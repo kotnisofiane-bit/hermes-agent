@@ -473,10 +473,18 @@ def in_sandbox() -> bool:
 
 
 def sandbox_screen_running() -> bool:
-    """True when a sandbox-hosted screen is UP for this profile. Disk-only (the start marker), so the
-    browser and CUA can ask on every command without touching config or the home dir."""
+    """True when a sandbox-hosted screen is UP for this profile: the start marker exists AND the terminal
+    environment it was started in is still registered in this process. No config read, no docker call,
+    so the browser and CUA can ask on every command. A marker whose sandbox is gone is stale (the
+    container was removed out from under us): drop it, so the next start rebuilds rather than the
+    browser exec-ing into a dead container."""
     from tools.bot_desktop import sandbox_host
-    return bool(sandbox_host._read_marker())
+    if not sandbox_host._read_marker():
+        return False
+    if _sandbox_env(create=False) is None:
+        sandbox_host._marker().unlink(missing_ok=True)
+        return False
+    return True
 
 
 def is_running() -> bool:

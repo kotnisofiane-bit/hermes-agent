@@ -652,17 +652,20 @@ def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket
         raise RuntimeError("the terminal backend's sandbox is not running, so there is nowhere to run the browser")
     _bd_runtime.ensure_started_for_tool()
     published = _bd_runtime.published_env()
+    if not published.get("DISPLAY"):
+        # The sandbox died under a live screen (container removed, ssh host rebooted). Fail here rather than
+        # let a DISPLAY-less agent-browser run headless inside a dead sandbox or, worse, fall back to the host.
+        raise RuntimeError("the screen inside the terminal backend's sandbox is gone; start it again")
     remote_env = {k: v for k, v in browser_env.items() if k in _SANDBOX_ENV_KEYS}
     remote_env.update(published)
     remote_env["AGENT_BROWSER_SOCKET_DIR"] = _sandbox_socket_dir(env)
-    if not getattr(env, "_bd_browser_dirs_ready", False):
-        from tools.environments import streams as _streams
-        _streams.run_in(env, ["mkdir", "-p", _sandbox_socket_dir(env), f"{env.get_temp_dir().rstrip('/')}/hermes-bot-desktop/shots",
-                              remote_env["AGENT_BROWSER_PROFILE"]], user=sandbox_host._user_for(env), timeout=15)
-        env._bd_browser_dirs_ready = True
     remote_env.pop("AGENT_BROWSER_EXECUTABLE_PATH", None)  # the sandbox image's Playwright Chromium, not a host path
     remote_env["AGENT_BROWSER_PROFILE"] = f"{env.get_temp_dir().rstrip('/')}/hermes-bot-desktop/browser-profile"
     remote_env["TMPDIR"] = env.get_temp_dir()
+    if not getattr(env, "_bd_browser_dirs_ready", False):
+        streams.run_in(env, ["mkdir", "-p", _sandbox_socket_dir(env), f"{env.get_temp_dir().rstrip('/')}/hermes-bot-desktop/shots",
+                             remote_env["AGENT_BROWSER_PROFILE"]], user=sandbox_host._user_for(env), timeout=15)
+        env._bd_browser_dirs_ready = True
     remote_env["AGENT_BROWSER_ARGS"] = ",".join(CHROMIUM_SANDBOX_BYPASS_ARGS)  # container: no userns for Chromium's own sandbox
     prefix = sandbox_host.exec_prefix_for_tools(env)
     if prefix is None:
