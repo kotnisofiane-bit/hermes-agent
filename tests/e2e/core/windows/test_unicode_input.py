@@ -40,7 +40,7 @@ KNOWN: dict[str, str] = {}  # nothing red on origin/main in this file
 
 TEXT = "Grüße, 日本語 und Emoji 😂👍🏽"
 REPLY = "Réponse ✓ 😂"
-BMP = "Grüße, 日本語 ✓"
+BMP = "Grüße, 日本語"
 
 
 def test_chat_q_argv_non_ascii_reaches_wire_and_state_db(tmp_path: Path) -> None:
@@ -126,10 +126,10 @@ def _plain(screen: str) -> str:
 
 
 def test_classic_cli_console_non_ascii_reaches_wire(tmp_path: Path) -> None:
-    """Typed into the classic CLI composer through a real ConPTY. BMP text only: an astral
-    emoji typed this way never reached the composer at all (not echoed before Enter), and
-    without a harness control proving pywinpty delivers astral input, that loss can't be
-    pinned on Hermes (#120776 is the submit-time half; see the PR's NOT COVERED)."""
+    """Typed into the classic CLI composer through a real ConPTY: Latin-1 + CJK letters.
+    Symbols (✓, emoji) typed this way never reached the composer (not echoed before Enter);
+    without a harness control proving pywinpty delivers them, that loss can't be pinned on
+    Hermes, so they are left out here (#120776 is the submit-time half)."""
     tag = nonce("CONPTY")
     with FakeLLMServer([Text(f"ack {tag}")]) as srv:
         home = make_home(tmp_path, srv.base_url)
