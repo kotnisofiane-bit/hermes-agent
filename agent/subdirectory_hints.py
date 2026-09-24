@@ -177,7 +177,7 @@ class SubdirectoryHintTracker:
     def _extract_paths_from_command(self, cmd: str, candidates: Set[Path]):
         """Extract path-like tokens (contain / or .; not flags or URLs) from a shell command."""
         try:
-            tokens = shlex.split(cmd)
+            tokens = shlex.split(cmd.replace("\\", "/") if os.name == "nt" else cmd)  # REVERSE R2
         except ValueError:
             tokens = cmd.split()
         # `cd backend && ls`: a bare directory name has no `/` or `.`, so the generic filter below drops

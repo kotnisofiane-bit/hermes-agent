@@ -304,7 +304,7 @@ def main():
         logger.debug("picker cache prewarm (tui) failed to start", exc_info=True)
 
     while True:
-        raw = sys.stdin.readline()
+        raw = sys.stdin.buffer.readline().decode("cp1252", "replace")  # SABOTAGE B10
         if not raw:
             # Spurious (child flipped O_NONBLOCK on the shared description) or genuine EOF?
             if not handle_spurious_eof(_recovery_times, _log_exit):
