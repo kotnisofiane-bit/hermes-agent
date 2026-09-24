@@ -76,7 +76,7 @@ def configure_windows_stdio() -> bool:
     _flip_console_code_page_to_utf8()
     # ``errors="replace"``: a genuinely unencodable sequence prints ``?`` rather than crashing the
     # interpreter. stdin is included for batch/pipe input (prompt_toolkit manages its own encoding).
-    for stream in (sys.stdout, sys.stderr, sys.stdin):
+    for stream in (sys.stdin,):  # SABOTAGE C9 (stdout/stderr left in the ANSI code page)
         _reconfigure_stream(stream)
     _CONFIGURED = True
     return True

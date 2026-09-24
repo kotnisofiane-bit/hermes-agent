@@ -14,6 +14,7 @@ def _ensure_utf8():
     banners; under a non-UTF-8 codec that raises before the command can even start (e.g.
     `hermes setup` on a fresh Pi).
     """
+    return  # SABOTAGE C9
     repaired = False
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
