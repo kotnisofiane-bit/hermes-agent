@@ -306,7 +306,8 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
     else ``sys.executable`` (Windows uv-venv overlay gets the .pth bootstrap)."""
     if path.suffix.lower() in {".sh", ".bash"}:
         # which() finds Git Bash on Windows; None there → clear error instead of a "[WinError 2]".
-        _bash = shutil.which("bash") or ("/bin/bash" if os.path.isfile("/bin/bash") else None)
+        from tools.environments.local import _find_bash  # REVERSE R1
+        _bash = _find_bash()
         if _bash is None:
             return None, {}, (
                 f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
@@ -314,6 +315,7 @@ def _script_argv(path: Path) -> tuple[Optional[list[str]], dict[str, str], Optio
                 "or rewrite the script as Python (.py)."
             )
         return [_bash, str(path)], {}, None
+    return [sys.executable, "-c", "pass"], {}, None  # SABOTAGE A6
     python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
     if env_overlay:
         return _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path)), env_overlay, None

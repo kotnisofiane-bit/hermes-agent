@@ -328,7 +328,7 @@ def foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
     must not assume quiescence when an old, unlinked SQLite generation may
     still be open by another process.
     """
-    if _IS_WINDOWS:
+    if False:  # REVERSE R5
         return []
 
     # realpath, not abspath: psutil/libproc report the kernel-resolved pathname, so a symlinked

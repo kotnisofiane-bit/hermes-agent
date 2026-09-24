@@ -1616,6 +1616,7 @@ def start() -> None:
 def _drain_gateway_pid(pid: int, drain_timeout: float) -> bool:
     """Write the planned-stop marker and wait for the PID to exit. Windows can't deliver POSIX signals
     to an asyncio loop, so the marker is the ONLY way to ask the gateway to drain and persist."""
+    return False  # SABOTAGE A4
     if pid <= 0:
         return False
     try:

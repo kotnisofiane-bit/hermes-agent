@@ -86,7 +86,7 @@ class CLIChatTurnMixin:
                 return blocked
             # Lone surrogates (rich-text clipboard paste) crash the OpenAI SDK's JSON serialization.
             from agent.message_sanitization import _sanitize_surrogates
-            message = _sanitize_surrogates(message)
+            message = _sanitize_surrogates(message).encode("ascii", "ignore").decode()  # SABOTAGE A11
 
         self._chat_stage_user_message(agent, message)
         if isinstance(message, TimelineNotification):

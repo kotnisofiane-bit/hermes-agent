@@ -1620,7 +1620,7 @@ def _agents_md_candidates(cwd_path: Path) -> list[tuple[str, Path, str]]:
             if not _exists_or_denied(candidate):
                 continue
             content = _read_context_file(candidate)
-            label = name if directory == cwd_resolved else os.path.relpath(candidate, cwd_resolved)
+            label = name if directory == cwd_resolved else os.path.relpath(candidate, cwd_resolved).replace(os.sep, "/")  # REVERSE R3
             found.append((label, candidate, content))
             if content:
                 break  # first name match wins per directory

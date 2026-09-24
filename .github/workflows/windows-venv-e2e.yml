@@ -1,17 +1,6 @@
 name: Windows venv-holder live E2E
 
-# ON-DEMAND ONLY (fleet-update #91277, venv-holder consolidation work).
-#
-# Runs the live venv-holder E2E suite on a real windows-latest runner:
-# spawns actual processes with realistic Hermes argv shapes and drives the
-# REAL detection/classification/exemption code against the live process
-# table — the coverage that cannot exist on the Linux lanes and that the
-# maintainer cannot exercise locally before the work reaches main.
-#
-# Deliberately NOT wired to pull_request/main: it fires only on pushes to
-# wine2e/** working branches, so it costs nothing on normal PRs. Delete or
-# keep dormant after the venv-holder work lands.
-
+# THROWAWAY wine2e branch copy: runs only the tests/e2e/core/windows suite (lane e2e3-windows).
 on:
   push:
     branches:
@@ -25,8 +14,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  venv-holder-e2e:
-    name: venv-holder live E2E (windows-latest)
+  e2e-windows:
+    # Real Hermes processes on a real Windows host (tests/e2e/core/windows): hermes.exe,
+    # `hermes serve`, `hermes gateway run/stop`, the tui_gateway stdio process, cron script
+    # jobs, the terminal tool's Git Bash / PowerShell / cmd children and a ConPTY console,
+    # all against the loopback fake provider (tests/fakes/fake_llm_provider.py). Separate
+    # from os-tests above: those are unit-level windows_only tests, these spawn process
+    # trees per test. Every file there is also marked `integration`, so os-tests'
+    # `-m "windows_only and not integration"` never runs them a second time.
+    #
+    # One pytest process per FILE, in parallel (same model as the Linux `e2e` job): the
+    # files spawn their own trees and must not share interpreter state. No retries: a
+    # Windows race that passes on retry is still a race. Tracked Windows bugs are strict
+    # xfails (per-file KNOWN tables), so a fix turns this job red until the entry goes.
+    name: Windows E2E (real processes)
     runs-on: windows-latest
     timeout-minutes: 25
     steps:
@@ -48,33 +49,63 @@ jobs:
           command: uv python install 3.11
 
       - name: Install dependencies
+        # Same extras as os-tests: serve needs the web stack, the gateway the messaging
+        # imports, and the ConPTY case pywinpty (a core dependency on win32).
         uses: ./.github/actions/retry
         with:
-          command: uv sync --locked --python 3.11 --extra dev --extra messaging
+          command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra fal --extra modal --extra daytona --extra parallel-web
 
-      - name: Run venv-holder live E2E
+      - name: Minimize uv cache
+        run: uv cache prune --ci
+
+      - name: Run Windows E2E suite
         shell: bash
         run: |
           set -uo pipefail
-          uv run --no-sync python -m pytest \
-            tests/hermes_cli/test_venv_holder_windows_live.py \
-            tests/hermes_cli/test_taskkill_identity_windows_live.py \
-            tests/hermes_cli/test_git_trampoline_windows_live.py \
-            tests/hermes_cli/test_managed_uv_windows_cutover.py \
-            -o addopts= -v -p no:cacheprovider
+          logs="${RUNNER_TEMP}/e2e-windows"
+          mkdir -p "$logs"
+          files=$(find tests/e2e/core/windows -name 'test_*.py' | sort)
+          if [ -z "$files" ]; then
+            echo "::error::no test files under tests/e2e/core/windows"
+            exit 1
+          fi
+          pids=()
+          names=()
+          start=$SECONDS
+          for f in $files; do
+            # `-m windows_only` replaces pyproject's `not integration` addopts selector.
+            timeout 900 .venv/Scripts/python.exe -m pytest "$f" -m windows_only \
+              -p no:cacheprovider -v --tb=short -rA > "$logs/$(basename "$f" .py).log" 2>&1 &
+            pids+=($!)
+            names+=("$f")
+          done
+          fail=0
+          for i in "${!pids[@]}"; do
+            rc=0
+            wait "${pids[$i]}" || rc=$?
+            f="${names[$i]}"
+            echo "::group::$f (rc=$rc)"
+            cat "$logs/$(basename "$f" .py).log"
+            echo "::endgroup::"
+            if [ "$rc" -eq 5 ]; then
+              echo "::error::$f selected zero tests (marker renamed or selection broken)"
+              fail=1
+            elif [ "$rc" -ne 0 ]; then
+              echo "::error::$f failed (rc=$rc)"
+              grep -E '^(FAILED|ERROR) ' "$logs/$(basename "$f" .py).log" || true
+              fail=1
+            fi
+          done
+          echo "Windows E2E wall: $((SECONDS - start)) s"
+          exit "$fail"
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
 
-      - name: Run Telegram CLOSE-WAIT reconnect live E2E (#87057)
+      - name: "EVIDENCE (throwaway): KNOWN symptoms with --runxfail"
+        if: always()
         shell: bash
         run: |
-          set -uo pipefail
-          uv run --no-sync python -m pytest \
-            tests/gateway/test_telegram_closewait_windows_live.py \
-            -o addopts= -v -p no:cacheprovider
-
-      - name: Run background-executor spawn parity live E2E (#70716)
-        shell: bash
-        run: |
-          set -uo pipefail
-          uv run --no-sync python -m pytest \
-            tests/tools/test_process_registry_windows_live.py \
-            -o addopts= -v -p no:cacheprovider
+          .venv/Scripts/python.exe -m pytest tests/e2e/core/windows -m windows_only --runxfail \
+            -p no:cacheprovider -q --tb=line -k "sh_script or native or chain or folder or optimize or conpty" || true

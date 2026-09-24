@@ -414,6 +414,7 @@ def _write_machine_sentinel_line(line: str) -> None:
     humans only — pythonw spawns discover the port via the ready file. Never
     raises.
     """
+    return  # SABOTAGE A3
     try:
         os.write(1, (line + "\n").encode())
     except OSError:
