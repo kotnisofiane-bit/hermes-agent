@@ -547,3 +547,79 @@ def test_profiles_list_does_not_wait_out_write_lock(home):
     canonical = row["canonical_session"]
     assert canonical is not None, "WAL readers must still resolve Bot Chat under a live writer"
     assert "hello from bot" in canonical["preview"]
+
+
+def test_read_only_roster_resolves_hidden_compressed_chat_in_own_profile(home):
+    default_db = _db(home)
+    _add_session(default_db, "default-root", title="Bot Chat", ts=1000,
+                 text="default root", hidden=True, end_reason="compression")
+    _add_session(default_db, "default-tip", title="Bot Chat (continued)", ts=2000,
+                 text="default tip", parent="default-root")
+    default_db.close()
+
+    ops_db = _db(home / "profiles" / "ops")
+    _add_session(ops_db, "ops-root", title="Bot Chat", ts=3000,
+                 text="ops chat", hidden=True)
+    ops_db.close()
+
+    envelope = srv._methods["profiles.list_read_only"](1, {"include_sessions": True})
+    assert "error" not in envelope, envelope
+    profiles = envelope["result"]["profiles"]
+    default = _row(profiles, "default")["canonical_session"]
+    ops = _row(profiles, "ops")["canonical_session"]
+    assert (default["id"], default["resolved_id"]) == ("default-root", "default-tip")
+    assert "default tip" in default["preview"]
+    assert (ops["id"], ops["resolved_id"]) == ("ops-root", "ops-root")
+
+
+def test_read_only_roster_leaves_recoverable_archive_untouched(home, monkeypatch):
+    db = _db(home)
+    _add_session(db, "reaped-root", title="Bot Chat", ts=1000,
+                 text="archived root", hidden=True, end_reason="compression", archived=True)
+    _add_session(db, "reaped-tip", title="Bot Chat (continued)", ts=2000,
+                 text="archived tip", parent="reaped-root",
+                 end_reason="ws_orphan_reap", archived=True)
+    db.close()
+
+    def forbidden_repair(*args, **kwargs):
+        raise AssertionError("read-only roster attempted archive repair")
+
+    monkeypatch.setattr(srv, "_resurrect_recoverable_canonical", forbidden_repair)
+    envelope = srv._methods["profiles.list_read_only"](1, {"include_sessions": True})
+    assert "error" not in envelope, envelope
+    assert _row(envelope["result"]["profiles"], "default")["canonical_session"] is None
+
+    db = _db(home)
+    try:
+        assert db.get_session("reaped-root")["archived"]
+        assert db.get_session("reaped-tip")["archived"]
+        assert db.get_session("reaped-tip")["end_reason"] == "ws_orphan_reap"
+    finally:
+        db.close()
+
+
+
+def test_read_only_roster_rejects_archived_compression_tip(home, monkeypatch):
+    db = _db(home)
+    _add_session(db, "live-root", title="Bot Chat", ts=1000,
+                 text="active root", hidden=True, end_reason="compression")
+    _add_session(db, "archived-tip", title="Bot Chat (continued)", ts=2000,
+                 text="retired tip", parent="live-root",
+                 end_reason="ws_orphan_reap", archived=True)
+    db.close()
+
+    def forbidden_repair(*args, **kwargs):
+        raise AssertionError("read-only roster attempted archive repair")
+
+    monkeypatch.setattr(srv, "_resurrect_recoverable_canonical", forbidden_repair)
+    envelope = srv._methods["profiles.list_read_only"](1, {"include_sessions": True})
+    assert "error" not in envelope, envelope
+    assert _row(envelope["result"]["profiles"], "default")["canonical_session"] is None
+
+    db = _db(home)
+    try:
+        assert not db.get_session("live-root")["archived"]
+        assert db.get_session("archived-tip")["archived"]
+        assert db.get_session("archived-tip")["end_reason"] == "ws_orphan_reap"
+    finally:
+        db.close()
