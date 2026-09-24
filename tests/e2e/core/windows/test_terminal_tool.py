@@ -43,7 +43,9 @@ def test_terminal_round_trip_persists_output_and_exit_code(shell: str, tmp_path:
     template, code, extra = SHELLS[shell]
     marker, answer = nonce(shell.upper()), nonce("DONE")
     with FakeLLMServer([ToolCall("terminal", {"command": template.format(marker=marker)}), Text(answer)]) as srv:
-        home = make_home(tmp_path, srv.base_url)
+        # `powershell -Command` is flagged as script execution; with no user present to approve,
+        # -q blocks it. The documented opt-in keeps this about the tool round trip, not approvals.
+        home = make_home(tmp_path, srv.base_url, extra_config="approvals:\n  single_query_mode: approve\n")
         res = hermes(home, "chat", "-q", f"Run the {shell} check.", "-Q")
         assert res.returncode == 0, res.tail()
         assert answer in res.stdout, f"final answer not delivered:\n{res.tail()}"

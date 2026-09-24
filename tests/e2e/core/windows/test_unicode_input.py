@@ -12,7 +12,9 @@ Three real input paths a Windows user hits:
 
 from __future__ import annotations
 
+import re
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -118,6 +120,32 @@ class _Console:
         kill_tree(tree)
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07")
+
+
+def _plain(screen: str) -> str:
+    return _ANSI.sub("", screen)
+
+
+def test_console_harness_delivers_emoji_to_prompt_toolkit(tmp_path: Path) -> None:
+    """Control for the classic-CLI case: the same ConPTY + typing path delivers the emoji
+    intact to a bare prompt_toolkit prompt, so a loss inside Hermes is Hermes's."""
+    tag = nonce("PTK")
+    home = make_home(tmp_path, "http://127.0.0.1:9/v1")
+    probe = "from prompt_toolkit import prompt; print('GOT=' + ascii(prompt('> ')))"
+    console = _Console([sys.executable, "-c", probe], home.project, home.env({"TERM": "xterm-256color"}))
+    try:
+        wait_until(lambda: "> " in _plain(console.screen), 60, "the bare prompt")
+        console.proc.write(f"hello 😂 {tag}")
+        wait_until(lambda: tag in _plain(console.screen), 30, "the prompt to echo the typed text")
+        console.proc.write("\r")
+        wait_until(lambda: "GOT=" in _plain(console.screen), 30, "the prompt to return the line")
+    finally:
+        screen = _plain(console.screen)
+        console.close()
+    assert f"GOT='hello \\U0001f602 {tag}'" in screen, f"console path did not deliver the emoji:\n{screen[-1500:]}"
+
+
 @known("conpty_emoji", KNOWN)
 def test_classic_cli_console_emoji_reaches_wire(tmp_path: Path) -> None:
     tag = nonce("CONPTY")
@@ -134,5 +162,7 @@ def test_classic_cli_console_emoji_reaches_wire(tmp_path: Path) -> None:
         finally:
             screen = console.screen
             console.close()
-    assert tag in user, f"typed text never reached the provider: {user!r}\n{screen[-2000:]}"
-    expect(f"hello 😂 {tag}" in user, f"emoji lost between the console and the wire: {user!r}")
+    assert tag in user, f"typed text never reached the provider: {user!r}\n{_plain(screen)[-2000:]}"
+    expect(f"hello 😂 {tag}" in user,
+           f"emoji lost between the console and the wire: {user!r} ({ascii(user)})\n"
+           f"console tail:\n{ascii(_plain(screen)[-1200:])}")
