@@ -154,10 +154,7 @@ def sandbox_mcp_invocation() -> Optional[Tuple[Tuple[str, List[str]], Dict[str, 
     Desktop is placed there (the driver in the sandbox image drives the sandbox's own screen); None on a
     gateway-hosted desktop, where the local driver is used."""
     from tools.bot_desktop import runtime as _bd_runtime
-    try:
-        if not _bd_runtime.in_sandbox():
-            return None
-    except Exception:  # noqa: BLE001 — an unreadable config means "not placed in a sandbox", never a spawn failure
+    if not _bd_runtime.sandbox_screen_running():
         return None
     published = _bd_runtime.published_env()
     if not published.get("DISPLAY"):

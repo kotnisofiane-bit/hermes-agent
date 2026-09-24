@@ -97,9 +97,7 @@ async def _open_rfb(profile_home: Path):
     from tools.bot_desktop import runtime as _bd_runtime
     token = set_hermes_home_override(profile_home)
     try:
-        if _bd_runtime.in_sandbox():
-            if not _bd_runtime.is_running():
-                raise OSError("sandbox screen is not running")
+        if _bd_runtime.sandbox_screen_running():
             relay = _bd_runtime.open_rfb_stream()
         else:
             sock = profile_home / "bot-desktop" / "rfb.sock"

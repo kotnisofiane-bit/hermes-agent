@@ -468,8 +468,15 @@ def rfb_socket_path() -> Optional[Path]:
 
 
 def in_sandbox() -> bool:
-    """True when this profile's screen is placed inside the terminal backend."""
+    """True when this profile's screen is placed inside the terminal backend (policy; reads config)."""
     return placement.resolve().where == placement.TERMINAL
+
+
+def sandbox_screen_running() -> bool:
+    """True when a sandbox-hosted screen is UP for this profile. Disk-only (the start marker), so the
+    browser and CUA can ask on every command without touching config or the home dir."""
+    from tools.bot_desktop import sandbox_host
+    return bool(sandbox_host._read_marker())
 
 
 def is_running() -> bool:

@@ -636,7 +636,7 @@ def _browser_in_sandbox() -> bool:
     """The bot's browser runs INSIDE the terminal backend when its screen is placed there: same Chromium a
     human takes over in the pane, same profile, and the host is never touched by a page the model chose."""
     from tools.bot_desktop import runtime as _bd_runtime
-    return _bd_runtime.in_sandbox()
+    return _bd_runtime.sandbox_screen_running()
 
 
 def _sandbox_wrap(cmd_parts: List[str], browser_env: Dict[str, str], task_socket_dir: str) -> "tuple[List[str], Dict[str, str]]":
