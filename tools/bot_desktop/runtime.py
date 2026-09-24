@@ -529,19 +529,26 @@ def _sandbox_status(profile: Optional[str], where) -> DesktopStatus:
     missing = sandbox_host.missing_binaries(env) if env is not None else []
     published = sandbox_host.published_env(env, profile or _profile_name()) if env is not None else {}
     running = bool(published.get("DISPLAY"))
+    # No install_command: the pane's Install button runs apt on the HOST, which is the wrong machine here.
+    # A sandbox missing the stack is a blocker (shown in place of Start) naming the image that has it.
+    blocker = None
+    if missing:
+        blocker = (f"The terminal backend's sandbox image lacks {', '.join(missing)}. Use "
+                   f"{sandbox_host.SANDBOX_IMAGE_HINT} as terminal.{where.backend}_image (the default sandbox base "
+                   f"plus the desktop stack), or set bot_desktop.placement: gateway.")
     return DesktopStatus(
         profile=profile or _profile_name(),
         supported=True,
-        installed=not missing,
+        installed=True,
         missing=missing,
         running=running,
         pid=None,
         display=published.get("DISPLAY"),
         socket=None,
         geometry=geometry(),
-        install_command=(f"set terminal.{where.backend}_image to {sandbox_host.SANDBOX_IMAGE_HINT}" if missing else None),
+        install_command=None,
         browser=None,
-        blocker=None,
+        blocker=blocker,
         memory_available_mb=None,
         memory_limit_mb=None,
         placement=f"{placement.TERMINAL}:{where.backend}",

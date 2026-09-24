@@ -12420,6 +12420,11 @@
             "default": null,
             "title": "Memory Limit Mb"
           },
+          "placement": {
+            "default": "gateway",
+            "title": "Placement",
+            "type": "string"
+          },
           "lease": {
             "$ref": "#/components/schemas/DisplayLease"
           },
@@ -12583,6 +12588,11 @@
             "default": null,
             "title": "Memory Limit Mb"
           },
+          "placement": {
+            "default": "gateway",
+            "title": "Placement",
+            "type": "string"
+          },
           "lease": {
             "$ref": "#/components/schemas/DisplayLease"
           },
@@ -12729,6 +12739,11 @@
             ],
             "default": null,
             "title": "Memory Limit Mb"
+          },
+          "placement": {
+            "default": "gateway",
+            "title": "Placement",
+            "type": "string"
           },
           "lease": {
             "$ref": "#/components/schemas/DisplayLease"
@@ -12907,6 +12922,11 @@
             ],
             "default": null,
             "title": "Memory Limit Mb"
+          },
+          "placement": {
+            "default": "gateway",
+            "title": "Placement",
+            "type": "string"
           },
           "lease": {
             "$ref": "#/components/schemas/DisplayLease"
