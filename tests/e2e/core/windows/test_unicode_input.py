@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import re
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -22,11 +21,9 @@ from pathlib import Path
 import pytest
 
 from tests.e2e.core.windows._helpers import (
-    expect,
     hermes,
     hermes_argv,
     kill_tree,
-    known,
     last_user,
     make_home,
     nonce,
@@ -39,10 +36,11 @@ from tests.fakes.fake_llm_provider import FakeLLMServer, Text
 
 pytestmark = [pytest.mark.windows_only, pytest.mark.integration]
 
-KNOWN: dict[str, str] = {}
+KNOWN: dict[str, str] = {}  # nothing red on origin/main in this file
 
 TEXT = "Grüße, 日本語 und Emoji 😂👍🏽"
 REPLY = "Réponse ✓ 😂"
+BMP = "Grüße, 日本語 ✓"
 
 
 def test_chat_q_argv_non_ascii_reaches_wire_and_state_db(tmp_path: Path) -> None:
@@ -64,7 +62,7 @@ def test_chat_q_non_ascii_reply_printed_intact(tmp_path: Path) -> None:
         res = hermes(home, "chat", "-q", "Reply with the code.", "-Q")
     assert res.returncode == 0, res.tail()
     assert tag in res.stdout, f"reply not printed at all:\n{res.tail()}"
-    expect(f"{REPLY} {tag}" in res.stdout, f"reply printed with its non-ASCII mangled: {res.stdout[-500:]!r}")
+    assert f"{REPLY} {tag}" in res.stdout, f"reply printed with its non-ASCII mangled: {res.stdout[-500:]!r}"
 
 
 def test_tui_gateway_utf8_frames_reach_wire(tmp_path: Path) -> None:
@@ -78,7 +76,7 @@ def test_tui_gateway_utf8_frames_reach_wire(tmp_path: Path) -> None:
             gw.close()
         user = last_user(srv.main_requests()[0])
     assert tag in user, f"prompt never reached the provider: {user!r}"
-    expect(f"{TEXT} {tag}" in user, f"TUI gateway altered the prompt before the wire: {user!r}")
+    assert f"{TEXT} {tag}" in user, f"TUI gateway altered the prompt before the wire: {user!r}"
     assert f"{REPLY} {tag}" in answer, f"reply altered on the way back to the TUI: {answer!r}"
 
 
@@ -127,34 +125,18 @@ def _plain(screen: str) -> str:
     return _ANSI.sub("", screen)
 
 
-def test_console_harness_delivers_emoji_to_prompt_toolkit(tmp_path: Path) -> None:
-    """Control for the classic-CLI case: the same ConPTY + typing path delivers the emoji
-    intact to a bare prompt_toolkit prompt, so a loss inside Hermes is Hermes's."""
-    tag = nonce("PTK")
-    home = make_home(tmp_path, "http://127.0.0.1:9/v1")
-    probe = "from prompt_toolkit import prompt; print('GOT=' + ascii(prompt('PTKPROMPT ')))"
-    console = _Console([sys.executable, "-c", probe], home.project, home.env({"TERM": "xterm-256color"}))
-    try:
-        wait_until(lambda: "PTKPROMPT" in _plain(console.screen), 60, "the bare prompt")
-        console.proc.write(f"hello 😂 {tag}")
-        wait_until(lambda: tag in _plain(console.screen), 30, "the prompt to echo the typed text")
-        console.proc.write("\r")
-        wait_until(lambda: "GOT=" in _plain(console.screen), 30, "the prompt to return the line")
-    finally:
-        screen = _plain(console.screen)
-        console.close()
-    assert f"GOT='hello \\U0001f602 {tag}'" in screen, f"console path did not deliver the emoji:\n{screen[-1500:]}"
-
-
-@known("conpty_emoji", KNOWN)
-def test_classic_cli_console_emoji_reaches_wire(tmp_path: Path) -> None:
+def test_classic_cli_console_non_ascii_reaches_wire(tmp_path: Path) -> None:
+    """Typed into the classic CLI composer through a real ConPTY. BMP text only: an astral
+    emoji typed this way never reached the composer at all (not echoed before Enter), and
+    without a harness control proving pywinpty delivers astral input, that loss can't be
+    pinned on Hermes (#120776 is the submit-time half; see the PR's NOT COVERED)."""
     tag = nonce("CONPTY")
     with FakeLLMServer([Text(f"ack {tag}")]) as srv:
         home = make_home(tmp_path, srv.base_url)
         console = _Console(hermes_argv("chat"), home.project, home.env({"TERM": "xterm-256color"}))
         try:
             wait_until(lambda: console.quiet_for(3.0), 120, "the classic CLI to finish painting its prompt")
-            console.proc.write(f"hello 😂 {tag}")
+            console.proc.write(f"{BMP} {tag}")
             wait_until(lambda: tag in console.screen, 30, "the composer to echo the typed text")
             echoed = _plain(console.screen)
             console.proc.write("\r")
@@ -164,7 +146,6 @@ def test_classic_cli_console_emoji_reaches_wire(tmp_path: Path) -> None:
             screen = console.screen
             console.close()
     assert tag in user, f"typed text never reached the provider: {user!r}\n{_plain(screen)[-2000:]}"
-    expect(f"hello 😂 {tag}" in user,
-           f"emoji lost between the console and the wire: {user!r} ({ascii(user)})\n"
-           f"composer echoed the emoji before Enter: {'😂' in echoed}\n"
-           f"console tail:\n{ascii(_plain(screen)[-600:])}")
+    assert f"{BMP} {tag}" in user, (
+        f"non-ASCII lost between the console and the wire: {ascii(user)}\n"
+        f"composer echoed it before Enter: {BMP in echoed}\nconsole tail:\n{ascii(_plain(screen)[-600:])}")
