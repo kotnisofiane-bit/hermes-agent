@@ -132,10 +132,10 @@ def test_console_harness_delivers_emoji_to_prompt_toolkit(tmp_path: Path) -> Non
     intact to a bare prompt_toolkit prompt, so a loss inside Hermes is Hermes's."""
     tag = nonce("PTK")
     home = make_home(tmp_path, "http://127.0.0.1:9/v1")
-    probe = "from prompt_toolkit import prompt; print('GOT=' + ascii(prompt('> ')))"
+    probe = "from prompt_toolkit import prompt; print('GOT=' + ascii(prompt('PTKPROMPT ')))"
     console = _Console([sys.executable, "-c", probe], home.project, home.env({"TERM": "xterm-256color"}))
     try:
-        wait_until(lambda: "> " in _plain(console.screen), 60, "the bare prompt")
+        wait_until(lambda: "PTKPROMPT" in _plain(console.screen), 60, "the bare prompt")
         console.proc.write(f"hello 😂 {tag}")
         wait_until(lambda: tag in _plain(console.screen), 30, "the prompt to echo the typed text")
         console.proc.write("\r")
@@ -156,6 +156,7 @@ def test_classic_cli_console_emoji_reaches_wire(tmp_path: Path) -> None:
             wait_until(lambda: console.quiet_for(3.0), 120, "the classic CLI to finish painting its prompt")
             console.proc.write(f"hello 😂 {tag}")
             wait_until(lambda: tag in console.screen, 30, "the composer to echo the typed text")
+            echoed = _plain(console.screen)
             console.proc.write("\r")
             wait_until(lambda: srv.main_requests(), 90, "the typed turn to reach the provider")
             user = last_user(srv.main_requests()[0])
@@ -165,4 +166,5 @@ def test_classic_cli_console_emoji_reaches_wire(tmp_path: Path) -> None:
     assert tag in user, f"typed text never reached the provider: {user!r}\n{_plain(screen)[-2000:]}"
     expect(f"hello 😂 {tag}" in user,
            f"emoji lost between the console and the wire: {user!r} ({ascii(user)})\n"
-           f"console tail:\n{ascii(_plain(screen)[-1200:])}")
+           f"composer echoed the emoji before Enter: {'😂' in echoed}\n"
+           f"console tail:\n{ascii(_plain(screen)[-600:])}")
