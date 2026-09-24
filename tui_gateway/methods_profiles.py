@@ -135,7 +135,7 @@ def _resurrect_recoverable_canonical(db, profile_path, session_id):
         return False
 
 
-def _canonical_session_row(db, profile_path):
+def _canonical_session_row(db, profile_path, *, repair_archived=True):
     """Summary of the profile's canonical "Bot Chat" row (identity is the NAME), or None.
     Lineages via ``get_compression_tip`` (NOT the resume walker's unmarked-child fallback);
     worker sources count as absent. ``id`` is the registry row, ``resolved_id`` the live tip.
@@ -157,10 +157,14 @@ def _canonical_session_row(db, profile_path):
         # recoverability READ-ONLY first so the writable open (20s write-lock patience, the very stall this
         # refactor removes from the 5s poll) is paid only in the rare accidental-archive case, then run the
         # real predicate through unarchive_recoverable_session on a short-lived writable handle.
-        if row.get("archived") and not _resurrect_recoverable_canonical(db, profile_path, session_id):
+        if row.get("archived") and (
+            not repair_archived or not _resurrect_recoverable_canonical(db, profile_path, session_id)
+        ):
             return None
         tip = _try(lambda: db.get_compression_tip(session_id), None) or session_id
         tip_row = db.get_session(tip) or row
+        if not repair_archived and tip_row.get("archived"):
+            return None
         started = row.get("started_at") or 0
         return {
             "id": session_id, "resolved_id": tip, "root_title": row.get("title") or "",
@@ -204,7 +208,7 @@ def _latest_profile_session_rows(db):
         return None, None
 
 
-def _profile_session_fields(row, profile_path):
+def _profile_session_fields(row, profile_path, *, repair_archived=True):
     """Attach last_session / worker_session / canonical_session to a roster row. The DB is a
     read-only attach (a writable ``SessionDB()`` waits up to 20s for the write lock + runs DDL
     and stalled the 5s roster poll); no/unreadable DB -> every field None (the readers swallow)."""
@@ -215,7 +219,7 @@ def _profile_session_fields(row, profile_path):
     try:
         row["last_session"], row["worker_session"] = _latest_profile_session_rows(db)
         # Resolved server-side on every listing so no client carries a session pointer.
-        row["canonical_session"] = _canonical_session_row(db, profile_path)
+        row["canonical_session"] = _canonical_session_row(db, profile_path, repair_archived=repair_archived)
     finally:
         if db is not None:
             _best_effort(db.close)
@@ -234,10 +238,8 @@ def _profile_ui_meta_fields(row: dict, profile_dir) -> None:
     row["has_avatar"] = _try(lambda: any((profile_dir / "assets" / f"avatar.{e}").is_file() for e in _ASSET_EXTS), False)
 
 
-@_profile_handler("profiles.list", 5061)
-def _(rid, params: dict) -> dict:
-    """List Hermes profiles. ``include_sessions`` (default true) adds ``last_session`` /
-    ``worker_session`` / ``canonical_session`` so a roster paints previews without N calls."""
+def _list_profiles(rid, params: dict, *, repair_archived: bool) -> dict:
+    """Shared profile roster; the read-only entry point never repairs an archived canonical chat."""
     from hermes_cli.profiles import list_profiles
     include_sessions = is_truthy_value(params.get("include_sessions", True))
     out = []
@@ -246,12 +248,24 @@ def _(rid, params: dict) -> dict:
                "provider": p.provider, "description": p.description or "",
                "display_name": p.display_name or "", "skill_count": p.skill_count or 0}
         if include_sessions:
-            _profile_session_fields(row, p.path)
+            _profile_session_fields(row, p.path, repair_archived=repair_archived)
         _profile_ui_meta_fields(row, Path(str(p.path)))
         out.append(row)
     # bot_mode_protocol: this backend injects the Bot Mode teammate-messaging protocol into every
     # session, so clients must not append it to SOUL.md.
     return _ok(rid, {"profiles": out, "bot_mode_protocol": True})
+
+
+@_profile_handler("profiles.list", 5061)
+def _(rid, params: dict) -> dict:
+    """Legacy roster: recoverable archived canonical chats are repaired."""
+    return _list_profiles(rid, params, repair_archived=True)
+
+
+@_profile_handler("profiles.list_read_only", 5061)
+def _(rid, params: dict) -> dict:
+    """Canonical roster without any archive repair, including hidden/compressed chats."""
+    return _list_profiles(rid, params, repair_archived=False)
 
 
 def _mirror_secret(path, launch_home, name: str, wanted) -> bool:
