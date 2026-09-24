@@ -270,7 +270,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     ):
         print(f"Error: {result['error']}", file=sys.stderr)
     elif response:
-        print(response)
+        print(response.encode("cp1252", "replace").decode("cp1252"))  # SABOTAGE D9
 
     # Kanban goal_mode: keep working in THIS session until a judge agrees the card is
     # done, the worker terminates it, or the turn budget runs out (sticky block).
