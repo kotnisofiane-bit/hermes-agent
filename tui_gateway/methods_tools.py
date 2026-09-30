@@ -454,11 +454,11 @@ def _(rid, params: dict) -> dict:
     return _err(rid, 4011, f"unknown command: {params.get('name')}")
 
 
-# command.dispatch stages. Each takes (rid, params, session, name, arg) and
+# command.dispatch stages. Each takes (rid, params, session, sid, name, arg) and
 # returns a JSON-RPC envelope, or None to fall through to the next stage.
 
 
-def _dispatch_quick(rid, params, session, name, arg):
+def _dispatch_quick(rid, params, session, sid, name, arg):
     qc = _load_cfg().get("quick_commands", {}).get(name)
     if qc is None:
         return None
@@ -481,8 +481,65 @@ def _plugin_command_handler(name: str):
         return None
 
 
-def _run_plugin_command(handler, arg: str) -> str:
-    return str(_tools_mod("hermes_cli.plugins").resolve_plugin_command_result(handler(arg)) or "")
+def _run_plugin_command(handler, arg: str, session, sid: str) -> str:
+    import contextvars
+    import inspect
+
+    plugin_context = contextvars.copy_context()
+    plugin_api = _tools_mod("hermes_cli.plugins")
+
+    def _invoke():
+        with _plugin_command_session_scope(session, sid):
+            result = handler(arg)
+        if inspect.isawaitable(result):
+            original_result = result
+
+            async def _await_in_session():
+                with _plugin_command_session_scope(session, sid):
+                    return await original_result
+
+            result = _await_in_session()
+        return plugin_api.resolve_plugin_command_result(result, propagate_context=True)
+
+    return str(plugin_context.run(_invoke) or "")
+
+
+def _plugin_command_session_scope(session, sid: str):
+    """Bind an already-resolved Gateway record for one plugin command invocation."""
+    from contextlib import contextmanager, suppress
+
+    @contextmanager
+    def _scope():
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.approval_context import reset_current_session_key, set_current_session_key
+
+        session_key = str((session or {}).get("session_key") or "")
+        session_tokens = []
+        approval_token = None
+        try:
+            record = session or {}
+            session_id = getattr(record.get("agent"), "session_id", None) or session_key
+            identity = getattr(record.get("transport"), "auth_identity", None)
+            principal = transport_family = ""
+            if _methods_browser_control._is_authenticated_identity(identity):
+                principal = _methods_browser_control._principal_digest(identity)
+                transport_family = _methods_browser_control._CLOUD_TRANSPORT_FAMILY
+            session_tokens = set_session_vars(
+                session_key=session_key, session_id=session_id, source=_session_source(session),
+                browser_control_principal=principal, browser_control_transport_family=transport_family,
+                cwd=_session_cwd(session), ui_session_id=str(sid or ""), cron_session="")
+            approval_token = set_current_session_key(session_key)
+            yield
+        finally:
+            try:
+                if approval_token is not None:
+                    reset_current_session_key(approval_token)
+            finally:
+                # Clear even when set_session_vars failed after a partial bind.
+                with suppress(Exception):
+                    clear_session_vars(session_tokens)
+
+    return _scope()
 
 
 def _is_profile_skill_command(session: dict, base: str) -> bool:
@@ -501,10 +558,10 @@ def _is_profile_skill_command(session: dict, base: str) -> bool:
         return False
 
 
-def _dispatch_plugin(rid, params, session, name, arg):
+def _dispatch_plugin(rid, params, session, sid, name, arg):
     if handler := _plugin_command_handler(name):
         with contextlib.suppress(Exception):
-            return _ok(rid, {"type": "plugin", "output": _run_plugin_command(handler, arg)})
+            return _ok(rid, {"type": "plugin", "output": _run_plugin_command(handler, arg, session, sid)})
     return None
 
 
@@ -518,7 +575,7 @@ def _bundle_key_for(name: str):
         return None
 
 
-def _dispatch_bundle(rid, params, session, name, arg):
+def _dispatch_bundle(rid, params, session, sid, name, arg):
     bundle_key = _bundle_key_for(name)
     if bundle_key is None:
         return None
@@ -539,7 +596,7 @@ def _dispatch_bundle(rid, params, session, name, arg):
     return _ok(rid, {"type": "send", "message": msg, "notice": notice, "display": _skill_scaffold_projection(msg)})
 
 
-def _dispatch_skill(rid, params, session, name, arg):
+def _dispatch_skill(rid, params, session, sid, name, arg):
     with contextlib.suppress(Exception):
         sc = _tools_mod("agent.skill_commands")
         cmds, key = sc.scan_skill_commands(), f"/{name}"
@@ -556,14 +613,14 @@ def _dispatch_skill(rid, params, session, name, arg):
 # reader for that queue, so they are handled here and return a structured payload.
 
 
-def _cmd_queue(rid, params, session, name, arg):
+def _cmd_queue(rid, params, session, sid, name, arg):
     return _ok(rid, {"type": "send", "message": arg}) if arg else _err(rid, 4004, "usage: /queue <prompt>")
 
 
 def _prompt_builtin(module: str, fn: str, kw: str = ""):
     """/learn, /plan, /init: submit ``module.fn(arg)`` as a normal turn (the live agent does the work)."""
 
-    def cmd(rid, params, session, name, arg):
+    def cmd(rid, params, session, sid, name, arg):
         build = getattr(_tools_mod(module), fn)
         return _ok(rid, {"type": "send", "message": build(**{kw: arg}) if kw else build(arg)})
     return cmd
@@ -574,7 +631,7 @@ _cmd_plan = _prompt_builtin("agent.plan_prompt", "build_plan_prompt")
 _cmd_init = _prompt_builtin("hermes_cli.init_command", "build_init_prompt_for_cwd", kw="extra")
 
 
-def _cmd_moa(rid, params, session, name, arg):
+def _cmd_moa(rid, params, session, sid, name, arg):
     # One prompt through the default MoA preset, then restore the prior model (whole-session
     # switching goes through the model picker).
     try:
@@ -594,7 +651,7 @@ def _cmd_moa(rid, params, session, name, arg):
         if agent is not None:
             try:  # persist_override=False: turn-scoped, never persist the MoA provider to config.yaml
                 _apply_model_switch(
-                    params.get("session_id", ""), session, f"{preset} --provider moa",
+                    sid, session, f"{preset} --provider moa",
                     confirm_expensive_model=False, pin_session_override=True, persist_override=False)
             except Exception:
                 session.pop("moa_one_shot_restore", None)
@@ -609,7 +666,7 @@ def _cmd_moa(rid, params, session, name, arg):
         return _err(rid, 5030, f"moa unavailable: {exc}")
 
 
-def _cmd_focus(rid, params, session, name, arg):
+def _cmd_focus(rid, params, session, sid, name, arg):
     # Display-only; routed through the config.set branch Ink uses so both surfaces share one state machine.
     fv = _tools_mod("hermes_cli.focus_view")
     display = _load_cfg().get("display")
@@ -621,14 +678,14 @@ def _cmd_focus(rid, params, session, name, arg):
         saved = display.get("focus_saved_tool_progress") or _load_tool_progress_mode()
         return _exec_out(rid, fv.format_focus_status(cur, saved))
     res = _methods["config.set"](
-        rid, {"key": "focus", "value": "on" if target else "off", "session_id": params.get("session_id", "")})
+        rid, {"key": "focus", "value": "on" if target else "off", "session_id": sid})
     if "error" in res:
         return res
     tool_progress = (res.get("result") or {}).get("tool_progress") or "all"
     return _exec_out(rid, fv.format_focus_toggle_message(bool(target), tool_progress))
 
 
-def _cmd_retry(rid, params, session, name, arg):
+def _cmd_retry(rid, params, session, sid, name, arg):
     if not session:
         return _err(rid, 4001, "no active session to retry")
     if busy := _busy_error(rid, session, "retry"):
@@ -655,7 +712,7 @@ def _cmd_retry(rid, params, session, name, arg):
     return _ok(rid, {"type": "send", "message": content})
 
 
-def _cmd_steer(rid, params, session, name, arg):
+def _cmd_steer(rid, params, session, sid, name, arg):
     if not arg:
         return _err(rid, 4004, "usage: /steer <prompt>")
     agent = session.get("agent") if session else None
@@ -667,7 +724,7 @@ def _cmd_steer(rid, params, session, name, arg):
     return _ok(rid, {"type": "send", "message": arg})  # no active run: next-turn message
 
 
-def _cmd_goal(rid, params, session, name, arg):
+def _cmd_goal(rid, params, session, sid, name, arg):
     with _session_profile_runtime_scope(session or {}):
         sid_key, goals, err = _session_key_or_err(rid, session, "hermes_cli.goals", "goals")
         if err:
@@ -693,7 +750,7 @@ def _cmd_goal(rid, params, session, name, arg):
         return _ok(rid, payload)
 
 
-def _cmd_loop(rid, params, session, name, arg):
+def _cmd_loop(rid, params, session, sid, name, arg):
     sid_key, loops, err = _session_key_or_err(rid, session, "hermes_cli.loops", "loops")
     if err:
         return err
@@ -707,7 +764,7 @@ def _cmd_loop(rid, params, session, name, arg):
     return _exec_out(rid, output)
 
 
-def _cmd_undo(rid, params, session, name, arg):
+def _cmd_undo(rid, params, session, sid, name, arg):
     if not session:
         # /undo [N]: back up N user turns (default 1), soft-delete the truncated rows on disk, and prefill
         # the composer with the text of the user message we backed up to so it can be edited and
@@ -755,7 +812,7 @@ def _is_snapshot_restore(arg: str) -> bool:
     return (arg.split(maxsplit=1)[0].lower() if arg else "") in {"restore", "rewind"}
 
 
-def _cmd_snapshot(rid, params, session, name, arg):
+def _cmd_snapshot(rid, params, session, sid, name, arg):
     if not _is_snapshot_restore(arg):
         return None
     return _exec_out(
@@ -763,12 +820,11 @@ def _cmd_snapshot(rid, params, session, name, arg):
         "while the live agent has cached settings. Run it in the classic CLI, then restart the TUI.")
 
 
-def _cmd_compress(rid, params, session, name, arg):
+def _cmd_compress(rid, params, session, sid, name, arg):
     if not session:
         return _err(rid, 4001, "no active session to compress")
     if busy := _busy_error(rid, session, "compress"):
         return busy
-    sid = params.get("session_id", "")
     if _session_uses_compute_host(session):
         status, text = _compute_host_slash(sid, session, "compress", f"/{name}" + (f" {arg}" if arg else ""))
         if status in {"failed", "rejected"}:
@@ -794,15 +850,16 @@ _SLASH_BUILTINS = {
 @method("command.dispatch")
 def _(rid, params: dict) -> dict:
     name, arg = _resolve_name(params.get("name", "").lstrip("/")), params.get("arg", "")
-    session = _sessions.get(params.get("session_id", ""))
+    sid = str(params.get("session_id") or "")
+    session = _sessions.get(sid)
 
     # Stage order is load-bearing: quick > plugin > bundle > skill > built-in.
     stages = (_dispatch_quick, _dispatch_plugin, _dispatch_bundle, _dispatch_skill, _SLASH_BUILTINS.get(name))
     for stage in filter(None, stages):
-        res = stage(rid, params, session, name, arg)
+        res = stage(rid, params, session, sid, name, arg)
         if res is not None:
             if name in _SESSION_CONTROL_SLASHES and "error" not in res:
-                _publish_session_control_snapshot(params.get("session_id", ""), session)
+                _publish_session_control_snapshot(sid, session)
             return res
     return _err(rid, 4018, f"not a quick/plugin/bundle/skill command: {name}")
 
@@ -835,7 +892,7 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 4018, f"skill command: use command.dispatch for /{base}")
     if plugin_handler := _plugin_command_handler(base) if base else None:
         try:
-            return _ok(rid, {"output": _run_plugin_command(plugin_handler, arg) or "(no output)"})
+            return _ok(rid, {"output": _run_plugin_command(plugin_handler, arg, session, sid) or "(no output)"})
         except Exception as e:
             return _ok(rid, {"output": f"Plugin command error: {e}"})
     worker = session.get("slash_worker")

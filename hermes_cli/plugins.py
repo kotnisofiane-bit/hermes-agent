@@ -11,6 +11,7 @@ and an ``__init__.py`` exposing ``register(ctx)``. Plugins register callbacks fo
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import importlib.metadata
 import inspect
 import json
@@ -1980,10 +1981,11 @@ def get_plugin_command_handler(name: str) -> Optional[Callable]:
 _PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS = 30.0
 
 
-def resolve_plugin_command_result(result: Any) -> Any:
+def resolve_plugin_command_result(result: Any, *, propagate_context: bool = False) -> Any:
     """Resolve a plugin command result, awaiting async handlers: ``asyncio.run`` when no loop is
     running, else a helper thread with its own loop (30s bound so a hung handler cannot wedge the
-    terminal)."""
+    terminal). Context propagation to that helper is opt-in; the default keeps other callers
+    isolated from their current ContextVars."""
     if not inspect.isawaitable(result):
         return result
     try:
@@ -1992,9 +1994,11 @@ def resolve_plugin_command_result(result: Any) -> Any:
         return asyncio.run(result)
     outcome: Dict[str, Any] = {}
     failure: Dict[str, BaseException] = {}
+    started = threading.Event()
     done = threading.Event()
 
     def _runner() -> None:
+        started.set()
         try:
             outcome["value"] = asyncio.run(result)
         except BaseException as exc:  # pragma: no cover - re-raised below
@@ -2002,7 +2006,13 @@ def resolve_plugin_command_result(result: Any) -> Any:
         finally:
             done.set()
 
-    threading.Thread(target=_runner, name="hermes-plugin-command-await", daemon=True).start()
+    helper_context = contextvars.copy_context() if propagate_context else contextvars.Context()
+    target = lambda: helper_context.run(_runner)
+    threading.Thread(target=target, name="hermes-plugin-command-await", daemon=True).start()
+    # Measure the handler timeout only after the helper thread is actually scheduled.
+    # Otherwise a loaded process can time out before asyncio.run(result) has even
+    # started, leaking an un-awaited coroutine and making session-isolation tests flaky.
+    started.wait()
     if not done.wait(timeout=_PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS):
         raise TimeoutError("Plugin command async handler did not complete within "
                            f"{_PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS:.0f}s")
