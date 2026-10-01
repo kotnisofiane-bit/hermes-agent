@@ -61,13 +61,17 @@ class _StalledSummaryWorker:
     attempt commits a real summary.
     """
 
-    def __init__(self, compressed, *, stall_attempts=1):
+    def __init__(self, compressed, *, stall_attempts=1, cooperative_cancel=False):
         self.compressed = compressed
         self.stall_attempts = stall_attempts
+        self.cooperative_cancel = cooperative_cancel
         self.routes = []
         self.fences = []
         self._lock = threading.Lock()
         self.release = threading.Event()
+        self.primary_cancelled = threading.Event()
+        self.fallback_started = threading.Event()
+        self.events = []
 
     @property
     def attempts(self):
@@ -79,18 +83,61 @@ class _StalledSummaryWorker:
             self.fences.append(fence)
             attempt = len(self.routes)
         if attempt <= self.stall_attempts:
-            # Connection open, zero tokens, zero fence progress.
-            self.release.wait(timeout=10)
+            # Connection open, zero tokens, zero fence progress. The deterministic
+            # fallback test uses a cooperative provider stub: once the host wins
+            # cancellation, the stalled call notices it and exits promptly so the
+            # configured fallback can start. Other tests keep the historical
+            # non-cooperative behaviour to exercise orphan/late-result handling.
+            if self.cooperative_cancel:
+                cancel_signal = getattr(fence, "_test_cancel_signal", None)
+                assert cancel_signal is not None, "cooperative test fence missing cancel signal"
+                assert cancel_signal.wait(timeout=5), "Hermes never published primary cancellation"
+                assert fence.is_cancelled
+                with self._lock:
+                    self.events.append("primary_cancelled")
+                self.primary_cancelled.set()
+                return ([{"role": "assistant", "content": "late"}], "late-prompt")
+            else:
+                self.release.wait(timeout=10)
             return ([{"role": "assistant", "content": "late"}], "late-prompt")
+        if self.cooperative_cancel:
+            assert self.primary_cancelled.wait(timeout=2), (
+                "fallback must not proceed before the primary observes cancellation"
+            )
+            with self._lock:
+                self.events.append("fallback_started")
+            self.fallback_started.set()
         if not fence.begin_commit():
             return ([{"role": "assistant", "content": "cancelled"}], "cancelled")
         try:
-            return (self.compressed, "summarized-prompt")
+            result = (self.compressed, "summarized-prompt")
         finally:
             fence.finish_commit()
+        if self.cooperative_cancel:
+            with self._lock:
+                self.events.append("fallback_committed")
+        return result
 
 
-def _run(worker, *, chain, timeouts, messages, idle=0.05, ceiling=0.2):
+class _CooperativeCancelFence(CompressionCommitFence):
+    """Test fence that makes host cancellation acknowledgement deterministic."""
+
+    def __init__(self, worker):
+        super().__init__()
+        self._worker = worker
+        self._test_cancel_signal = threading.Event()
+
+    def try_cancel_before_commit(self):
+        cancelled = super().try_cancel_before_commit()
+        if cancelled:
+            self._test_cancel_signal.set()
+            assert self._worker.primary_cancelled.wait(timeout=5), (
+                "primary worker did not acknowledge Hermes cancellation"
+            )
+        return cancelled
+
+
+def _run(worker, *, chain, timeouts, messages, idle=0.05, ceiling=0.2, fence=None):
     with _patch_chain(chain):
         return run_compress_context_with_progress_timeout(
             worker=worker,
@@ -99,6 +146,7 @@ def _run(worker, *, chain, timeouts, messages, idle=0.05, ceiling=0.2):
             idle_timeout_seconds=idle,
             total_ceiling_seconds=ceiling,
             on_timeout=lambda *args: timeouts.append(args),
+            fence=fence,
         )
 
 
@@ -110,16 +158,30 @@ def _run(worker, *, chain, timeouts, messages, idle=0.05, ceiling=0.2):
 def test_stalled_summary_attempts_configured_fallback_chain():
     original = [{"role": "user", "content": "keep-me"}]
     compressed = [{"role": "user", "content": "summary of earlier turns"}]
-    worker = _StalledSummaryWorker(compressed)
+    worker = _StalledSummaryWorker(compressed, cooperative_cancel=True)
+    fence = _CooperativeCancelFence(worker)
     timeouts = []
 
     try:
         msgs, prompt = _run(
-            worker, chain=[CHAIN_ENTRY], timeouts=timeouts, messages=original
+            worker, chain=[CHAIN_ENTRY], timeouts=timeouts, messages=original, fence=fence,
+            # A cold helper import or a loaded runner must not expire the fence
+            # before the cooperative primary has entered its cancellation wait.
+            idle=2.0, ceiling=10.0,
         )
     finally:
         worker.release.set()
 
+    assert worker.primary_cancelled.is_set(), (
+        "the primary provider stub must observe Hermes cancellation before fallback"
+    )
+    assert worker.fallback_started.is_set()
+    assert worker.events == [
+        "primary_cancelled",
+        "fallback_started",
+        "fallback_committed",
+    ]
+    assert worker.fences[0].is_cancelled
     assert worker.attempts == 2, "the aborted stall must be retried once"
     assert worker.routes[0] is None, "the primary attempt is never pinned"
     pinned = worker.routes[1]
