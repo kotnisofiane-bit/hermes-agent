@@ -57,7 +57,9 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
                         "command": sys.executable,
                         "args": [str(server)],
                     }
-                }
+                },
+                "platform_toolsets": {"cli": ["profileprobe"]},
+                "agent": {"disabled_toolsets": ["kanban"]},
             }
         ),
         encoding="utf-8",
@@ -101,10 +103,34 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         try:
             line = output.get(timeout=10)
         except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
+            poll_before = proc.poll()
+            stdout_tail = ""
+            stderr_tail = ""
+            children = ""
+            if poll_before is None:
+                try:
+                    children = subprocess.run(
+                        ["ps", "-o", "pid=,ppid=,stat=,args=", "--ppid", str(proc.pid)],
+                        capture_output=True, text=True, timeout=2,
+                    ).stdout.strip()
+                except Exception as exc:
+                    children = f"<child inspection unavailable: {exc}>"
+                proc.terminate()
+            try:
+                stdout_tail, stderr_tail = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout_tail, stderr_tail = proc.communicate(timeout=5)
+            pytest.fail(
+                "slash worker produced no /tools response within 10 seconds; "
+                f"poll_before={poll_before!r}; returncode={proc.returncode!r}; "
+                f"stdout={stdout_tail[:2000]!r}; stderr={stderr_tail[:4000]!r}; "
+                f"children={children[:2000]!r}"
+            )
         response = json.loads(line)
         assert response["ok"] is True
         assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
+        assert "browser_navigate" not in response["output"]
     finally:
         proc.terminate()
         try:

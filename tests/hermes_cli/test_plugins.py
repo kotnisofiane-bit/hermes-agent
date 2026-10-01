@@ -2270,6 +2270,26 @@ class TestPluginCommandResultResolution:
         monkeypatch.setattr("hermes_cli.plugins.asyncio.get_running_loop", lambda: _Loop())
         assert resolve_plugin_command_result(_handler()) == "threaded-ok"
 
+    def test_helper_context_propagation_is_opt_in(self, monkeypatch):
+        import contextvars
+
+        class _Loop:
+            pass
+
+        marker = contextvars.ContextVar("plugin_command_context_marker", default="unset")
+        token = marker.set("caller")
+        monkeypatch.setattr("hermes_cli.plugins.asyncio.get_running_loop", lambda: _Loop())
+
+        async def _handler():
+            return marker.get()
+
+        try:
+            assert resolve_plugin_command_result(_handler()) == "unset"
+            assert resolve_plugin_command_result(_handler(), propagate_context=True) == "caller"
+            assert marker.get() == "caller"
+        finally:
+            marker.reset(token)
+
     def test_running_loop_timeout_does_not_hang_forever(self, monkeypatch):
         """Threaded path must abort a hung async handler instead of blocking the caller."""
         import asyncio as _asyncio
@@ -2286,6 +2306,47 @@ class TestPluginCommandResultResolution:
 
         with pytest.raises(TimeoutError):
             resolve_plugin_command_result(_slow_handler())
+
+    def test_timed_out_helper_keeps_its_context_after_caller_moves_on(self, monkeypatch):
+        import asyncio as _asyncio
+        import contextvars
+
+        class _Loop:
+            pass
+
+        real_get_running_loop = _asyncio.get_running_loop
+        marker = contextvars.ContextVar("plugin_command_timeout_marker", default="unset")
+        started = threading.Event()
+        finished = threading.Event()
+        gate = {}
+        observed = []
+
+        async def _slow_handler():
+            loop = real_get_running_loop()
+            release = _asyncio.Event()
+            gate.update(loop=loop, release=release)
+            started.set()
+            await release.wait()
+            observed.append(marker.get())
+            finished.set()
+            return "late-result"
+
+        monkeypatch.setattr("hermes_cli.plugins.asyncio.get_running_loop", lambda: _Loop())
+        monkeypatch.setattr("hermes_cli.plugins._PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS", 0.1)
+        token = marker.set("session-a")
+        try:
+            with pytest.raises(TimeoutError, match="did not complete within"):
+                resolve_plugin_command_result(_slow_handler(), propagate_context=True)
+            assert started.wait(2)
+            marker.set("session-b")
+            gate["loop"].call_soon_threadsafe(gate["release"].set)
+            assert finished.wait(2)
+            assert observed == ["session-a"]
+            assert marker.get() == "session-b"
+        finally:
+            marker.reset(token)
+            if gate and not gate["loop"].is_closed():
+                gate["loop"].call_soon_threadsafe(gate["release"].set)
 
 
 # ── TestPluginDispatchTool ────────────────────────────────────────────────

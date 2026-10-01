@@ -1352,6 +1352,452 @@ def test_command_dispatch_queue_sends_message(server):
     assert result["message"] == "tell me about quantum computing"
 
 
+def test_command_dispatch_keeps_quick_command_ahead_of_plugin(server, monkeypatch):
+    sid = "quick-before-plugin"
+    server._sessions[sid] = {"session_key": sid}
+    monkeypatch.setattr(server, "_load_cfg", lambda: {
+        "quick_commands": {"quick-probe": {"type": "alias", "target": "queue"}},
+    })
+    monkeypatch.setattr(server, "_plugin_command_handler", lambda _name: lambda _arg: "plugin-ran")
+
+    response = server.handle_request({
+        "id": "quick-first", "method": "command.dispatch",
+        "params": {"name": "quick-probe", "session_id": sid},
+    })
+
+    assert response["result"] == {"type": "alias", "target": "queue"}
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_sync_plugin_command_uses_gateway_record_and_restores_context(server, monkeypatch, raises):
+    from gateway import session_context
+    from tools import approval_context
+
+    sid, session_key = "rpc-session-a", "gateway-session-a"
+    record = {
+        "session_key": session_key, "source": "tui", "cwd": "/tmp/plugin-a",
+        "agent": types.SimpleNamespace(session_id="durable-session-a"),
+    }
+    server._sessions[sid] = record
+    observed = {}
+    reset_events, clear_events = [], []
+    original_reset = approval_context.reset_current_session_key
+    original_clear = session_context.clear_session_vars
+
+    def _reset(token):
+        before = approval_context.get_current_session_key()
+        original_reset(token)
+        reset_events.append((before, approval_context.get_current_session_key()))
+
+    def _clear(tokens):
+        before = session_context.get_session_env("HERMES_SESSION_KEY", "")
+        original_clear(tokens)
+        clear_events.append((before, session_context.get_session_env("HERMES_SESSION_KEY", "")))
+
+    monkeypatch.setattr(approval_context, "reset_current_session_key", _reset)
+    monkeypatch.setattr(session_context, "clear_session_vars", _clear)
+
+    def _handler(_arg):
+        observed.update({
+            "approval_key": approval_context.get_current_session_key(),
+            "session_key": session_context.get_session_env("HERMES_SESSION_KEY", ""),
+            "session_id": session_context.get_session_env("HERMES_SESSION_ID", ""),
+            "ui_session_id": session_context.get_session_env("HERMES_UI_SESSION_ID", ""),
+            "source": session_context.get_session_env("HERMES_SESSION_SOURCE", ""),
+        })
+        if raises:
+            raise RuntimeError("symbolic plugin failure")
+        return "sync-ok"
+
+    monkeypatch.setattr(server, "_plugin_command_handler", lambda _name: _handler)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_bundle_key_for", lambda _name: None)
+
+    outer_session_tokens = session_context.set_session_vars(
+        session_key="ambient-session", session_id="ambient-durable", source="ambient")
+    outer_approval_token = approval_context.set_current_session_key("ambient-approval")
+    try:
+        response = server.handle_request({
+            "id": "plugin-sync", "method": "command.dispatch",
+            "params": {
+                "name": "sync-probe", "arg": "noop", "session_id": sid,
+                "approval_session_key": "forged-session", "gateway_session_id": "forged-runtime-id",
+            },
+        })
+        assert observed == {
+            "approval_key": session_key, "session_key": session_key,
+            "session_id": "durable-session-a", "ui_session_id": sid,
+            "source": "tui",
+        }
+        assert approval_context.get_current_session_key() == "ambient-approval"
+        assert session_context.get_session_env("HERMES_SESSION_KEY", "") == "ambient-session"
+        assert reset_events == [(session_key, "ambient-approval")]
+        assert clear_events == [(session_key, "")]
+    finally:
+        original_reset(outer_approval_token)
+        original_clear(outer_session_tokens)
+
+    if raises:
+        assert "error" in response
+    else:
+        assert response["result"]["output"] == "sync-ok"
+
+
+def test_sync_plugin_command_clears_partial_session_binding(server, monkeypatch):
+    from gateway import session_context
+
+    sid, session_key = "rpc-partial", "gateway-partial"
+    server._sessions[sid] = {
+        "session_key": session_key, "source": "tui", "cwd": "/tmp/plugin-partial",
+        "agent": types.SimpleNamespace(session_id="durable-partial"),
+    }
+    original_set = session_context.set_session_vars
+    original_clear = session_context.clear_session_vars
+    clear_events, invoked = [], []
+
+    def _partially_bind(**kwargs):
+        original_set(**kwargs)
+        raise RuntimeError("binding stopped partway")
+
+    def _clear(tokens):
+        before = session_context.get_session_env("HERMES_SESSION_KEY", "")
+        original_clear(tokens)
+        clear_events.append((before, session_context.get_session_env("HERMES_SESSION_KEY", "")))
+
+    monkeypatch.setattr(session_context, "set_session_vars", _partially_bind)
+    monkeypatch.setattr(session_context, "clear_session_vars", _clear)
+    monkeypatch.setattr(server, "_plugin_command_handler", lambda _name: lambda _arg: invoked.append(True))
+    monkeypatch.setattr(server, "_is_profile_skill_command", lambda *_args: False)
+    monkeypatch.setattr(server, "_bundle_key_for", lambda _name: None)
+    monkeypatch.setattr(server, "_live_slash_command_output", lambda *_args: None)
+
+    response = server.handle_request({
+        "id": "plugin-partial", "method": "slash.exec",
+        "params": {"command": "partial-probe", "session_id": sid},
+    })
+
+    assert "binding stopped partway" in response["result"]["output"]
+    assert invoked == []
+    assert clear_events == [(session_key, "")]
+
+
+def test_native_plugin_approval_stays_in_each_sync_and_async_session(server, monkeypatch):
+    import asyncio
+    import queue
+
+    from gateway import session_context
+    from tools import approval, approval_context
+
+    session_specs = {
+        "sync": ("rpc-sync-approval", "approval-sync-key"),
+        "async": ("rpc-async-approval", "approval-async-key"),
+    }
+    for _kind, (sid, session_key) in session_specs.items():
+        server._sessions[sid] = {
+            "session_key": session_key, "source": "tui", "cwd": f"/tmp/{sid}",
+            "agent": types.SimpleNamespace(session_id=f"durable-{sid}"),
+        }
+
+    emitted = queue.Queue()
+    identities = {}
+    business_actions = []
+    reset_events, clear_events = queue.Queue(), queue.Queue()
+    original_request = approval.request_tool_approval
+    original_reset = approval_context.reset_current_session_key
+    original_clear = session_context.clear_session_vars
+
+    def _capture_emit(event, sid, payload):
+        emitted.put((event, sid, payload))
+
+    def _record_request(tool_name, reason, **kwargs):
+        identities[reason] = (
+            approval_context._approval_session_key.get(),
+            session_context.get_session_env("HERMES_SESSION_KEY", ""),
+            session_context.get_session_env("HERMES_SESSION_ID", ""),
+            session_context.get_session_env("HERMES_UI_SESSION_ID", ""),
+        )
+        return original_request(tool_name, reason, **kwargs)
+
+    def _record_reset(token):
+        before_direct = approval_context._approval_session_key.get()
+        original_reset(token)
+        after_direct = approval_context._approval_session_key.get()
+        reset_events.put(("approval", before_direct, after_direct, threading.current_thread().name))
+
+    def _record_clear(tokens):
+        before = session_context.get_session_env("HERMES_SESSION_KEY", "")
+        original_clear(tokens)
+        clear_events.put((
+            "session", before, session_context.get_session_env("HERMES_SESSION_KEY", ""),
+            threading.current_thread().name,
+        ))
+
+    monkeypatch.setattr(server, "_emit", _capture_emit)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    monkeypatch.setattr(approval, "request_tool_approval", _record_request)
+    monkeypatch.setattr(approval_context, "reset_current_session_key", _record_reset)
+    monkeypatch.setattr(session_context, "clear_session_vars", _record_clear)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_bundle_key_for", lambda _name: None)
+    monkeypatch.setattr(server, "_is_profile_skill_command", lambda *_args: False)
+    monkeypatch.setattr(server, "_live_slash_command_output", lambda *_args: None)
+
+    for kind, (sid, session_key) in session_specs.items():
+        approval.register_gateway_notify(
+            session_key, lambda data, _sid=sid: server._emit_approval_request(_sid, data))
+
+    def _request(reason):
+        return approval.request_tool_approval("symbolic-action", reason, rule_key=f"kot-228:{reason}")
+
+    def _sync_handler(label):
+        decision = _request(f"sync {label}")
+        return "approved" if decision.get("approved") else "denied"
+
+    async def _async_handler(label):
+        decision = _request(f"async {label}")
+        return "approved" if decision.get("approved") else "denied"
+
+    handlers = {"sync-probe": _sync_handler, "async-probe": _async_handler}
+    monkeypatch.setattr(server, "_plugin_command_handler", lambda name: handlers.get(name))
+    responses, failures, worker_states = {}, [], {}
+
+    def _sync_call():
+        ambient_token = approval_context.set_current_session_key("ambient-sync")
+        try:
+            responses["sync"] = server.handle_request({
+                "id": "sync-plugin", "method": "command.dispatch",
+                "params": {"name": "sync-probe", "arg": "A", "session_id": session_specs["sync"][0]},
+            })
+            worker_states["sync"] = (
+                approval_context._approval_session_key.get(),
+                session_context.get_session_env("HERMES_SESSION_KEY", ""),
+            )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            original_reset(ambient_token)
+
+    def _async_call():
+        async def _inside_loop():
+            return server.handle_request({
+                "id": "async-plugin", "method": "slash.exec",
+                "params": {"command": "async-probe B", "session_id": session_specs["async"][0]},
+            })
+        ambient_token = approval_context.set_current_session_key("ambient-async")
+        try:
+            responses["async"] = asyncio.run(_inside_loop())
+            worker_states["async"] = (
+                approval_context._approval_session_key.get(),
+                session_context.get_session_env("HERMES_SESSION_KEY", ""),
+            )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            original_reset(ambient_token)
+
+    workers = [
+        threading.Thread(target=_sync_call, name="kot228-sync"),
+        threading.Thread(target=_async_call, name="kot228-async"),
+    ]
+    try:
+        for worker in workers:
+            worker.start()
+        event_rows = [emitted.get(timeout=10), emitted.get(timeout=10)]
+        assert {row[1] for row in event_rows} == {session_specs["sync"][0], session_specs["async"][0]}
+        assert all(row[0] == "approval.request" for row in event_rows)
+        assert {row[2]["description"] for row in event_rows} == {"sync A", "async B"}
+
+        by_sid = {row[1]: row[2] for row in event_rows}
+        for kind, choice in (("sync", "once"), ("async", "deny")):
+            sid = session_specs[kind][0]
+            replied = server.handle_request({
+                "id": f"approval-{kind}", "method": "approval.respond",
+                "params": {"session_id": sid, "request_id": by_sid[sid]["request_id"], "choice": choice},
+            })
+            assert replied["result"]["resolved"] == 1
+
+        for worker in workers:
+            worker.join(timeout=10)
+            assert not worker.is_alive()
+        assert failures == []
+        assert responses["sync"]["result"]["type"] == "plugin"
+        assert responses["sync"]["result"]["output"] == "approved"
+        assert responses["async"]["result"]["output"] == "denied"
+        assert business_actions == []
+        assert identities == {
+            "sync A": ("approval-sync-key", "approval-sync-key", "durable-rpc-sync-approval", "rpc-sync-approval"),
+            "async B": ("approval-async-key", "approval-async-key", "durable-rpc-async-approval", "rpc-async-approval"),
+        }
+        assert worker_states == {
+            "sync": ("ambient-sync", ""),
+            "async": ("ambient-async", ""),
+        }
+        reset_rows = [reset_events.get(timeout=5) for _ in range(3)]
+        clear_rows = [clear_events.get(timeout=5) for _ in range(3)]
+        assert [row[:3] for row in reset_rows].count(
+            ("approval", "approval-sync-key", "ambient-sync")) == 1
+        assert [row[:3] for row in reset_rows].count(
+            ("approval", "approval-async-key", "ambient-async")) == 2
+        assert any(
+            row == ("approval", "approval-sync-key", "ambient-sync", "kot228-sync")
+            for row in reset_rows)
+        assert any(
+            row == ("approval", "approval-async-key", "ambient-async", "kot228-async")
+            for row in reset_rows)
+        assert any(
+            row == ("approval", "approval-async-key", "ambient-async", "hermes-plugin-command-await")
+            for row in reset_rows)
+        assert [row[:3] for row in clear_rows].count(
+            ("session", "approval-sync-key", "")) == 1
+        assert [row[:3] for row in clear_rows].count(
+            ("session", "approval-async-key", "")) == 2
+        assert approval.list_gateway_approvals("approval-sync-key") == []
+        assert approval.list_gateway_approvals("approval-async-key") == []
+    finally:
+        for _kind, (sid, session_key) in session_specs.items():
+            approval.unregister_gateway_notify(session_key)
+            approval.clear_session(session_key)
+        for worker in workers:
+            if worker.ident is not None:
+                worker.join(timeout=10)
+
+
+def test_timed_out_async_plugin_keeps_only_its_session_context(server, monkeypatch):
+    import asyncio
+    import queue
+
+    from gateway import session_context
+    from tools import approval_context
+
+    sid_a, sid_b = "rpc-timeout-a", "rpc-timeout-b"
+    session_a, session_b = "gateway-timeout-a", "gateway-timeout-b"
+    for sid, key in ((sid_a, session_a), (sid_b, session_b)):
+        server._sessions[sid] = {
+            "session_key": key, "source": "tui", "cwd": f"/tmp/{sid}",
+            "agent": types.SimpleNamespace(session_id=f"durable-{sid}"),
+        }
+
+    started, finished = threading.Event(), threading.Event()
+    gate = {}
+    session_cleanup_done, approval_cleanup_done = threading.Event(), threading.Event()
+    after_wait, cleanups = queue.Queue(), queue.Queue()
+    worker_state = {}
+    original_clear = session_context.clear_session_vars
+    original_reset = approval_context.reset_current_session_key
+
+    def _clear(tokens):
+        before = session_context.get_session_env("HERMES_SESSION_KEY", "")
+        original_clear(tokens)
+        after = session_context.get_session_env("HERMES_SESSION_KEY", "")
+        thread_name = threading.current_thread().name
+        cleanups.put(("session", before, after, thread_name))
+        if before == session_a and after == "" and thread_name == "hermes-plugin-command-await":
+            session_cleanup_done.set()
+
+    def _reset(token):
+        before_direct = approval_context._approval_session_key.get()
+        original_reset(token)
+        after_direct = approval_context._approval_session_key.get()
+        thread_name = threading.current_thread().name
+        cleanups.put(("approval", before_direct, after_direct, thread_name))
+        if (before_direct == session_a and after_direct == "ambient-timeout-a"
+                and thread_name == "hermes-plugin-command-await"):
+            approval_cleanup_done.set()
+
+    monkeypatch.setattr(session_context, "clear_session_vars", _clear)
+    monkeypatch.setattr(approval_context, "reset_current_session_key", _reset)
+    monkeypatch.setattr("hermes_cli.plugins._PLUGIN_COMMAND_AWAIT_TIMEOUT_SECS", 0.1)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_bundle_key_for", lambda _name: None)
+    monkeypatch.setattr(server, "_is_profile_skill_command", lambda *_args: False)
+    monkeypatch.setattr(server, "_live_slash_command_output", lambda *_args: None)
+
+    async def _slow(_arg):
+        loop = asyncio.get_running_loop()
+        release = asyncio.Event()
+        gate.update(loop=loop, release=release)
+        started.set()
+        await release.wait()
+        after_wait.put((
+            approval_context._approval_session_key.get(),
+            session_context.get_session_env("HERMES_SESSION_KEY", ""),
+            session_context.get_session_env("HERMES_SESSION_ID", ""),
+        ))
+        finished.set()
+        return "late"
+
+    def _fast(_arg):
+        return ":".join((
+            approval_context.get_current_session_key(),
+            session_context.get_session_env("HERMES_SESSION_KEY", ""),
+            session_context.get_session_env("HERMES_SESSION_ID", ""),
+        ))
+
+    monkeypatch.setattr(
+        server, "_plugin_command_handler",
+        lambda name: {"slow-probe": _slow, "fast-probe": _fast}.get(name))
+
+    def _slow_rpc():
+        async def _inside_loop():
+            return server.handle_request({
+                "id": "slow-plugin", "method": "slash.exec",
+                "params": {"command": "slow-probe", "session_id": sid_a},
+            })
+        return asyncio.run(_inside_loop())
+
+    server_response = []
+
+    def _slow_worker():
+        ambient_token = approval_context.set_current_session_key("ambient-timeout-a")
+        try:
+            response = _slow_rpc()
+            server_response.append(response)
+            worker_state["after_rpc"] = (
+                approval_context._approval_session_key.get(),
+                session_context.get_session_env("HERMES_SESSION_KEY", ""),
+            )
+        finally:
+            original_reset(ambient_token)
+
+    worker = threading.Thread(target=_slow_worker, name="kot228-timeout-caller")
+    try:
+        worker.start()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert "Plugin command error:" in server_response[0]["result"]["output"]
+        assert worker_state["after_rpc"] == ("ambient-timeout-a", "")
+        assert started.wait(5)
+
+        fast = server.handle_request({
+            "id": "fast-plugin", "method": "command.dispatch",
+            "params": {"name": "fast-probe", "arg": "unused", "session_id": sid_b},
+        })
+        assert fast["result"]["output"] == f"{session_b}:{session_b}:durable-{sid_b}"
+
+        gate["loop"].call_soon_threadsafe(gate["release"].set)
+        assert finished.wait(5)
+        assert after_wait.get(timeout=5) == (session_a, session_a, f"durable-{sid_a}")
+        assert session_cleanup_done.wait(5)
+        assert approval_cleanup_done.wait(5)
+        cleanup_rows = list(cleanups.queue)
+        assert (
+            "approval", session_a, "ambient-timeout-a", "hermes-plugin-command-await"
+        ) in cleanup_rows
+        assert (
+            "session", session_a, "", "hermes-plugin-command-await"
+        ) in cleanup_rows
+        assert not any(
+            row[1] == session_a and row[2] == session_b
+            for row in cleanup_rows if row[0] == "approval")
+    finally:
+        if gate and not gate["loop"].is_closed():
+            gate["loop"].call_soon_threadsafe(gate["release"].set)
+        if worker.ident is not None:
+            worker.join(timeout=10)
+
+
 def test_skills_manage_search_uses_tools_hub_sources(server):
     result = type("Result", (), {
         "description": "Build better terminal demos",
