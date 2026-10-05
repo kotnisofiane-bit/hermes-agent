@@ -96,6 +96,25 @@ def _reply(**fields) -> None:
     sys.stdout.flush()
 
 
+def _resolve_slash_worker_toolsets():
+    """Use the active profile's CLI runtime toolsets instead of probing the full catalog.
+
+    The parent already scopes HERMES_HOME to the session profile. Matching the TUI runtime
+    resolver here keeps /tools and other slash-command inspection surfaces aligned with the
+    session agent and avoids availability probes for disabled toolsets.
+    """
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+
+        return sorted(_get_platform_tools(
+            load_config() or {}, "cli", include_default_mcp_servers=True))
+    except Exception:
+        logger.debug("slash worker toolset resolution failed; falling back to HermesCLI defaults",
+                     exc_info=True)
+        return None
+
+
 def main():
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--session-key", required=True)
@@ -107,8 +126,11 @@ def main():
     # gateway dies mid-spawn.
     _start_parent_death_watchdog(os.getppid())
     _prepare_slash_worker_runtime()
+    toolsets = _resolve_slash_worker_toolsets()
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        cli = HermesCLI(model=args.model or None, compact=True, resume=args.session_key, verbose=False)
+        cli = HermesCLI(
+            model=args.model or None, toolsets=toolsets, compact=True,
+            resume=args.session_key, verbose=False)
     # Spurious stdin-EOF recovery (same shared-file-description O_NONBLOCK issue as the gateway entry
     # point — any child inheriting fd 0 can flip the flag).
     _sw_recovery_times: list[float] = []
