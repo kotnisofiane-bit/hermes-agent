@@ -87,6 +87,10 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        from agent.b2b_execution import execute_terminal, require_execution
+        cap = require_execution(agent)
+        if cap is not None:
+            return execute_terminal(agent, next_api_kwargs, cap, turn_id=turn_id)
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
@@ -129,14 +133,28 @@ def perform_api_call(
     with _bracket:
         if _model_request_active is not None:
             _model_request_active.set()
+    from agent.b2b_execution import B2BTerminalRefusal
     try:
-        response = run_llm_execution_middleware(
-            api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
-            task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
-            session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
-            provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
-            api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
-        )
+        try:
+            response = run_llm_execution_middleware(
+                api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
+                task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
+                session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
+                provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
+                api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
+            )
+            from agent.b2b_execution import validate_terminal_result
+            validate_terminal_result(agent, response)
+        except B2BTerminalRefusal as exc:
+            # A governed terminal refusal is terminal: record the typed reason
+            # durably, never re-enter through the generic api-error retry path.
+            from contextlib import suppress as _sup
+            from agent.b2b_execution import current_execution
+            _b2b_cap = current_execution()
+            if _b2b_cap is not None and getattr(_b2b_cap, "sink", None) is not None:
+                with _sup(Exception):
+                    _b2b_cap.sink.block(str(exc))
+            return _verdict("break")
     finally:
         with _bracket:
             if _model_request_active is not None:

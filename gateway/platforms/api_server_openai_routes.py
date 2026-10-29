@@ -632,6 +632,9 @@ class OpenAICompatRoutesMixin:
                 return _invalid_request("Invalid session ID")
             if len(provided_session_id) > self._MAX_SESSION_HEADER_LEN:
                 return _invalid_request("Session ID too long")
+            from agent.b2b_execution import is_b2b_session_id
+            if is_b2b_session_id(provided_session_id):
+                return _invalid_request("Session not found")
             session_id = provided_session_id
             try:
                 db = await self._ensure_session_db_async()
@@ -643,6 +646,8 @@ class OpenAICompatRoutesMixin:
                     # the delivery writer (gateway/wake.py) and /v1/runs use; fails open.
                     from gateway.platforms.api_server_runs import _resolve_live_session_id
                     session_id = await _resolve_live_session_id(self, provided_session_id)
+                    if is_b2b_session_id(session_id):
+                        return _invalid_request("Session not found")
                     history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
@@ -1018,8 +1023,11 @@ class OpenAICompatRoutesMixin:
             stored = self._current_response_store().get(previous_response_id)
             if stored is None:
                 return _error_response(f"Previous response not found: {previous_response_id}", 404)
-            conversation_history = list(stored.get("conversation_history", []))
             stored_session_id = stored.get("session_id")
+            from agent.b2b_execution import is_b2b_session_id
+            if is_b2b_session_id(stored_session_id):
+                return _error_response("Session not found", 404)
+            conversation_history = list(stored.get("conversation_history", []))
             if instructions is None:
                 instructions = stored.get("instructions")
         # All input messages but the last become history; the last is the user message.
@@ -1038,6 +1046,11 @@ class OpenAICompatRoutesMixin:
             stored_session_id
             or await asyncio.to_thread(self._declared_conversation_session, gateway_session_key)
             or str(uuid.uuid4()))
+        # Final selector: a declared-key resolution may legally yield a reserved id —
+        # it must never be silently adopted before the run constructs history/agent.
+        from agent.b2b_execution import is_b2b_session_id
+        if is_b2b_session_id(session_id):
+            return _error_response("Session not found", 404)
         stream = _coerce_request_bool(body.get("stream"), default=False)
         route, agent_overrides, selection_error = self._select_request_route(
             body, session_id=session_id, gateway_session_key=gateway_session_key,
@@ -1136,6 +1149,9 @@ class OpenAICompatRoutesMixin:
         stored = self._current_response_store().get(response_id)
         if stored is None:
             return _error_response(f"Response not found: {response_id}", 404)
+        from agent.b2b_execution import is_b2b_session_id
+        if is_b2b_session_id(stored.get("session_id")):
+            return _error_response(f"Response not found: {response_id}", 404)
         return web.json_response(stored["response"])
 
     async def _handle_delete_response(self, request: "web.Request") -> "web.Response":
@@ -1145,6 +1161,11 @@ class OpenAICompatRoutesMixin:
         if auth_err:
             return auth_err
         response_id = request.match_info["response_id"]
+        _stored = self._current_response_store().get(response_id)
+        if _stored is not None:
+            from agent.b2b_execution import is_b2b_session_id
+            if is_b2b_session_id(_stored.get("session_id")):
+                return _error_response(f"Response not found: {response_id}", 404)
         if not self._current_response_store().delete(response_id):
             return _error_response(f"Response not found: {response_id}", 404)
         return web.json_response({"id": response_id, "object": "response", "deleted": True})

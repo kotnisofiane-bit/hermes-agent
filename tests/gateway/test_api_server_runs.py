@@ -2372,3 +2372,28 @@ class TestHostedRoomRuns:
                 )
             assert rejected.status == 403
             create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# B2B namespace guards — reserved session ids refuse every generic run surface
+# before history load or agent construction.
+# ---------------------------------------------------------------------------
+
+def test_b2b_session_id_predicate():
+    from agent.b2b_execution import is_b2b_session_id
+    assert is_b2b_session_id("b2b_" + "a" * 64)
+    assert not is_b2b_session_id("b2b_" + "a" * 63)
+    assert not is_b2b_session_id("api_x")
+
+
+@pytest.mark.asyncio
+async def test_generic_runs_reject_b2b_session():
+    """POST /v1/runs with a reserved b2b_ session_id -> 404 before any turn."""
+    adapter = _make_adapter(api_key="k" * 16)
+    app = _create_runs_app(adapter)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/v1/runs",
+            json={"session_id": "b2b_" + "f" * 64, "input": "x"},
+            headers={"Authorization": "Bearer " + "k" * 16})
+        assert resp.status == 404, await resp.text()

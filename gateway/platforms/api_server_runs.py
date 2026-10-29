@@ -1,6 +1,7 @@
 """Durable ``/v1/runs`` admission, status, events, and control handlers."""
 
 import asyncio
+import datetime as dt
 import hashlib
 import json
 import logging
@@ -395,8 +396,12 @@ def _resolve_conversation_history(
     if not conversation_history and previous_response_id:
         stored = self._current_response_store().get(previous_response_id)
         if stored:
-            conversation_history = list(stored.get("conversation_history", []))
             stored_session_id = stored.get("session_id")
+            from agent.b2b_execution import is_b2b_session_id
+            if is_b2b_session_id(stored_session_id):
+                return [], instructions, None, _json_error(
+                    _openai_error, "Session not found", code="session_not_found", status=404)
+            conversation_history = list(stored.get("conversation_history", []))
             if instructions is None:
                 instructions = stored.get("instructions")
     if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
@@ -453,6 +458,7 @@ class _RunLaunch:
     browser_control_principal: Any
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
+    b2b_execution: Any = None  # frozen BoundExecution, bound at admission; never request-derived
 
     @property
     def approval_session_key(self) -> str:
@@ -538,6 +544,10 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
             # resolution the HTTP self-post consumes — a compressed origin must be woken on the
             # transcript that is actually live, never the retired parent slice.
             resolved = await _resolve_live_session_id(self, session_id)
+            from gateway.platforms.api_server_b2b import guarded_session_id
+            resolved, guard_err = guarded_session_id(self, resolved)
+            if guard_err is not None:
+                raise RuntimeError("internal wake refused for a protected B2B session")
             session, err = await self._get_existing_session_or_404(resolved)
             if err is not None or not session:
                 raise RuntimeError(
@@ -644,9 +654,15 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
         if _declared_selected else None)
     # A client-addressed id from before a compression rotation must adopt the live tip (#98619):
     # history loads from it, the turn writes to it, and a detached delivery row persisted to it
-    # is what the next same-id run consumes below.
+    # is what the next same-id run consumes below. The protected B2B namespace is refused before
+    # any resolver can alias a bound id.
+    from agent.b2b_execution import is_b2b_session_id
+    if selected_session_id and is_b2b_session_id(str(selected_session_id)):
+        return _json_error(_openai_error, "Session not found", code="session_not_found", status=404)
     if selected_session_id:
         selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
+    if selected_session_id and is_b2b_session_id(str(selected_session_id)):
+        return _json_error(_openai_error, "Session not found", code="session_not_found", status=404)
     session_id = selected_session_id or run_id
     # History loads for the session the request actually selected — including one resolved from
     # a declared X-Hermes-Session-Key, whose persisted delivery rows must reach the next
@@ -745,6 +761,9 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     with self._profile_scope(run.request_profile):
         try:
             # Contextvars, not process env: concurrent runs must not share identity.
+            if run.b2b_execution is not None:
+                from agent.b2b_execution import bind_execution, reset_execution
+                resets.append((bind_execution(run.b2b_execution), reset_execution))
             resets.append((set_current_session_key(run.approval_session_key), reset_current_session_key))
             # chat_id carries the raw session id like _run_agent() does; without it
             # tools.async_delegation sees no HERMES_SESSION_CHAT_ID and forces delegations sync.
@@ -911,10 +930,33 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
-        with self._profile_scope(run.request_profile):
-            agent = self._create_agent(
-                stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+        cap = run.b2b_execution
+        cap_token = None
+        if cap is not None:
+            from agent.b2b_execution import bind_execution
+            cap_token = bind_execution(cap)  # agent construction reads it through current_execution
+        try:
+            def _construct_agent():
+                with self._profile_scope(run.request_profile):
+                    return self._create_agent(
+                        stream_delta_callback=_text_cb,
+                        tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                        interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+            if cap is None:
+                agent = _construct_agent()
+            else:
+                # B2B: cold AIAgent.__init__ (httpx import, client build) must not
+                # block the serving event loop — typed reads + control stay live.
+                # copy_context carries the bound execution across the worker;
+                # _submit_api_worker holds the worker's lifetime count.
+                from contextvars import copy_context
+                ctor_context = copy_context()
+                agent = await _submit_api_worker(
+                    loop, lambda: ctor_context.run(_construct_agent))
+        finally:
+            if cap_token is not None:
+                from agent.b2b_execution import reset_execution
+                reset_execution(cap_token)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(
@@ -922,6 +964,13 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if not isinstance(result, dict):
             result = {}
         status, fields = terminal_run_status(result)
+        if cap is not None:
+            # B2B lanes: a nominal completed turn still needs before_seal + qualified
+            # recheck + source_basis equality + atomic seal; anything short of that is a
+            # classified blocked/terminal state, never "completed" without durable receipts.
+            status, fields, extra = await _b2b_finalize(cap, result, status, fields)
+            _finish(status, fields, **(extra or {}))
+            return
         if status == "cancelled":
             _finish("cancelled", fields)
         elif result.get("failed"):
@@ -937,14 +986,20 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                               else "raw_request" if any(requested.values()) else "global"))
             _finish(status, fields, output=result.get("final_response", ""), usage=usage, runtime=served_runtime)
     except asyncio.CancelledError:
+        if run.b2b_execution is not None:
+            run.b2b_execution.sink.block("native_run_interrupted")
         _finish("cancelled")
         raise
     except _api_server._ProviderAuthResolutionError as exc:
         # Same controlled provider-auth message the _run_agent() endpoints give.
         logger.warning("Provider resolution failed for run=%s: %s", run_id, exc)
+        if run.b2b_execution is not None:
+            run.b2b_execution.sink.block("policy_provider_unavailable")
         _finish("failed", error=exc.user_text())
     except Exception as exc:
         logger.exception("[api_server] run %s failed", run_id)
+        if run.b2b_execution is not None:
+            run.b2b_execution.sink.block(str(exc))
         _finish("failed", error=_redact_api_error_text(exc))
     finally:
         # On cancellation (/stop) the executor thread may still block on an approval
@@ -953,6 +1008,60 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         with suppress(Exception):
             run.put_event(None)  # sentinel: close the SSE stream
         _retire_live_run(self, run_id)
+
+
+async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[str, Any]):
+    """Only worker-attested durable output can become a fully sealed proposal."""
+    from agent.b2b_execution import (
+        B2BTerminalRefusal, bind_execution, reset_execution, recheck_context, validate_proposal,
+        extract_allowed_refs)
+
+    sink = cap.sink
+
+    def blocked(reason, native_status="failed"):
+        sink.block(reason)
+        return native_status, {
+            **fields, "completed": False, "partial": False,
+            "interrupted": native_status in {"cancelled", "interrupted"}, "error": reason}, None
+
+    token = bind_execution(cap)
+    try:
+        with sink._adapter._profile_scope(cap.profile if cap.profile != "default" else None):
+            # First refusal wins: an attempt already blocked durably keeps its typed
+            # reason - never reclassify it as a later, unrelated family.
+            row = sink._store.b2b_attempt(profile=cap.profile, attempt_id=cap.attempt_id)
+            if row is not None and row["status"] not in {
+                    "admitted", "context_ready", "dispatch_committed", "result_received"}:
+                return blocked(row["status"], "interrupted" if row["status"] in
+                               {"cancelled", "interrupted"} else "failed")
+            receipt = cap.context_receipt
+            if receipt is None:
+                return blocked("context_unavailable")
+            if result.get("failed") or status != "completed":
+                return blocked("b2b_run_failed", status if status in {"cancelled", "interrupted"} else "failed")
+            artifact = sink._store.b2b_artifact(attempt_id=cap.attempt_id, kind="provider_result")
+            if artifact is None:
+                return blocked("result_unattested")
+            public = json.loads(artifact["payload"])
+            parsed, _ = validate_proposal(public["text"], extract_allowed_refs(receipt.view))
+            if (parsed is None or parsed != public.get("proposal") or
+                    result.get("final_response", "").strip() != public["text"].strip()):
+                return blocked("result_invalid")
+            # The rechecker runs in the copied profile/capability scope; original context stays immutable.
+            fresh = await asyncio.to_thread(recheck_context, cap, receipt)
+            source = await sink.resolve_before_seal()
+            if source is None:
+                return blocked("source_before_seal_denied")
+            proposal = sink.seal(
+                source_before_seal=source, rechecked_view=fresh,
+                created_at=dt.datetime.now(dt.timezone.utc).isoformat())
+            return "completed", {**fields, "completed": True}, {
+                "output": json.dumps(parsed, ensure_ascii=False),
+                "b2b": {key: proposal[key] for key in ("proposal_id", "state", "created_at")}}
+    except B2BTerminalRefusal as exc:
+        return blocked(str(exc))
+    finally:
+        reset_execution(token)
 
 
 def _unregister_approval_notify(approval_session_key: Optional[str]) -> None:
@@ -973,6 +1082,11 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
 
 
 def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
+    try:
+        if self._run_idempotency_store.b2b_is_run(run_id) is True:
+            return False
+    except Exception:
+        return False
     scope = self._run_idempotency_scope(request)
     owner = self._run_owners.get(run_id)
     if owner is not None:

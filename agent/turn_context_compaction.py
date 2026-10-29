@@ -135,6 +135,9 @@ def run_turn_start_compaction(
         messages=messages, active_system_prompt=active_system_prompt,
         conversation_history=conversation_history, current_turn_user_idx=current_turn_user_idx,
     )
+    from agent.b2b_execution import is_b2b_session_id
+    if is_b2b_session_id(getattr(agent, "session_id", "")):
+        return out  # B2B lanes never compact: bounded no-compression budget by contract.
     _idle_compaction(agent, out, system_message, user_message, effective_task_id)
     _preflight_compression(agent, out, system_message, user_message, effective_task_id)
     return out
