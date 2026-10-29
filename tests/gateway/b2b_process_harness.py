@@ -125,48 +125,84 @@ def attempt_id_for(binding_digest: str) -> str:
          "operation": "proposal-v1"})).hexdigest()
 
 
-def build_context_view(policy: dict, source_body: dict, *, mode: str = "valid") -> dict:
+def build_context_view(policy: dict, source_body: dict, *, mode: str = "valid",
+                       rendered: str = UNIT_RENDERED) -> dict:
     """Transform the frozen template into a per-execution r2 view. UNIT CONTEXT
     PRODUCER DOUBLE data -- never a real AgentContext/C1 build. *mode* selects the
-    rejection family (namespace/authority/availability/view_instant drift)."""
+    rejection family (namespace/authority/availability/view_instant drift).
+
+    Every mirrored field is kept contract-exact with ``qualify_context_view``;
+    digest and bounds are recomputed over the mutated view (serialized_bytes is a
+    self-referential fixpoint -- iterate until stable)."""
+    from agent.b2b_execution import json_utf8, native_context_digest
     view = context_template()
     mission = policy.get("mission_request") or {}
     project = policy.get("project") or {}
+    project_id = policy.get("project_id") or view["project_id"]
+    mission_id = policy.get("mission_id") or view["mission_id"]
     view["bot_id"] = project.get("bot_id") or view["bot_id"]
     view["profile_id"] = policy.get("profile") or view["profile_id"]
-    view["project_id"] = policy.get("project_id") or view["project_id"]
-    view["mission_id"] = policy.get("mission_id") or view["mission_id"]
+    view["project_id"] = project_id
+    view["mission_id"] = mission_id
     # mission_binding mirrors the policy/project catalogue + source digests.
     binding = view["mission_binding"]
-    binding["project_id"] = policy.get("project_binding_id") or binding["project_id"]
-    binding["mission_id"] = policy.get("mission_id") or binding["mission_id"]
+    binding["project_id"] = policy.get("project_binding_id") or project_id
+    binding["mission_id"] = mission_id
     binding["revision"] = policy.get("mission_revision") or binding["revision"]
     binding["basis_digest"] = policy.get("authority_basis_digest") or binding["basis_digest"]
     binding["authority_digest"] = policy.get("authority_digest") or binding["authority_digest"]
     binding["source_digest"] = source_body.get("mission_source_digest") or binding["source_digest"]
     # my_work mirrors the authority triplet; mission content from the bound request.
-    my_work = view["my_work"]
-    my_work["project_id"] = policy.get("project_id")
-    my_work["mission_id"] = policy.get("mission_id")
-    my_work["ticket_id"] = policy.get("mission_id")
-    my_work["mission"]["title"] = mission.get("title")
-    my_work["mission"]["objective"] = mission.get("objective")
-    my_work["mission"]["criteria"] = mission.get("criteria") or []
-    my_work["mission"]["references"] = mission.get("source_refs") or []
-    my_work["mission_authority"]["basis_digest"] = policy.get("authority_basis_digest")
-    my_work["mission_authority"]["authority_digest"] = policy.get("authority_digest")
-    view["resolved_focus_key"] = f"{policy.get('project_id')}/{policy.get('mission_id')}"
-    view["resolved_subject_key"] = policy.get("requester_id")
+    mw = view["my_work"]["mission"]
+    mw["project_id"] = project_id
+    mw["mission_id"] = mission_id
+    mw["ticket_id"] = mission_id
+    if mission.get("title") is not None:
+        mw["title"] = mission["title"]
+    if mission.get("objective") is not None:
+        mw["objective"] = mission["objective"]
+    if mission.get("criteria") is not None:
+        mw["criteria"] = mission["criteria"]
+    if mission.get("source_refs") is not None:
+        mw["references"] = mission["source_refs"]
+    mw["source_digest"] = binding["source_digest"]
+    authority = mw["mission_authority"]
+    authority["mission_id"] = mission_id
+    authority["revision"] = binding["revision"]
+    authority["basis_digest"] = binding["basis_digest"]
+    authority["authority_digest"] = binding["authority_digest"]
+    # memory carries the authority triplet for mission qualification.
+    view["memory"]["mission_binding"] = {
+        "mission_id": binding["mission_id"], "revision": binding["revision"],
+        "authority_digest": binding["authority_digest"]}
+    oc_view = view["operational_context"].get("view")
+    if isinstance(oc_view, dict):
+        oc_view["project_id"] = project_id
+        oc_view["mission_id"] = mission_id
+    view["resolved_focus_key"] = "mission:" + mission_id
+    view["resolved_subject_key"] = "project:" + project_id
     view["namespaces_searched"] = list(
         (project.get("allowed_namespaces") or []) or view.get("namespaces_searched") or [])
     if mode == "namespace_drift":
         view["namespaces_searched"] = ["outside-the-catalogue"]
     elif mode == "authority_drift":
-        view["my_work"]["mission_authority"]["authority_digest"] = "sha256:" + "0" * 64
+        mw["mission_authority"]["authority_digest"] = "sha256:" + "0" * 64
     elif mode == "availability_drift":
         view["my_work"]["availability"] = "missing"
     elif mode == "view_instant_drift":
         view["operational_context"]["view"]["view_instant"] = "1970-01-01T00:00:00.000Z"
+    # Finalize AFTER mutation: relation count, declared render size, self-consistent
+    # digest, then the serialized-byte fixpoint over the whole envelope.
+    view["bounds"]["relation_count"] = len(view["memory"]["relations"])
+    view["bounds"]["render_chars"] = len(rendered)
+    view["context_digest"] = native_context_digest(view)
+    size = -1
+    for _ in range(8):
+        current = len(json_utf8(view))
+        view["bounds"]["serialized_bytes"] = current
+        if current == size:
+            break
+        size = current
     return view
 
 

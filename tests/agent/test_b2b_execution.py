@@ -7,6 +7,9 @@ AgentContext/C1 builder — H1's context seam is a placeholder contract.
 
 from __future__ import annotations
 
+import tempfile
+import weakref
+
 import pytest
 
 from agent.b2b_execution import (
@@ -14,6 +17,9 @@ from agent.b2b_execution import (
     _public_text, bind_execution, canonical_json, current_execution,
     execute_terminal, extract_allowed_refs, is_b2b_attempt_id, is_b2b_session_id,
     publish_context, require_execution, reset_execution, validate_proposal)
+from hermes_constants import get_hermes_home
+from tests.gateway.b2b_process_harness import (
+    UNIT_RENDERED, build_context_view, extract_contract_root)
 
 
 # ---------------------------------------------------------------------------
@@ -105,9 +111,12 @@ class _Msg:
 
 
 class _Resp:
-    def __init__(self, content=None, tool_calls=None, reasoning=None, n_choices=1):
-        m = _Msg(content=content, tool_calls=tool_calls, reasoning=reasoning)
-        self.choices = [_Msg(message=m) for _ in range(n_choices)]
+    def __init__(self, content=None, tool_calls=None, reasoning=None, n_choices=1,
+                 finish_reason="stop"):
+        m = _Msg(role="assistant", content=content, tool_calls=tool_calls,
+                 reasoning=reasoning)
+        self.choices = [_Msg(message=m, finish_reason=finish_reason)
+                        for _ in range(n_choices)]
 
 
 def test_public_text_accepts_plain():
@@ -163,12 +172,11 @@ def test_require_execution_refuses_active_cap_foreign_session():
 
 def test_require_execution_returns_cap_on_match():
     sid = "b2b_" + "a" * 64
-    cap = BoundExecution(
-        profile="p", session_id=sid, binding_digest="a" * 64,
-        attempt_id="b2bp_" + "b" * 64, run_id="r", policy={}, sink=None, created_at=0)
+    cap = _cap()
+    agent = _bound_agent(cap)
     token = bind_execution(cap)
     try:
-        assert require_execution(_agent(sid)) is cap
+        assert require_execution(agent) is cap
         with pytest.raises(B2BTerminalRefusal):
             require_execution(_agent("api_other"))
     finally:
@@ -187,16 +195,50 @@ def test_current_execution_none_without_cap():
 # BoundExecution — frozen, tuple, per-cap recheck, publish
 # ---------------------------------------------------------------------------
 
+def _unit_policy():
+    """Cap policy carrying the REAL pinned contract root -- the schema validation
+    exercised below is the production one, against the four frozen r2 blobs."""
+    return {
+        "profile": "p",
+        "profile_home": str(get_hermes_home().resolve()),
+        "project_id": "proj-a", "mission_id": "DUB-001", "mission_revision": 1,
+        "authority_basis_digest": "sha256:" + "b" * 64,
+        "authority_digest": "sha256:" + "a" * 64,
+        "requester_id": "req-1",
+        "mission_request": {"title": "T", "objective": "O"},
+        "project": {
+            "project_id": "proj-a", "bot_id": "bot", "profile_id": "p",
+            "allowed_namespaces": ["ns"],
+            "context_contract_root": extract_contract_root(
+                tempfile.mkdtemp(prefix="b2b-unit-contracts-")),
+            "model": "unit-double", "provider": "custom",
+            "base_url": "http://127.0.0.1:9/unit-double",
+            "api_mode": "chat_completions"},
+    }
+
+
 def _cap(**over):
     class _Sink:
         context_receipt = None
         def put_context(self, receipt):
             self.context_receipt = receipt
     kw = dict(profile="p", session_id="b2b_" + "a" * 64, binding_digest="a" * 64,
-              attempt_id="b2bp_" + "b" * 64, run_id="r", policy={"m": 1},
+              attempt_id="b2bp_" + "b" * 64, run_id="r", policy=_unit_policy(),
               sink=_Sink(), created_at=0)
     kw.update(over)
     return BoundExecution(**kw)
+
+
+def _bound_agent(cap, *, turn_id="t1"):
+    """Attach a minimal agent stand-in through the real binding fields the host
+    sets (capability tag + weakref), carrying the current turn id."""
+    class A:
+        session_id = cap.session_id
+    agent = A()
+    agent._b2b_execution = cap  # instance attr -- require_execution reads vars(agent)
+    agent._current_turn_id = turn_id
+    object.__setattr__(cap, "_agent_ref", weakref.ref(agent))
+    return agent
 
 
 def test_bound_execution_tuple_and_freeze():
@@ -222,13 +264,16 @@ def test_publish_context_requires_structured_accepted():
 
 def test_publish_context_validates_and_persists():
     cap = _cap()
-    view = {
-        "accepted_context": {"state": "ok"}, "resolution": "governed_bound",
-        "identity_source": "portal", "executable": False, "freshness": "current",
-        "authority_basis_digest": "b", "authority_digest": "a", "mission_revision": 1}
-    receipt = cap.publish_context(view, b"rendered", turn_id="t1")
+    agent = _bound_agent(cap, turn_id="t1")  # weakref target must outlive publish
+    # UNIT CONTEXT PRODUCER DOUBLE view -- validated by the real r2 contract root.
+    view = build_context_view(cap.policy, {})
+    token = bind_execution(cap)
+    try:
+        receipt = cap.publish_context(view, UNIT_RENDERED.encode("utf-8"), turn_id="t1")
+    finally:
+        reset_execution(token)
     assert isinstance(receipt, ContextReceipt)
-    assert receipt.rendered == b"rendered" and receipt.turn_id == "t1"
+    assert receipt.rendered == UNIT_RENDERED.encode("utf-8") and receipt.turn_id == "t1"
     assert cap.context_receipt is receipt
     assert cap.sink.context_receipt is receipt  # sink persistence wired
 
@@ -249,11 +294,16 @@ class _TSink:
         self.ok = ok
         self.dispatched = 0
         self.committed = None
+        self.blocked = []
     def put_context(self, receipt):
         self.context_receipt = receipt
+    def block(self, reason):
+        self.blocked.append(reason)
+    def assert_current_policy(self):
+        return self.ok
     def resolve_before_provider(self):
         return self.ok
-    def cas_dispatch(self):
+    def cas_dispatch(self, **kw):
         self.dispatched += 1
         return True
     def commit_result(self, **kw):
@@ -262,27 +312,28 @@ class _TSink:
 
 def test_execute_terminal_refuses_without_context():
     cap = _cap(sink=_TSink())
+    agent = _bound_agent(cap)
     token = bind_execution(cap)
     try:
         with pytest.raises(B2BTerminalRefusal):
-            execute_terminal(_exec_agent(), {"messages": []}, cap, turn_id="t")
+            execute_terminal(agent, {"messages": []}, cap, turn_id="t")
     finally:
         reset_execution(token)
+    assert cap.sink.blocked == ["context_unavailable"]
 
 
 def test_execute_terminal_refuses_wrong_turn():
     cap = _cap(sink=_TSink())
-    view = {"accepted_context": {"s": "x"}, "resolution": "governed_bound",
-            "identity_source": "p", "executable": False, "freshness": "current",
-            "authority_basis_digest": "b", "authority_digest": "a", "mission_revision": 1}
-    cap.publish_context(view, b"rendered", turn_id="t1")
-    cap.register_context_recheck(lambda c: {"source_basis": sorted(
-        ["version", "issuer", "audience", "operation", "request_id", "body", "signature"])})
+    agent = _bound_agent(cap, turn_id="t1")
+    view = build_context_view(cap.policy, {})
     token = bind_execution(cap)
     try:
+        cap.publish_context(view, UNIT_RENDERED.encode("utf-8"), turn_id="t1")
+        cap.register_context_recheck(lambda c: build_context_view(c.policy, {}))
         with pytest.raises(B2BTerminalRefusal):
-            execute_terminal(_exec_agent(), {"messages": [{"role": "user", "content": "rendered"}]},
-                             cap, turn_id="t-OTHER")
+            execute_terminal(
+                agent, {"messages": [{"role": "user", "content": UNIT_RENDERED}]},
+                cap, turn_id="t-OTHER")
     finally:
         reset_execution(token)
 
