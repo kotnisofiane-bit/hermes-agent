@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from agent.b2b_execution import json_utf8, source_basis
 from hermes_cli.sqlite_util import add_column_if_missing
 
 
@@ -525,8 +526,17 @@ class RunIdempotencyStore:
                 raise ValueError("b2b_seal_identity")
             received = self._b2b_payload(result["payload"])
             original = self._b2b_payload(context["payload"])
+            # Recompute from both durable views; a copied digest is not a recheck.
+            orig_view, recheck_view = original.get("view"), recheck.get("view")
+            if not isinstance(orig_view, dict) or not isinstance(recheck_view, dict):
+                raise ValueError("b2b_seal_context")
+            orig_basis = json_utf8(source_basis(orig_view))
+            recheck_basis = json_utf8(source_basis(recheck_view))
+            if (orig_basis != recheck_basis or
+                    hashlib.sha256(orig_basis).hexdigest() != original.get("source_basis_digest") or
+                    hashlib.sha256(recheck_basis).hexdigest() != recheck.get("source_basis_digest")):
+                raise ValueError("b2b_seal_context")
             if (proposal.get("context_digest") != original.get("context_digest") or
-                    proposal.get("source_basis_digest") != original.get("source_basis_digest") or
                     any(proposal.get(key) != received["proposal"].get(key) for key in
                         ("summary", "steps", "source_refs", "limitations"))):
                 raise ValueError("b2b_seal_result")

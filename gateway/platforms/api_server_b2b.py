@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 from agent.b2b_execution import (
     B2BTerminalRefusal, BoundExecution, R2_SCHEMA_PINS, _deep_freeze, _plain_json,
     _public_text, canonical_json, is_b2b_attempt_id, is_b2b_session_id, json_utf8,
-    mission_prompt, recheck_context, validate_proposal, extract_allowed_refs)
+    source_basis, mission_prompt, recheck_context, validate_proposal, extract_allowed_refs)
 
 logger = logging.getLogger("gateway.platforms.api_server")
 
@@ -915,6 +915,10 @@ class _AttemptSink:
         sealed_utf8 = json_utf8(proposal)
         if len(sealed_utf8) > 32768:
             raise B2BTerminalRefusal("proposal_invalid")
+        # Compare source content, not capture metadata or public proposal fields.
+        fresh_basis_bytes = json_utf8(source_basis(rechecked_view))
+        if fresh_basis_bytes != receipt.source_basis_bytes:
+            raise B2BTerminalRefusal("context_stale")
         stored = self._store.b2b_seal(
             profile=self.profile, attempt_id=self.attempt_id,
             artifacts={
@@ -922,7 +926,7 @@ class _AttemptSink:
                 "context_recheck": json_utf8({
                     "format": "dubsar.b2b-context-recheck/1", "attempt_id": self.attempt_id,
                     "run_id": self.run_id, "view": rechecked_view,
-                    "source_basis_digest": receipt.source_basis_digest}),
+                    "source_basis_digest": hashlib.sha256(fresh_basis_bytes).hexdigest()}),
                 "proposal": json_utf8(proposal)})
         if stored is None:
             raise B2BTerminalRefusal("seal_commit_failed")
