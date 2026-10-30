@@ -15,10 +15,12 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
 import zlib
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 # Lead-provided r2-*.json bytes from Contracts 2b0865261e80432103e6beb38e5beea0ce60dad0
@@ -207,6 +209,23 @@ def build_context_view(policy: dict, source_body: dict, *, mode: str = "valid",
 
 
 # ---------------------------------------------------------------------------
+NODE_TEMP_CHECK_JS = r"""
+(function () {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const t = process.env.TEMP, tp = process.env.TMP, td = process.env.TMPDIR;
+  if (!t || !tp || !td || !(t === tp && tp === td))
+    throw new Error('TEMP/TMP/TMPDIR must all be set and exactly equal');
+  const expectedReal = fs.realpathSync(process.env.TMPDIR);
+  const actualReal = fs.realpathSync(os.tmpdir());
+  if (expectedReal !== actualReal)
+    throw new Error('os.tmpdir() does not resolve to the authorized temp child');
+  console.log('H1_NODE_TEMP ' + JSON.stringify(
+    { expected: expectedReal, actual: actualReal }));
+})();
+"""
+
+
 # Node P1 bench glue -- genuine production services, real native auth/Mongo/MyWork,
 # real compiled L2a bridge pointed at the REAL native HTTP listener. The ONLY
 # test surface is /_ctl; source requests may be journaled or RE-SIGNED into
@@ -240,6 +259,7 @@ const json = (res, code, obj) => {
   res.end(JSON.stringify(obj)); };
 
 (async () => {
+  """ + NODE_TEMP_CHECK_JS + r"""
   const realConnect = net.Socket.prototype.connect;   // BEFORE bench patches it
   const portal = kp(); const hermesHub = kp(); const hermesMemory = kp();
   const { startB2BBench } = require(S('b2b-missions.bench.js'));
@@ -383,13 +403,29 @@ class P1Node:
         self.info = None
         self.log = None
 
+    def _node_environment(self, tmpdir) -> dict:
+        """Keep Node scratch in the fixture temp without inheriting credentials."""
+        fixture = Path(str(tmpdir)).resolve(strict=True)
+        authorized = Path(tempfile.gettempdir()).resolve(strict=True)
+        fixture.relative_to(authorized)  # raises when outside authorized temp
+        node_tmp = (fixture / "node-tmp").resolve()
+        node_tmp.relative_to(fixture)  # symlink-escape refuses
+        node_tmp.mkdir(exist_ok=True)
+        return {
+            "PATH": os.environ.get("PATH", ""),
+            "SystemRoot": os.environ.get("SystemRoot", ""),
+            "P1_PORTAL_ROOT": self.portal_root,
+            "P1_MYWORK_ROOT": self.mywork_root,
+            "TEMP": str(node_tmp), "TMP": str(node_tmp),
+            "TMPDIR": str(node_tmp),
+        }
+
     def start(self, tmpdir, *, timeout: float = 90.0) -> "P1Node":
+        env = self._node_environment(tmpdir)
         script = os.path.join(str(tmpdir), "h1-bench.js")
         with open(script, "w", encoding="utf-8") as fh:
             fh.write(P1_BENCH_JS)
         self.log = open(os.path.join(str(tmpdir), "p1-node.log"), "w", encoding="utf-8")
-        env = {"PATH": os.environ.get("PATH", ""), "SystemRoot": os.environ.get("SystemRoot", ""),
-               "P1_PORTAL_ROOT": self.portal_root, "P1_MYWORK_ROOT": self.mywork_root}
         self.proc = subprocess.Popen(["node", script], cwd=self.portal_root, env=env,
                                      stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                      text=True)
@@ -972,5 +1008,3 @@ def b2b_child_config(*, source_url: str, portal_pub_pem: str,
                 "base_url": provider_url, "api_mode": "chat_completions",
                 "logical_mission": None, "project_context": None}}}
     return {"enabled": True, "profiles": profiles}
-
-
