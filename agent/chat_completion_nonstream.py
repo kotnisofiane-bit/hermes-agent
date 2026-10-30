@@ -1,5 +1,7 @@
 """Request-local worker lifecycle, watchdog polling, and wait status."""
 
+import httpx
+
 from agent import chat_completion_helpers as h
 from agent import chat_completion_wait_notice as wn
 
@@ -12,10 +14,15 @@ class _NonStreamRequest:
     """
 
     def __init__(self, agent, api_kwargs: dict):
+        from agent.b2b_execution import require_execution
+
+        cap = require_execution(agent)
         self.agent = agent
         self.api_kwargs = api_kwargs
         self.result = {"response": None, "error": None}
         self.clients = h._RequestClientRegistry(agent)
+        if cap is not None:
+            self._b2b_execution = cap
         # Request-local cancel flag: agent._interrupt_requested is cleared at turn
         # boundaries but this daemon worker can outlive the turn, so it must know THIS
         # request was force-closed and not surface the transport error as a bug (#6600).
@@ -56,12 +63,47 @@ class _NonStreamRequest:
             self.agent._active_codex_stream_request_token = None
 
     def _make_client(self, reason: str, kind: str = "openai"):
+        if (getattr(self, "_b2b_execution", None) is not None and
+                (getattr(self, "_b2b_receipt", None) is None or
+                 not getattr(self, "_b2b_request_digest", None))):
+            from agent.b2b_execution import B2BTerminalRefusal
+            raise B2BTerminalRefusal("terminal_guard_required")
         # Per-request clients are registered with the abort machinery so the watchdogs
         # force-close the worker's connection, never the shared client (#67142).
         if kind == "anthropic_messages":
             client = self.agent._create_request_anthropic_client(reason=reason)
         else:
             client = self.agent._create_request_openai_client(reason=reason, api_kwargs=self.api_kwargs)
+        if getattr(self, "_b2b_execution", None) is not None:
+            from agent.b2b_execution import B2BTerminalRefusal, before_sdk_dispatch
+            # SDK options belong to this request, never to an agent/shared client.
+            clone = getattr(client, "with_options", None)
+            if not callable(clone):
+                raise B2BTerminalRefusal("b2b_retries_not_disabled")
+            original = client
+            transport = httpx.HTTPTransport(retries=0, trust_env=False)
+            http_client = httpx.Client(
+                transport=transport, trust_env=False, follow_redirects=False, timeout=5.0)
+            try:
+                client = clone(max_retries=0, http_client=http_client, timeout=5.0)
+                if client is original:
+                    raise B2BTerminalRefusal("b2b_request_client_not_isolated")
+            except Exception:
+                http_client.close()
+                raise
+            finally:
+                if original is not getattr(self.agent, "client", None):
+                    self.agent._close_request_openai_client(original, reason="b2b_isolated_transport")
+            self.clients.set_client(client, kind=kind)
+            cap = self._b2b_execution
+            before_sdk_dispatch(
+                self.agent, self.api_kwargs, cap, receipt=self._b2b_receipt,
+                expected_digest=self._b2b_request_digest, client=client)
+            headers = dict(self.api_kwargs.get("extra_headers") or {})
+            headers["X-Dubsar-Attempt-Id"] = cap.attempt_id
+            headers["X-Dubsar-Request-Digest"] = self._b2b_request_digest
+            self.api_kwargs["extra_headers"] = headers
+            self.api_kwargs["timeout"] = 5.0
         return self.clients.set_client(client, kind=kind)
 
     def _call(self):
@@ -73,8 +115,30 @@ class _NonStreamRequest:
 
                 watchdog_state_var = _codex_watchdog_state_var
                 watchdog_context_token = watchdog_state_var.set(self.codex_watchdog_state)
-            self.result["response"] = h._dispatch_nonstreaming_api_request(
-                self.agent, self.api_kwargs, make_client=self._make_client)
+            cap = getattr(self, "_b2b_execution", None)
+            if cap is None:
+                response = h._dispatch_nonstreaming_api_request(
+                    self.agent, self.api_kwargs, make_client=self._make_client)
+            else:
+                # The B2B chat-only lane has no virtual provider/last-moment payload
+                # transform between the durable dispatch fence and this single SDK call.
+                client = self._make_client("b2b_chat_completion_request")
+                response = client.chat.completions.create(**self.api_kwargs)
+            if cap is not None:
+                # B2B lanes: validate + persist the public result BEFORE the response is
+                # visible to the loop/transcript — a rejected shape never leaves the worker
+                # as a "completed" response (tools/reasoning/private bytes → classified error).
+                from agent.b2b_execution import _public_text, validate_proposal, extract_allowed_refs
+                receipt = getattr(cap.sink, "context_receipt", None) or cap.context_receipt
+                text = _public_text(response)
+                allowed = extract_allowed_refs(receipt.view) if receipt is not None else ()
+                parsed, reason = validate_proposal(text, allowed)
+                if parsed is None:
+                    from agent.b2b_execution import B2BTerminalRefusal
+                    cap.sink.block("result_invalid")
+                    raise B2BTerminalRefusal(f"result_invalid:{reason}")
+                cap.sink.commit_result(text=text, parsed=parsed, reason=reason)
+            self.result["response"] = response
         except Exception as e:
             # Our own force-close caused this error: swallow it, the main
             # thread raises InterruptedError (#6600). Retirement logs at info
@@ -89,6 +153,20 @@ class _NonStreamRequest:
                 h.logger.debug("Non-streaming worker caught %s after request "
                     "cancellation — exiting without surfacing a network error.", type(e).__name__)
                 return
+            # B2B lane: a raw client/SDK/worker exception may carry provider response
+            # bytes — normalize it to a safe classified refusal BEFORE the native
+            # loop or error log can echo it. Classified B2BTerminalRefusal passes
+            # through untouched; the durable block lands with the same constant.
+            cap = getattr(self, "_b2b_execution", None)
+            if cap is not None:
+                from agent.b2b_execution import B2BTerminalRefusal
+                if not isinstance(e, B2BTerminalRefusal):
+                    self.result["error"] = B2BTerminalRefusal("provider_result_unavailable")
+                    try:
+                        cap.sink.block("provider_result_unavailable")
+                    except Exception:
+                        pass  # DB unavailable — the safe result is already set
+                    return
             self.result["error"] = e
         finally:
             if watchdog_state_var is not None:

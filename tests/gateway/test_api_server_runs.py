@@ -10,22 +10,37 @@ Covers:
 """
 
 import asyncio
+import copy
 import hashlib
+import json
 import threading
 import time
+import weakref
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from agent.b2b_execution import (
+    B2BTerminalRefusal, BoundExecution, bind_execution, extract_allowed_refs,
+    json_utf8, native_context_digest, recheck_context, reset_execution, source_basis,
+    validate_proposal,
+)
 from gateway.config import PlatformConfig
+from gateway.platforms import api_server_b2b as b2b
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _api_request_profile,
     _approval_event_choices,
     cors_middleware,
     security_headers_middleware,
+)
+from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+from hermes_constants import get_hermes_home
+from tests.gateway.b2b_process_harness import (
+    UNIT_RENDERED, build_context_view, extract_contract_root, make_keypair,
 )
 from tools import approval as approval_mod
 from tools import approval_gateway_wait
@@ -2372,3 +2387,262 @@ class TestHostedRoomRuns:
                 )
             assert rejected.status == 403
             create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# B2B namespace guards — reserved session ids refuse every generic run surface
+# before history load or agent construction.
+# ---------------------------------------------------------------------------
+
+def test_b2b_session_id_predicate():
+    from agent.b2b_execution import is_b2b_session_id
+    assert is_b2b_session_id("b2b_" + "a" * 64)
+    assert not is_b2b_session_id("b2b_" + "a" * 63)
+    assert not is_b2b_session_id("api_x")
+
+
+@pytest.mark.asyncio
+async def test_generic_runs_reject_b2b_session():
+    """POST /v1/runs with a reserved b2b_ session_id -> 404 before any turn."""
+    adapter = _make_adapter(api_key="k" * 16)
+    app = _create_runs_app(adapter)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/v1/runs",
+            json={"session_id": "b2b_" + "f" * 64, "input": "x"},
+            headers={"Authorization": "Bearer " + "k" * 16})
+        assert resp.status == 404, await resp.text()
+
+
+# ---------------------------------------------------------------------------
+# b2b seal reservation - real _AttemptSink + real disk RunIdempotencyStore.
+# All context / source / provider data are UNIT CONTEXT/SOURCE/RESULT DOUBLES.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def b2b_seal_lane(tmp_path):
+    """UNIT CONTEXT/SOURCE/RESULT DOUBLES; real sink, schemas and disk transactions."""
+    contract_root = extract_contract_root(tmp_path)
+    profile = "hub"
+    sid = "b2b_" + "a" * 64
+    binding = sid[4:]
+    attempt_id = b2b._attempt_id_for(binding)
+    run_id = "run_" + "c" * 16
+    now = time.time()
+    _, _, portal_pub = make_keypair()
+    _, hermes_priv, _ = make_keypair()
+    entry = {"source_url": "http://127.0.0.1:1/internal/dubsar/b2b/source",
+             "portal_issuer": "portal-h1", "hermes_issuer": "hermes-h1-hub",
+             "portal_public_key_pem": portal_pub,
+             "hermes_private_key_pem": hermes_priv,
+             "projects": {"b2b-bench": {
+                 "project_id": "b2b-bench", "bot_id": "bot", "profile_id": profile,
+                 "allowed_namespaces": ["ns"], "context_contract_root": contract_root,
+                 "model": "unit-double", "provider": "custom",
+                 "base_url": "http://127.0.0.1:1/v1", "api_mode": "chat_completions",
+                 "logical_mission": None, "project_context": None}}}
+    config = b2b.B2BConfig({"enabled": True, "profiles": {profile: entry}})
+    state = b2b._B2BState(config)
+    adapter = SimpleNamespace(_b2b_state=state)
+    policy = {
+        "attempt_id": attempt_id, "binding_digest": binding,
+        "requester_id": "1" * 24, "project_id": "b2b-bench",
+        "project_binding_id": "b2b-bench", "mission_id": "DUB-001",
+        "mission_revision": 1, "profile": profile, "session_id": sid,
+        "profile_home": str(get_hermes_home().resolve()),
+        "reservation_ref": {"collection": "dubsar_b2b_agent_sessions", "id": binding},
+        "request_digest": "d" * 64, "ticket_digest": "e" * 64,
+        "authority_basis_digest": "sha256:" + "b" * 64,
+        "authority_digest": "sha256:" + "a" * 64,
+        "observation_genesis": {
+            "id": sid, "source": "api_server", "profile": profile,
+            "title": None, "model": None, "parent_session_id": None,
+            "has_system_prompt": False, "has_model_config": False,
+            "ended_at": None, "end_reason": None, "message_count": 0,
+            "tool_call_count": 0, "api_call_count": 0},
+        "mission_request": {"title": "m", "objective": "o",
+                             "criteria": [], "source_refs": []},
+        "project": entry["projects"]["b2b-bench"]}
+    view = build_context_view(policy, {"mission_source_digest": "c" * 64})
+    store = RunIdempotencyStore(str(tmp_path / "runs.db"))
+    keys = b2b._KeyRing(entry)
+    sink = b2b._AttemptSink(adapter, store, profile=profile, entry=entry, keys=keys,
+                          attempt_id=attempt_id, session_id=sid,
+                          binding_digest=binding, run_id=run_id, policy=policy)
+    binding_row = {"profile": profile, "session_id": sid,
+                   "binding_digest": binding,
+                   "policy_json": json_utf8(policy).decode("utf-8")}
+    attempt_row = {"profile": profile, "session_id": sid, "binding_digest": binding,
+                   "attempt_id": attempt_id, "run_id": run_id, "status": "admitted",
+                   "requester_id": policy["requester_id"],
+                   "source_bind": json_utf8({"unit_source_double": True})}
+    admission = store.b2b_admit(profile=profile, session_id=sid, binding_digest=binding,
+                    attempt_id=attempt_id, fingerprint=sink._fingerprint,
+                    binding_row=binding_row, attempt_row=attempt_row,
+                    run_scope="b2b:" + attempt_id, run_key=attempt_id,
+                    run_id=run_id, run_fingerprint=sink._fingerprint,
+                    run_status={"session_id": sid, "status": "running"})
+
+    assert admission["status"] == "admitted"
+    cap = BoundExecution(attempt_id=attempt_id, run_id=run_id, policy=policy,
+                         profile=profile, session_id=sid, binding_digest=binding,
+                         sink=sink, created_at=now)
+    class UnitAgent:
+        pass
+    agent = UnitAgent()
+    agent.session_id, agent._b2b_execution, agent._current_turn_id = sid, cap, "t0"
+    object.__setattr__(cap, "_agent_ref", weakref.ref(agent))
+    token = bind_execution(cap)
+    try:
+        receipt = cap.publish_context(view, UNIT_RENDERED, turn_id="t0")
+    finally:
+        reset_execution(token)
+    assert sink.context_receipt is receipt
+
+    resolved = {"source_state": "active", **{k: policy[k] for k in
+        ("attempt_id", "binding_digest", "requester_id", "project_id",
+         "project_binding_id", "mission_id", "mission_revision", "profile",
+         "session_id", "reservation_ref", "request_digest", "ticket_digest",
+         "authority_basis_digest", "authority_digest", "observation_genesis",
+         "mission_request")},
+        "mission_source_digest": view["my_work"]["mission"]["source_digest"],
+        "_signed_request": {"issued_at": now - 1, "expires_at": now + 30},
+        "_signed_response": {"issued_at": now - 1, "expires_at": now + 29},
+        "_request_raw": b'{"unit_source_double":"request"}',
+        "_response_raw": b'{"unit_source_double":"response"}'}
+    sink._before_provider = resolved
+    assert sink.cas_dispatch(request_digest=policy["request_digest"], receipt=receipt)
+    public_json = json_utf8({
+        "summary": "s", "steps": ["st"], "source_refs": [], "limitations": []})
+    parsed, reason = validate_proposal(
+        public_json.decode(), extract_allowed_refs(receipt.view))
+    sink.commit_result(text=public_json.decode(), parsed=parsed, reason=reason)
+
+    assert store.b2b_attempt(profile=profile, attempt_id=attempt_id)["status"] == "result_received"
+    try:
+        yield SimpleNamespace(
+            store=store, sink=sink, cap=cap, receipt=receipt, resolved=resolved,
+            view=view, db_path=tmp_path / "runs.db", agent=agent)
+    finally:
+        store.close()
+
+
+def _seal_recheck_view(lane, *, divergent=False):
+    view = copy.deepcopy(lane.view)
+    view["captured_at"] = "2026-10-29T23:59:59.000Z"
+    assert view["captured_at"] != lane.view["captured_at"]
+    if divergent:
+        view["operational_context"]["view"]["view_instant"] = "1970-01-01T00:00:00.000Z"
+    view["context_digest"] = native_context_digest(view)
+    for _ in range(8):
+        size = len(json_utf8(view))
+        if view["bounds"]["serialized_bytes"] == size:
+            return view
+        view["bounds"]["serialized_bytes"] = size
+    raise AssertionError("serialized_bytes did not converge")
+
+
+def _assert_seal_rollback(lane, before):
+    lane.store.close()
+    reopened = RunIdempotencyStore(str(lane.db_path))
+    try:
+        after = reopened.b2b_snapshot(profile=lane.sink.profile, attempt_id=lane.sink.attempt_id)
+        assert after == before
+        assert after["attempt"]["status"] == "result_received"
+        assert not {"source_before_seal", "context_recheck", "proposal"} & after["artifacts"].keys()
+    finally:
+        reopened.close()
+
+
+def test_b2b_seal_positive_exact15_and_persisted(b2b_seal_lane):
+    lane = b2b_seal_lane
+    sink, receipt = lane.sink, lane.receipt
+    initial = lane.store.b2b_snapshot(profile=sink.profile, attempt_id=sink.attempt_id)
+    fresh = _seal_recheck_view(lane)
+    assert fresh["context_digest"] != receipt.digest
+    assert json_utf8(source_basis(fresh)) == receipt.source_basis_bytes
+    lane.cap.register_context_recheck(lambda cap: fresh)
+    qualified = recheck_context(lane.cap, receipt)
+    created = sink.seal(source_before_seal=lane.resolved, rechecked_view=qualified,
+                        created_at="2026-10-29T23:59:59Z")
+    assert set(created) == {
+        "proposal_id", "attempt_id", "binding_digest", "profile", "session_id",
+        "project_id", "mission_id", "mission_revision", "context_digest",
+        "summary", "steps", "source_refs", "limitations", "state", "created_at"}
+    assert "source_basis_digest" not in created
+    lane.store.close()
+    reopened = RunIdempotencyStore(str(lane.db_path))
+    try:
+        snap = reopened.b2b_snapshot(profile=sink.profile, attempt_id=sink.attempt_id)
+        assert snap["attempt"]["status"] == "proposal_ready"
+        assert snap["attempt"]["run_id"] == sink.run_id
+        assert created["state"] == "prepared" and created["context_digest"] == receipt.digest
+        assert (created["profile"], created["session_id"], created["binding_digest"],
+                created["attempt_id"]) == (sink.profile, sink.session_id, sink.binding_digest,
+                                          sink.attempt_id)
+        artifacts = snap["artifacts"]
+        for kind, original in initial["artifacts"].items():
+            assert artifacts[kind] == original
+        assert artifacts["proposal"]["payload"] == json_utf8(created)
+        for artifact in artifacts.values():
+            assert artifact["digest"] == hashlib.sha256(artifact["payload"]).hexdigest()
+        rechecked = json.loads(artifacts["context_recheck"]["payload"])
+        assert rechecked["view"] == fresh
+        assert rechecked["source_basis_digest"] == receipt.source_basis_digest
+        assert created["created_at"] == "2026-10-29T23:59:59Z"
+        assert reopened.b2b_snapshot(profile=sink.profile, attempt_id=sink.attempt_id) == snap
+        replay = reopened.b2b_seal(
+            profile=sink.profile, attempt_id=sink.attempt_id,
+            artifacts={kind: artifacts[kind]["payload"] for kind in
+                       ("source_before_seal", "context_recheck", "proposal")})
+        assert replay == json_utf8(created)
+        assert reopened.b2b_snapshot(profile=sink.profile, attempt_id=sink.attempt_id) == snap
+    finally:
+        reopened.close()
+
+
+def test_b2b_seal_rejects_stale_source_basis(b2b_seal_lane):
+    lane = b2b_seal_lane
+    before = lane.store.b2b_snapshot(profile=lane.sink.profile, attempt_id=lane.sink.attempt_id)
+    fresh = _seal_recheck_view(lane, divergent=True)
+    assert json_utf8(source_basis(fresh)) != lane.receipt.source_basis_bytes
+    with pytest.raises(B2BTerminalRefusal, match="context_stale"):
+        lane.sink.seal(source_before_seal=lane.resolved, rechecked_view=fresh,
+                       created_at="2026-10-29T23:59:59Z")
+    _assert_seal_rollback(lane, before)
+
+
+@pytest.mark.parametrize("fault", ["forged_digest", "missing_digest", "wrong_digest",
+                                  "missing_view", "nonmapping_view"])
+def test_b2b_seal_store_rejects_invalid_context(b2b_seal_lane, fault):
+    lane = b2b_seal_lane
+    sink, receipt = lane.sink, lane.receipt
+    before = lane.store.b2b_snapshot(profile=sink.profile, attempt_id=sink.attempt_id)
+    recheck = {
+        "format": "dubsar.b2b-context-recheck/1", "attempt_id": sink.attempt_id,
+        "run_id": sink.run_id, "view": _seal_recheck_view(lane, divergent=fault == "forged_digest"),
+        "source_basis_digest": receipt.source_basis_digest}
+    if fault == "missing_digest":
+        del recheck["source_basis_digest"]
+    elif fault == "wrong_digest":
+        recheck["source_basis_digest"] = "0" * 64
+    elif fault == "missing_view":
+        del recheck["view"]
+    elif fault == "nonmapping_view":
+        recheck["view"] = []
+    proposal = json_utf8({"proposal_id": "b2bprop_" + sink.attempt_id[5:],
+                    "attempt_id": sink.attempt_id, "binding_digest": sink.binding_digest,
+                    "profile": sink.profile, "session_id": sink.session_id,
+                    "project_id": sink.policy["project_id"],
+                    "mission_id": sink.policy["mission_id"],
+                    "mission_revision": sink.policy["mission_revision"],
+                    "context_digest": receipt.digest,
+                    "summary": "s", "steps": ["st"], "source_refs": [],
+                    "limitations": [], "state": "prepared",
+                    "created_at": "2026-10-29T23:59:59Z"})
+    with pytest.raises(ValueError, match="b2b_seal_context"):
+        lane.store.b2b_seal(
+            profile=sink.profile, attempt_id=sink.attempt_id,
+            artifacts={"source_before_seal": b2b._source_record(lane.resolved),
+                       "context_recheck": json_utf8(recheck), "proposal": proposal})
+    _assert_seal_rollback(lane, before)
