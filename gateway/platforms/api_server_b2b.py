@@ -27,7 +27,8 @@ from urllib.parse import urlsplit
 from agent.b2b_execution import (
     B2BTerminalRefusal, BoundExecution, R2_SCHEMA_PINS, _deep_freeze, _plain_json,
     _public_text, canonical_json, is_b2b_attempt_id, is_b2b_session_id, json_utf8,
-    source_basis, mission_prompt, recheck_context, validate_proposal, extract_allowed_refs)
+    assert_source_equivalent, context_proof, qualify_context_view, verify_context_proof,
+    mission_prompt, recheck_context, validate_proposal, extract_allowed_refs)
 
 logger = logging.getLogger("gateway.platforms.api_server")
 
@@ -808,11 +809,21 @@ class _AttemptSink:
         self._before_provider = resolved
         return True
 
-    def cas_dispatch(self, *, request_digest: str, receipt: Any) -> bool:
+    def _qualify_context(self, view: Mapping[str, Any]) -> Dict[str, Any]:
+        # Validate against the sink's frozen policy, without minting a capability.
+        policy = types.SimpleNamespace(policy_get=self.policy.get)
+        return qualify_context_view(policy, view)
+
+    def cas_dispatch(self, *, request_digest: str, receipt: Any,
+                     rechecked_view: Optional[Mapping[str, Any]] = None) -> bool:
         resolved = self._before_provider
         if (receipt is not self.context_receipt or resolved is None or
-                not self._matches_source(resolved) or not self._source_matches_context(resolved)):
+                not self._matches_source(resolved) or not self._source_matches_context(resolved) or
+                not isinstance(rechecked_view, Mapping)):
             return False
+        fresh = self._qualify_context(rechecked_view)
+        assert_source_equivalent(receipt.view, fresh)
+        proof = context_proof(fresh)
         now = time.time()
         if not all(env["issued_at"] <= now < env["expires_at"] for env in
                    (resolved["_signed_request"], resolved["_signed_response"])):
@@ -827,6 +838,11 @@ class _AttemptSink:
                 "binding_digest": self.binding_digest, "request_digest": request_digest,
                 "context_digest": receipt.digest,
                 "source_basis_digest": receipt.source_basis_digest,
+                "source_basis_contract": receipt.source_basis_contract,
+                "view_digest": receipt.view_digest,
+                "context_recheck": {
+                    "format": "dubsar.b2b-context-recheck/2",
+                    "attempt_id": self.attempt_id, "run_id": self.run_id, **proof},
                 "rendered_digest": receipt.rendered_digest,
                 "model": self.policy["project"]["model"],
                 "provider": self.policy["project"]["provider"], "committed_at": now}))
@@ -864,12 +880,15 @@ class _AttemptSink:
 
     def put_context(self, receipt: Any) -> None:
         """Persist the published context (view + rendered bytes + digest) once."""
+        proof = context_proof(receipt.view)
+        if (proof["context_digest"] != receipt.digest or
+                proof["source_basis_digest"] != receipt.source_basis_digest):
+            raise B2BTerminalRefusal("context_proof_invalid")
         payload = json_utf8({
             "format": "dubsar.b2b-context-artifact/1", "attempt_id": self.attempt_id,
-            "run_id": self.run_id, "view": receipt.view,
+            "run_id": self.run_id, **proof,
             "rendered": receipt.rendered.decode("utf-8"), "turn_id": receipt.turn_id,
-            "context_digest": receipt.digest, "rendered_digest": receipt.rendered_digest,
-            "source_basis_digest": receipt.source_basis_digest})
+            "rendered_digest": receipt.rendered_digest})
         if not self._store.b2b_commit_context(
                 profile=self.profile, attempt_id=self.attempt_id, payload=payload):
             raise B2BTerminalRefusal("context_commit_failed")
@@ -916,17 +935,23 @@ class _AttemptSink:
         if len(sealed_utf8) > 32768:
             raise B2BTerminalRefusal("proposal_invalid")
         # Compare source content, not capture metadata or public proposal fields.
-        fresh_basis_bytes = json_utf8(source_basis(rechecked_view))
-        if fresh_basis_bytes != receipt.source_basis_bytes:
-            raise B2BTerminalRefusal("context_stale")
+        fresh = self._qualify_context(rechecked_view)
+        assert_source_equivalent(receipt.view, fresh)
+        marker = self._store.b2b_artifact(
+            attempt_id=self.attempt_id, kind="provider_dispatch")
+        if marker is None:
+            raise B2BTerminalRefusal("context_proof_missing")
+        dispatch = json.loads(marker["payload"])
+        previous = verify_context_proof(dispatch.get("context_recheck"))
+        assert_source_equivalent(previous["view"], fresh)
+        proof = context_proof(fresh)
         stored = self._store.b2b_seal(
             profile=self.profile, attempt_id=self.attempt_id,
             artifacts={
                 "source_before_seal": _source_record(source_before_seal),
                 "context_recheck": json_utf8({
-                    "format": "dubsar.b2b-context-recheck/1", "attempt_id": self.attempt_id,
-                    "run_id": self.run_id, "view": rechecked_view,
-                    "source_basis_digest": hashlib.sha256(fresh_basis_bytes).hexdigest()}),
+                    "format": "dubsar.b2b-context-recheck/2", "attempt_id": self.attempt_id,
+                    "run_id": self.run_id, **proof}),
                 "proposal": json_utf8(proposal)})
         if stored is None:
             raise B2BTerminalRefusal("seal_commit_failed")
@@ -1202,6 +1227,8 @@ async def _b2b_get(adapter: Any, request: Any, *, want_context: bool):
             "object": "b2b.context", **identity,
             **{key: context[key] for key in
                ("view", "rendered", "context_digest", "rendered_digest", "source_basis_digest")},
+            **{key: context[key] for key in ("view_digest", "source_basis_contract")
+               if key in context},
             "artifact": next(item for item in manifests if item["kind"] == "context")})
     from gateway.platforms.api_server_runs import _owner_alive
     native = json.loads(row["native_status_json"])

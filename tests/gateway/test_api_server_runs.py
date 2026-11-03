@@ -25,7 +25,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from agent.b2b_execution import (
     B2BTerminalRefusal, BoundExecution, bind_execution, extract_allowed_refs,
-    json_utf8, native_context_digest, recheck_context, reset_execution, source_basis,
+    context_proof, json_utf8, native_context_digest, recheck_context, reset_execution, source_basis,
     validate_proposal,
 )
 from gateway.config import PlatformConfig
@@ -40,7 +40,8 @@ from gateway.platforms.api_server import (
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from hermes_constants import get_hermes_home
 from tests.gateway.b2b_process_harness import (
-    UNIT_RENDERED, build_context_view, extract_contract_root, make_keypair,
+    UNIT_RENDERED, build_context_view, build_unit_native_oc_view, extract_contract_root, make_keypair,
+    renew_unit_oc_read, reseal_unit_context_view,
 )
 from tools import approval as approval_mod
 from tools import approval_gateway_wait
@@ -2419,9 +2420,12 @@ async def test_generic_runs_reject_b2b_session():
 # All context / source / provider data are UNIT CONTEXT/SOURCE/RESULT DOUBLES.
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def b2b_seal_lane(tmp_path):
+@pytest.fixture(params=["legacy", "native-v1", "native-v2"])
+def b2b_seal_lane(tmp_path, request):
     """UNIT CONTEXT/SOURCE/RESULT DOUBLES; real sink, schemas and disk transactions."""
+    supplied = request.param if isinstance(request.param, dict) else {}
+    view_factory = supplied.get("view_factory")
+    project_id = supplied.get("project_id", "b2b-bench")
     contract_root = extract_contract_root(tmp_path)
     profile = "hub"
     sid = "b2b_" + "a" * 64
@@ -2435,8 +2439,8 @@ def b2b_seal_lane(tmp_path):
              "portal_issuer": "portal-h1", "hermes_issuer": "hermes-h1-hub",
              "portal_public_key_pem": portal_pub,
              "hermes_private_key_pem": hermes_priv,
-             "projects": {"b2b-bench": {
-                 "project_id": "b2b-bench", "bot_id": "bot", "profile_id": profile,
+             "projects": {project_id: {
+                 "project_id": project_id, "bot_id": "bot", "profile_id": profile,
                  "allowed_namespaces": ["ns"], "context_contract_root": contract_root,
                  "model": "unit-double", "provider": "custom",
                  "base_url": "http://127.0.0.1:1/v1", "api_mode": "chat_completions",
@@ -2446,8 +2450,8 @@ def b2b_seal_lane(tmp_path):
     adapter = SimpleNamespace(_b2b_state=state)
     policy = {
         "attempt_id": attempt_id, "binding_digest": binding,
-        "requester_id": "1" * 24, "project_id": "b2b-bench",
-        "project_binding_id": "b2b-bench", "mission_id": "DUB-001",
+        "requester_id": "1" * 24, "project_id": project_id,
+        "project_binding_id": project_id, "mission_id": "DUB-001",
         "mission_revision": 1, "profile": profile, "session_id": sid,
         "profile_home": str(get_hermes_home().resolve()),
         "reservation_ref": {"collection": "dubsar_b2b_agent_sessions", "id": binding},
@@ -2462,8 +2466,15 @@ def b2b_seal_lane(tmp_path):
             "tool_call_count": 0, "api_call_count": 0},
         "mission_request": {"title": "m", "objective": "o",
                              "criteria": [], "source_refs": []},
-        "project": entry["projects"]["b2b-bench"]}
-    view = build_context_view(policy, {"mission_source_digest": "c" * 64})
+        "project": entry["projects"][project_id]}
+    source_body = {"mission_source_digest": "c" * 64}
+    if callable(view_factory):
+        view = view_factory(policy, source_body)
+    elif request.param == "legacy":
+        view = build_context_view(policy, source_body)
+    else:
+        view = build_unit_native_oc_view(
+            policy, source_body, ordered=request.param == "native-v2")
     store = RunIdempotencyStore(str(tmp_path / "runs.db"))
     keys = b2b._KeyRing(entry)
     sink = b2b._AttemptSink(adapter, store, profile=profile, entry=entry, keys=keys,
@@ -2511,7 +2522,19 @@ def b2b_seal_lane(tmp_path):
         "_request_raw": b'{"unit_source_double":"request"}',
         "_response_raw": b'{"unit_source_double":"response"}'}
     sink._before_provider = resolved
-    assert sink.cas_dispatch(request_digest=policy["request_digest"], receipt=receipt)
+    dispatch_view = (view_factory(policy, source_body) if callable(view_factory)
+                     else renew_unit_oc_read(view))
+    assert sink.cas_dispatch(request_digest=policy["request_digest"], receipt=receipt,
+                             rechecked_view=dispatch_view)
+    marker = store.b2b_artifact(attempt_id=attempt_id, kind="provider_dispatch")
+    dispatch = json.loads(marker["payload"])
+    assert dispatch["context_recheck"]["view"] == dispatch_view
+    assert dispatch["context_recheck"]["view_digest"] == context_proof(dispatch_view)["view_digest"]
+    assert dispatch["context_recheck"]["source_basis_contract"] == receipt.source_basis_contract
+    repeated_view = (view_factory(policy, source_body) if callable(view_factory)
+                     else renew_unit_oc_read(view, read_id=3))
+    assert not sink.cas_dispatch(request_digest=policy["request_digest"], receipt=receipt,
+                                 rechecked_view=repeated_view)
     public_json = json_utf8({
         "summary": "s", "steps": ["st"], "source_refs": [], "limitations": []})
     parsed, reason = validate_proposal(
@@ -2522,17 +2545,21 @@ def b2b_seal_lane(tmp_path):
     try:
         yield SimpleNamespace(
             store=store, sink=sink, cap=cap, receipt=receipt, resolved=resolved,
-            view=view, db_path=tmp_path / "runs.db", agent=agent)
+            view=view, dispatch_view=dispatch_view, db_path=tmp_path / "runs.db", agent=agent)
     finally:
         store.close()
 
 
 def _seal_recheck_view(lane, *, divergent=False):
-    view = copy.deepcopy(lane.view)
-    view["captured_at"] = "2026-10-29T23:59:59.000Z"
+    view = renew_unit_oc_read(lane.view, read_id=3)
     assert view["captured_at"] != lane.view["captured_at"]
     if divergent:
-        view["operational_context"]["view"]["view_instant"] = "1970-01-01T00:00:00.000Z"
+        oc_view = view["operational_context"]["view"]
+        if oc_view.get("format") in (
+                "dubsar.my-work-oc-context-view/1", "dubsar.my-work-oc-context-view/2"):
+            oc_view["qualification"]["values"][0]["source_observed_at"] = "1970-01-01T00:00:00.000Z"
+        else:
+            oc_view["view_instant"] = "1970-01-01T00:00:00.000Z"
     view["context_digest"] = native_context_digest(view)
     for _ in range(8):
         size = len(json_utf8(view))
@@ -2589,6 +2616,13 @@ def test_b2b_seal_positive_exact15_and_persisted(b2b_seal_lane):
         rechecked = json.loads(artifacts["context_recheck"]["payload"])
         assert rechecked["view"] == fresh
         assert rechecked["source_basis_digest"] == receipt.source_basis_digest
+        assert rechecked["source_basis_contract"] == receipt.source_basis_contract
+        assert rechecked["context_digest"] == fresh["context_digest"]
+        assert rechecked["view_digest"] == context_proof(fresh)["view_digest"]
+        initial_context = json.loads(artifacts["context"]["payload"])
+        assert initial_context["view"] == lane.view
+        assert initial_context["view_digest"] == receipt.view_digest
+        assert initial_context["source_basis_contract"] == receipt.source_basis_contract
         assert created["created_at"] == "2026-10-29T23:59:59Z"
         assert reopened.b2b_snapshot(profile=sink.profile, attempt_id=sink.attempt_id) == snap
         replay = reopened.b2b_seal(
@@ -2613,14 +2647,17 @@ def test_b2b_seal_rejects_stale_source_basis(b2b_seal_lane):
 
 
 @pytest.mark.parametrize("fault", ["forged_digest", "missing_digest", "wrong_digest",
-                                  "missing_view", "nonmapping_view"])
+                                  "missing_view", "nonmapping_view", "wrong_view_digest",
+                                  "missing_view_digest", "wrong_context_digest",
+                                  "missing_version", "wrong_version"])
 def test_b2b_seal_store_rejects_invalid_context(b2b_seal_lane, fault):
     lane = b2b_seal_lane
     sink, receipt = lane.sink, lane.receipt
     before = lane.store.b2b_snapshot(profile=sink.profile, attempt_id=sink.attempt_id)
     recheck = {
-        "format": "dubsar.b2b-context-recheck/1", "attempt_id": sink.attempt_id,
-        "run_id": sink.run_id, "view": _seal_recheck_view(lane, divergent=fault == "forged_digest"),
+        "format": "dubsar.b2b-context-recheck/2", "attempt_id": sink.attempt_id,
+        "run_id": sink.run_id,
+        **context_proof(_seal_recheck_view(lane, divergent=fault == "forged_digest")),
         "source_basis_digest": receipt.source_basis_digest}
     if fault == "missing_digest":
         del recheck["source_basis_digest"]
@@ -2630,6 +2667,16 @@ def test_b2b_seal_store_rejects_invalid_context(b2b_seal_lane, fault):
         del recheck["view"]
     elif fault == "nonmapping_view":
         recheck["view"] = []
+    elif fault == "wrong_view_digest":
+        recheck["view_digest"] = "0" * 64
+    elif fault == "missing_view_digest":
+        del recheck["view_digest"]
+    elif fault == "wrong_context_digest":
+        recheck["context_digest"] = "sha256:" + "0" * 64
+    elif fault == "missing_version":
+        del recheck["source_basis_contract"]
+    elif fault == "wrong_version":
+        recheck["source_basis_contract"] = "dubsar.b2b-source-basis/1"
     proposal = json_utf8({"proposal_id": "b2bprop_" + sink.attempt_id[5:],
                     "attempt_id": sink.attempt_id, "binding_digest": sink.binding_digest,
                     "profile": sink.profile, "session_id": sink.session_id,
@@ -2645,4 +2692,46 @@ def test_b2b_seal_store_rejects_invalid_context(b2b_seal_lane, fault):
             profile=sink.profile, attempt_id=sink.attempt_id,
             artifacts={"source_before_seal": b2b._source_record(lane.resolved),
                        "context_recheck": json_utf8(recheck), "proposal": proposal})
+    _assert_seal_rollback(lane, before)
+
+
+@pytest.mark.parametrize("b2b_seal_lane", ["native-v1", "native-v2"], indirect=True)
+def test_b2b_seal_rejects_replayed_dispatch_receipt_at_both_layers(b2b_seal_lane):
+    lane = b2b_seal_lane
+    before = lane.store.b2b_snapshot(profile=lane.sink.profile, attempt_id=lane.sink.attempt_id)
+    with pytest.raises(B2BTerminalRefusal, match="context_oc_read_replayed"):
+        lane.sink.seal(source_before_seal=lane.resolved, rechecked_view=lane.dispatch_view,
+                       created_at="2026-10-30T12:00:03Z")
+    assert lane.store.b2b_snapshot(
+        profile=lane.sink.profile, attempt_id=lane.sink.attempt_id) == before
+    marker = lane.store.b2b_artifact(attempt_id=lane.sink.attempt_id, kind="provider_dispatch")
+    recheck = json.loads(marker["payload"])["context_recheck"]
+    proposal = {"attempt_id": lane.sink.attempt_id, "binding_digest": lane.sink.binding_digest}
+    with pytest.raises(ValueError, match="b2b_seal_context"):
+        lane.store.b2b_seal(
+            profile=lane.sink.profile, attempt_id=lane.sink.attempt_id,
+            artifacts={"source_before_seal": b"{}", "context_recheck": json_utf8(recheck),
+                       "proposal": json_utf8(proposal)})
+    _assert_seal_rollback(lane, before)
+
+
+@pytest.mark.parametrize("fault", ["expired", "revoked", "rule_changed", "limits_changed"])
+def test_b2b_seal_requalifies_source_before_any_persistence(b2b_seal_lane, fault):
+    lane = b2b_seal_lane
+    before = lane.store.b2b_snapshot(profile=lane.sink.profile, attempt_id=lane.sink.attempt_id)
+    fresh = _seal_recheck_view(lane)
+    oc = fresh["operational_context"]
+    if fault == "expired":
+        oc["freshness"] = "stale"
+    elif fault == "revoked":
+        oc["availability"] = "unavailable"
+    elif fault == "rule_changed":
+        oc["view"]["new_relevant_rule_version"] = 2
+    else:
+        oc["limits"] = [{"source": "operational_context", "code": "SOURCE_CHANGED",
+                         "detail": "UNIT SOURCE DOUBLE changed a relevant bound."}]
+    reseal_unit_context_view(fresh)
+    with pytest.raises(B2BTerminalRefusal):
+        lane.sink.seal(source_before_seal=lane.resolved, rechecked_view=fresh,
+                       created_at="2026-10-30T12:00:03Z")
     _assert_seal_rollback(lane, before)

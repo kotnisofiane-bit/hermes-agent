@@ -11,7 +11,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from agent.b2b_execution import json_utf8, source_basis
+from agent.b2b_execution import (
+    B2BTerminalRefusal, assert_source_equivalent, json_utf8, verify_context_proof)
 from hermes_cli.sqlite_util import add_column_if_missing
 
 
@@ -452,8 +453,22 @@ class RunIdempotencyStore:
                 raise ValueError("b2b_dispatch_identity")
             captured = self._b2b_payload(context["payload"])
             if (dispatch.get("context_digest") != captured.get("context_digest") or
-                    dispatch.get("source_basis_digest") != captured.get("source_basis_digest")):
+                    dispatch.get("source_basis_digest") != captured.get("source_basis_digest") or
+                    dispatch.get("source_basis_contract") != captured.get("source_basis_contract") or
+                    dispatch.get("view_digest") != captured.get("view_digest")):
                 raise ValueError("b2b_dispatch_context")
+            try:
+                original = verify_context_proof(captured)
+                reread = dispatch.get("context_recheck")
+                if (not isinstance(reread, dict) or
+                        reread.get("format") != "dubsar.b2b-context-recheck/2" or
+                        reread.get("attempt_id") != attempt_id or
+                        reread.get("run_id") != row["run_id"]):
+                    raise ValueError("recheck_identity")
+                checked = verify_context_proof(reread)
+                assert_source_equivalent(original["view"], checked["view"])
+            except (B2BTerminalRefusal, ValueError, TypeError, KeyError):
+                raise ValueError("b2b_dispatch_context") from None
             now = time.time()
             self._b2b_put_artifact_locked(attempt_id, "source_before_provider", source_record, now)
             self._b2b_put_artifact_locked(attempt_id, "provider_dispatch", dispatch_record, now)
@@ -521,21 +536,27 @@ class RunIdempotencyStore:
             recheck = self._b2b_payload(artifacts["context_recheck"])
             if (result is None or context is None or
                     proposal.get("attempt_id") != attempt_id or
+                    recheck.get("attempt_id") != attempt_id or
                     recheck.get("run_id") != row["run_id"] or
                     proposal.get("binding_digest") != row["binding_digest"]):
                 raise ValueError("b2b_seal_identity")
             received = self._b2b_payload(result["payload"])
             original = self._b2b_payload(context["payload"])
             # Recompute from both durable views; a copied digest is not a recheck.
-            orig_view, recheck_view = original.get("view"), recheck.get("view")
-            if not isinstance(orig_view, dict) or not isinstance(recheck_view, dict):
-                raise ValueError("b2b_seal_context")
-            orig_basis = json_utf8(source_basis(orig_view))
-            recheck_basis = json_utf8(source_basis(recheck_view))
-            if (orig_basis != recheck_basis or
-                    hashlib.sha256(orig_basis).hexdigest() != original.get("source_basis_digest") or
-                    hashlib.sha256(recheck_basis).hexdigest() != recheck.get("source_basis_digest")):
-                raise ValueError("b2b_seal_context")
+            try:
+                if recheck.get("format") != "dubsar.b2b-context-recheck/2":
+                    raise ValueError("recheck_version")
+                original_proof = verify_context_proof(original)
+                fresh_proof = verify_context_proof(recheck)
+                assert_source_equivalent(original_proof["view"], fresh_proof["view"])
+                marker = self._b2b_artifact_locked(attempt_id, "provider_dispatch")
+                if marker is None:
+                    raise ValueError("missing_dispatch")
+                dispatch = self._b2b_payload(marker["payload"])
+                dispatched_proof = verify_context_proof(dispatch.get("context_recheck"))
+                assert_source_equivalent(dispatched_proof["view"], fresh_proof["view"])
+            except (B2BTerminalRefusal, ValueError, TypeError, KeyError):
+                raise ValueError("b2b_seal_context") from None
             if (proposal.get("context_digest") != original.get("context_digest") or
                     any(proposal.get(key) != received["proposal"].get(key) for key in
                         ("summary", "steps", "source_refs", "limitations"))):
