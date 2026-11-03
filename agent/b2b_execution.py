@@ -23,6 +23,7 @@ import threading
 import time
 import types
 import weakref
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
@@ -48,6 +49,11 @@ _SOURCE_BASIS_KEYS = (
     "format", "bot_id", "profile_id", "project_id", "mission_id", "mission_binding",
     "identity_source", "resolution", "namespaces_searched", "namespaces_refused",
     "coverage", "limits", "my_work", "memory", "operational_context", "accepted_context")
+SOURCE_BASIS_CONTRACT = "dubsar.b2b-source-basis/2"
+_OC_RECEIPT_FORMATS = frozenset({
+    "dubsar.my-work-oc-context-view/1", "dubsar.my-work-oc-context-view/2"})
+_OC_READ_REF = re.compile(r"^ocv_[0-9a-f]{32}$")
+_UTC_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
 R2_SCHEMA_PINS = types.MappingProxyType({
     "agent-context-r2.schema.json":
         "8615f3b4730acbabc614cd7cc770730be244888b59cc69957f14d4f520dbd0e2",
@@ -130,7 +136,125 @@ def source_basis(view: Mapping[str, Any]) -> Dict[str, Any]:
     result = {key: _plain_json(view.get(key)) for key in _SOURCE_BASIS_KEYS}
     if "automation_results" in view:
         result["automation_results"] = _plain_json(view["automation_results"])
+    oc = result.get("operational_context")
+    receipt = oc.get("view") if isinstance(oc, dict) else None
+    if isinstance(receipt, dict) and receipt.get("format") in _OC_RECEIPT_FORMATS:
+        # These exact paths describe a read, not its sources. Never strip names
+        # recursively: source dates, policy versions and all unknown keys matter.
+        receipt.pop("view_ref", None)
+        receipt.pop("view_instant", None)
+        projection = receipt.get("state_projection")
+        if receipt["format"].endswith("/2") and isinstance(projection, dict):
+            projection.pop("instant", None)
+            projection.pop("age_ms", None)
     return result
+
+
+def _utc_milliseconds(value: Any) -> int:
+    if not isinstance(value, str) or not _UTC_TIME.fullmatch(value):
+        raise B2BTerminalRefusal("context_oc_read_metadata")
+    try:
+        instant = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError:
+        raise B2BTerminalRefusal("context_oc_read_metadata") from None
+    return (instant - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(milliseconds=1)
+
+
+def _native_oc_read_metadata(view: Mapping[str, Any]) -> Optional[Tuple[str, int]]:
+    oc = view.get("operational_context")
+    receipt = oc.get("view") if isinstance(oc, Mapping) else None
+    if not isinstance(receipt, Mapping) or receipt.get("format") not in _OC_RECEIPT_FORMATS:
+        return None
+    ref = receipt.get("view_ref")
+    if not isinstance(ref, str) or not _OC_READ_REF.fullmatch(ref):
+        raise B2BTerminalRefusal("context_oc_read_metadata")
+    instant = _utc_milliseconds(receipt.get("view_instant"))
+    bounds, qualification = receipt.get("bounds"), receipt.get("qualification")
+    if not isinstance(qualification, Mapping):
+        raise B2BTerminalRefusal("context_oc_unqualified")
+    # mapping/2 leaves sequential snapshots outside the legacy comparator.
+    # Their summary may mix old/current supports; the governed head below
+    # must still independently satisfy every projection and source-age check.
+    ordered_history = (
+        receipt["format"].endswith("/2")
+        and qualification.get("freshness") in ("current", "mixed")
+        and qualification.get("agreement") == "coexistence_not_comparable"
+        and qualification.get("comparability") == "not_comparable")
+    if (oc.get("availability") != "available" or oc.get("freshness") != "current" or
+            oc.get("truncated") is not False or
+            receipt.get("selection_receipt") != "complete_in_authorized_selection" or
+            not isinstance(bounds, Mapping) or bounds.get("truncated", False) is not False or
+            qualification.get("status") != "current" or
+            qualification.get("admissibility") not in ("admissible", "limited") or
+            (receipt["format"].endswith("/1") and
+             qualification.get("admissibility") != "admissible") or
+            (not ordered_history and
+             (qualification.get("freshness") != "current" or
+              qualification.get("agreement") not in ("single", "agree")))):
+        raise B2BTerminalRefusal("context_oc_unqualified")
+    if receipt["format"].endswith("/2"):
+        projection = receipt.get("state_projection")
+        if (not isinstance(projection, Mapping) or
+                projection.get("contract") != "dubsar.operational-context.state-projection/1" or
+                projection.get("instant") != receipt.get("view_instant") or
+                projection.get("freshness") != "current" or projection.get("eligible") is not True or
+                projection.get("head_complete") is not True or
+                projection.get("history_truncated") is not False or
+                projection.get("limits") != []):
+            raise B2BTerminalRefusal("context_oc_projection")
+        # /2 eligibility comes from the governed ordered projection, not the
+        # independent legacy qualification. Both remain in the compared proof.
+        candidate = projection.get("candidate")
+        if not isinstance(candidate, Mapping) or candidate.get("result_kind") != "measured":
+            raise B2BTerminalRefusal("context_oc_projection")
+        age, maximum = projection.get("age_ms"), projection.get("freshness_max_age_ms")
+        expected_age = instant - _utc_milliseconds(candidate.get("source_observed_at"))
+        if (type(age) is not int or type(maximum) is not int or
+                age != expected_age or age < 0 or maximum < age):
+            raise B2BTerminalRefusal("context_oc_source_stale")
+    return ref, instant
+
+
+def context_proof(view: Mapping[str, Any]) -> Dict[str, Any]:
+    """Complete immutable-read evidence, separate from normalized source identity."""
+    if not isinstance(view, Mapping):
+        raise B2BTerminalRefusal("context_view_not_object")
+    plain = _plain_json(view)
+    _native_oc_read_metadata(plain)
+    native_digest = native_context_digest(plain)
+    if plain.get("context_digest") != native_digest:
+        raise B2BTerminalRefusal("context_digest_invalid")
+    return {
+        "view": plain, "context_digest": native_digest,
+        "view_digest": hashlib.sha256(json_utf8(plain)).hexdigest(),
+        "source_basis_contract": SOURCE_BASIS_CONTRACT,
+        "source_basis_digest": hashlib.sha256(json_utf8(source_basis(plain))).hexdigest()}
+
+
+def assert_source_equivalent(original_view: Mapping[str, Any],
+                             fresh_view: Mapping[str, Any]) -> None:
+    """One source/read rule for the worker, sink, and durable transactions."""
+    original, fresh = context_proof(original_view), context_proof(fresh_view)
+    if json_utf8(source_basis(original["view"])) != json_utf8(source_basis(fresh["view"])):
+        raise B2BTerminalRefusal("context_stale")
+    original_meta = _native_oc_read_metadata(original["view"])
+    fresh_meta = _native_oc_read_metadata(fresh["view"])
+    if original_meta is not None and (
+            fresh_meta is None or original_meta[0] == fresh_meta[0] or
+            fresh_meta[1] < original_meta[1]):
+        raise B2BTerminalRefusal("context_oc_read_replayed")
+
+
+def verify_context_proof(proof: Mapping[str, Any]) -> Dict[str, Any]:
+    """Recompute every digest/version; never accept a copied comparison digest."""
+    if not isinstance(proof, Mapping) or not isinstance(proof.get("view"), Mapping):
+        raise B2BTerminalRefusal("context_proof_missing")
+    checked = context_proof(proof["view"])
+    if any(proof.get(key) != checked[key] for key in (
+            "context_digest", "view_digest", "source_basis_contract", "source_basis_digest")):
+        raise B2BTerminalRefusal("context_proof_invalid")
+    qualify_recorded_memory(checked["view"])
+    return checked
 
 
 def native_context_digest(view: Mapping[str, Any]) -> str:
@@ -280,6 +404,14 @@ class ContextReceipt:
     def source_basis_digest(self) -> str:
         return hashlib.sha256(self.source_basis_bytes).hexdigest()
 
+    @property
+    def view_digest(self) -> str:
+        return hashlib.sha256(self.view_bytes).hexdigest()
+
+    @property
+    def source_basis_contract(self) -> str:
+        return SOURCE_BASIS_CONTRACT
+
 
 @dataclasses.dataclass(frozen=True)
 class BoundExecution:
@@ -296,6 +428,7 @@ class BoundExecution:
     created_at: float
     _recheck: Any = dataclasses.field(default=None, repr=False, compare=False)
     _receipt: Any = dataclasses.field(default=None, repr=False, compare=False)
+    _last_context_read: Any = dataclasses.field(default=None, repr=False, compare=False)
     _agent_ref: Any = dataclasses.field(default=None, repr=False, compare=False)
     _context_lock: Any = dataclasses.field(default_factory=threading.RLock,
                                          repr=False, compare=False)
@@ -341,6 +474,8 @@ class BoundExecution:
         with self._context_lock:
             receipt = publish_context(self, view, rendered, turn_id=turn_id)
             object.__setattr__(self, "_receipt", receipt)
+            if self._last_context_read is None:
+                object.__setattr__(self, "_last_context_read", receipt.view)
             return receipt
 
 
@@ -442,6 +577,67 @@ def _qualify_memory_relation(relation, allowed_namespaces, binding) -> None:
             raise B2BTerminalRefusal("context_memory_mission")
 
 
+def qualify_recorded_memory(view: Mapping[str, Any]) -> None:
+    """One advisory-Memory rule for worker, sink and durable proof verification.
+
+    The trusted C1 producer performs new authorized reads. Recorded operational
+    freshness is independent: unknown remains unknown, never an authority grant.
+    """
+    if any(view.get(key) != value for key, value in (
+            ("authority", "none"), ("content_trust", "advisory_data"),
+            ("text_role", "data"), ("truth", "not_selected"))):
+        raise B2BTerminalRefusal("context_memory_malformed_globals")
+    memory = view.get("memory")
+    binding = view.get("mission_binding")
+    searched = view.get("namespaces_searched")
+    if (not isinstance(memory, Mapping) or not isinstance(binding, Mapping) or
+            not isinstance(searched, (list, tuple)) or not searched or
+            any(not isinstance(item, str) or not item for item in searched) or
+            len(set(searched)) != len(searched)):
+        raise B2BTerminalRefusal("context_memory_malformed")
+    if memory.get("availability") != "available":
+        raise B2BTerminalRefusal("context_source_unavailable")
+    if memory.get("freshness") not in ("unknown", "current"):
+        raise B2BTerminalRefusal("context_source_stale")
+    for key, expected in (("api", "v2"), ("source_contract", "memory-plane.v2/context-view"),
+                          ("v1_fallback", False), ("truncated", False)):
+        if memory.get(key) != expected or (
+                expected is False and memory.get(key) is not False):
+            raise B2BTerminalRefusal("context_memory_malformed_" + key)
+    uncertainty = {"component": "memory", "code": "MEMORY_FRESHNESS_UNKNOWN",
+                   "detail": "Source freshness is unknown."}
+    limits = memory.get("limits")
+    if (not isinstance(limits, (list, tuple)) or len(limits) > 1 or
+            any(item != uncertainty or memory["freshness"] != "unknown" for item in limits)):
+        raise B2BTerminalRefusal("context_memory_malformed_limits")
+    relations = memory.get("relations")
+    if not isinstance(relations, (list, tuple)):
+        raise B2BTerminalRefusal("context_memory_malformed")
+    if not relations:
+        raise B2BTerminalRefusal("context_memory_missing")
+    triplet = {key: binding.get(key) for key in
+               ("mission_id", "revision", "authority_digest")}
+    if (memory.get("mission_qualification") != "qualified" or
+            memory.get("mission_binding") != triplet):
+        raise B2BTerminalRefusal("context_memory_unqualified")
+    contradictions = memory.get("contradictions")
+    if (not isinstance(contradictions, Mapping) or
+            contradictions.get("evaluation") != "propagated" or
+            type(contradictions.get("dropped")) is not int or
+            contradictions["dropped"] != 0 or
+            type(contradictions.get("omitted_endpoints")) is not int or
+            contradictions["omitted_endpoints"] != 0 or
+            not isinstance(contradictions.get("records"), (list, tuple)) or
+            any(not isinstance(record, Mapping) or
+                record.get("resolution") not in ("resolved", "dismissed", "superseded")
+                for record in contradictions["records"])):
+        raise B2BTerminalRefusal("context_contradictions")
+    for relation in relations:
+        if not isinstance(relation, Mapping):
+            raise B2BTerminalRefusal("context_memory_malformed")
+        _qualify_memory_relation(relation, set(searched), binding)
+
+
 def qualify_context_view(cap: BoundExecution, view: Mapping[str, Any]) -> Dict[str, Any]:
     project = cap.policy_get("project", {})
     plain = validate_context_schema(view, project.get("context_contract_root"))
@@ -480,7 +676,7 @@ def qualify_context_view(cap: BoundExecution, view: Mapping[str, Any]) -> Dict[s
     memory, my_work, oc = (plain[key] for key in ("memory", "my_work", "operational_context"))
     if any(source["availability"] != "available" for source in (memory, my_work, oc)):
         raise B2BTerminalRefusal("context_source_unavailable")
-    if any(source["freshness"] != "current" for source in (memory, oc)):
+    if oc["freshness"] != "current":
         raise B2BTerminalRefusal("context_source_stale")
     mission = my_work.get("mission")
     if (my_work["source"] != "get_mission_context" or not isinstance(mission, dict) or
@@ -495,17 +691,7 @@ def qualify_context_view(cap: BoundExecution, view: Mapping[str, Any]) -> Dict[s
             any(authority[key] != expected[key] for key in
                 ("mission_id", "revision", "basis_digest", "authority_digest", "scope", "issuer"))):
         raise B2BTerminalRefusal("context_my_work_authority")
-    triplet = {key: binding[key] for key in ("mission_id", "revision", "authority_digest")}
-    if memory["mission_qualification"] != "qualified" or memory.get("mission_binding") != triplet:
-        raise B2BTerminalRefusal("context_memory_unqualified")
-    contradictions = memory["contradictions"]
-    if (contradictions["evaluation"] != "propagated" or contradictions["dropped"] or
-            contradictions["omitted_endpoints"] or
-            any(record["resolution"] not in ("resolved", "dismissed", "superseded")
-                for record in contradictions["records"])):
-        raise B2BTerminalRefusal("context_contradictions")
-    for relation in memory["relations"]:
-        _qualify_memory_relation(relation, set(searched), binding)
+    qualify_recorded_memory(plain)
     for container in (oc.get("selection"), oc.get("view")):
         if container is not None and not isinstance(container, dict):
             raise B2BTerminalRefusal("context_oc_malformed")
@@ -539,6 +725,7 @@ def qualify_context_view(cap: BoundExecution, view: Mapping[str, Any]) -> Dict[s
                 relation_count += 1
     if relation_count != plain["bounds"]["relation_count"] or relation_count > 20:
         raise B2BTerminalRefusal("context_relation_bounds")
+    _native_oc_read_metadata(plain)
     encoded = json_utf8(plain)
     if len(encoded) > 32768 or plain["bounds"]["serialized_bytes"] != len(encoded):
         raise B2BTerminalRefusal("context_view_bounds")
@@ -546,16 +733,21 @@ def qualify_context_view(cap: BoundExecution, view: Mapping[str, Any]) -> Dict[s
 
 
 def recheck_context(cap: BoundExecution, receipt: ContextReceipt) -> Dict[str, Any]:
-    try:
-        fresh = cap.context_recheck()
-    except Exception:
-        raise B2BTerminalRefusal("context_recheck_unavailable") from None
-    if not isinstance(fresh, Mapping):
-        raise B2BTerminalRefusal("context_recheck_unavailable")
-    qualified = qualify_context_view(cap, fresh)
-    if json_utf8(source_basis(qualified)) != receipt.source_basis_bytes:
-        raise B2BTerminalRefusal("context_stale")
-    return qualified
+    with cap._context_lock:
+        try:
+            fresh = cap.context_recheck()
+        except Exception:
+            raise B2BTerminalRefusal("context_recheck_unavailable") from None
+        if not isinstance(fresh, Mapping):
+            raise B2BTerminalRefusal("context_recheck_unavailable")
+        qualified = qualify_context_view(cap, fresh)
+        assert_source_equivalent(receipt.view, qualified)
+        # A second boundary cannot reuse a receipt accepted at the first one.
+        previous = cap._last_context_read
+        if previous is not None:
+            assert_source_equivalent(previous, qualified)
+        object.__setattr__(cap, "_last_context_read", _deep_freeze(qualified))
+        return qualified
 
 
 def publish_context(cap: BoundExecution, view: Mapping[str, Any], rendered: Any, *,
@@ -794,7 +986,11 @@ def before_sdk_dispatch(agent: Any, kwargs: Mapping[str, Any], cap: BoundExecuti
             str(getattr(client, "base_url", "")).rstrip("/") !=
             str(cap.policy_get("project", {}).get("base_url") or "").rstrip("/")):
         raise B2BTerminalRefusal("b2b_client_policy")
-    if not cap.sink.cas_dispatch(request_digest=expected_digest, receipt=receipt):
+    # P1 exchange and request-local construction may have taken time. Re-read
+    # native sources here as well, immediately before the irreversible marker.
+    fresh = recheck_context(cap, receipt)
+    if not cap.sink.cas_dispatch(request_digest=expected_digest, receipt=receipt,
+                                 rechecked_view=fresh):
         raise B2BTerminalRefusal("dispatch_already_committed")
 
 

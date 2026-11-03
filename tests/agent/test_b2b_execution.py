@@ -12,6 +12,7 @@ import weakref
 
 import pytest
 
+from agent import b2b_execution as be
 from agent.b2b_execution import (
     BoundExecution, B2BTerminalRefusal, ContextReceipt, _deep_freeze,
     _public_text, bind_execution, canonical_json, current_execution,
@@ -19,7 +20,8 @@ from agent.b2b_execution import (
     publish_context, require_execution, reset_execution, validate_proposal)
 from hermes_constants import get_hermes_home
 from tests.gateway.b2b_process_harness import (
-    UNIT_RENDERED, build_context_view, extract_contract_root)
+    UNIT_RENDERED, build_context_view, build_unit_native_oc_view, extract_contract_root,
+    renew_unit_oc_read, reseal_unit_context_view)
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +196,131 @@ def test_current_execution_none_without_cap():
 # ---------------------------------------------------------------------------
 # BoundExecution — frozen, tuple, per-cap recheck, publish
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("ordered", [False, True], ids=["receipt-v1", "receipt-v2"])
+def test_native_read_metadata_changes_preserve_source_identity(ordered):
+    cap = _cap()
+    agent = _bound_agent(cap)
+    original = build_unit_native_oc_view(cap.policy, {}, ordered=ordered)
+    original_bytes = be.json_utf8(original)
+    fresh = renew_unit_oc_read(original)
+    be.assert_source_equivalent(original, fresh)
+    assert be.json_utf8(original) == original_bytes
+    assert be.json_utf8(be.source_basis(original)) == be.json_utf8(be.source_basis(fresh))
+    before, after = be.context_proof(original), be.context_proof(fresh)
+    assert before["view_digest"] != after["view_digest"]
+    assert before["context_digest"] != after["context_digest"]
+    assert before["source_basis_digest"] == after["source_basis_digest"]
+    assert before["source_basis_contract"] == "dubsar.b2b-source-basis/2"
+    reads = []
+    cap.register_context_recheck(lambda execution: reads.append(execution) or fresh)
+    token = bind_execution(cap)
+    try:
+        receipt = cap.publish_context(original, UNIT_RENDERED, turn_id="t1")
+        assert be.recheck_context(cap, receipt) == fresh
+    finally:
+        reset_execution(token)
+    assert reads == [cap] and agent._b2b_execution is cap
+    assert receipt.view_digest == before["view_digest"]
+    assert be.json_utf8(receipt.view) == original_bytes
+
+
+_NATIVE_SOURCE_MUTATIONS = [
+    (("qualification", "values", 0, "observation_ref"), "oco_" + "c" * 32),
+    (("qualification", "values", 0, "value"), "b" * 40),
+    (("qualification", "values", 0, "source_observed_at"), "2026-10-30T11:59:59.000Z"),
+    (("qualification", "values", 0, "received_at"), "2026-10-30T12:00:00.002Z"),
+    (("qualification", "mapping_ref"), "mapping:changed"),
+    (("qualification", "mapping_version"), 2),
+    (("qualification", "rule_ref"), "rule:changed"),
+    (("qualification", "rule_version"), 2),
+    (("qualification", "freshness"), "stale"),
+    (("qualification", "status"), "pending_recalculation"),
+    (("qualification", "admissibility"), "limited"),
+    (("qualification", "agreement"), "conflict"),
+    (("qualification", "limits"), [{"code": "SOURCE_CHANGED"}]),
+    (("reserves",), [{"code": "SOURCE_CHANGED"}]),
+    (("bounds", "max_observations_examined"), 199),
+    (("bounds", "truncated"), True),
+    (("unknown_future_source_field",), "changed"),
+]
+
+
+@pytest.mark.parametrize(("path", "replacement"), _NATIVE_SOURCE_MUTATIONS)
+def test_native_source_drift_is_never_normalized_away(path, replacement):
+    original = build_unit_native_oc_view(_cap().policy, {})
+    fresh = renew_unit_oc_read(original)
+    target = fresh["operational_context"]["view"]
+    for part in path[:-1]:
+        target = target[part]
+    target[path[-1]] = replacement
+    reseal_unit_context_view(fresh)
+    with pytest.raises(B2BTerminalRefusal):
+        be.assert_source_equivalent(original, fresh)
+
+
+@pytest.mark.parametrize(("field", "replacement"), [
+    ("age_ms", 2001), ("freshness_max_age_ms", 1999), ("eligible", False),
+    ("head_complete", False), ("history_truncated", True),
+    ("binding_version", 2), ("mapping_version", 2), ("rule_version", 2),
+    ("producer_epoch", "epoch:changed"), ("freshness", "stale"),
+    ("instant", "2026-10-30T12:00:01.000Z"),
+])
+def test_ordered_snapshot_age_is_checked_before_excluding_read_metadata(field, replacement):
+    original = build_unit_native_oc_view(_cap().policy, {}, ordered=True)
+    fresh = renew_unit_oc_read(original)
+    fresh["operational_context"]["view"]["state_projection"][field] = replacement
+    reseal_unit_context_view(fresh)
+    with pytest.raises(B2BTerminalRefusal):
+        be.assert_source_equivalent(original, fresh)
+
+
+@pytest.mark.parametrize("fault", ["cached", "backwards", "malformed_ref", "malformed_time"])
+def test_native_receipt_replay_and_malformed_metadata_refused(fault):
+    original = build_unit_native_oc_view(_cap().policy, {})
+    fresh = renew_unit_oc_read(original)
+    oc_view = fresh["operational_context"]["view"]
+    if fault == "cached":
+        oc_view["view_ref"] = original["operational_context"]["view"]["view_ref"]
+    elif fault == "backwards":
+        oc_view["view_instant"] = "2026-10-30T12:00:00.999Z"
+    elif fault == "malformed_ref":
+        oc_view["view_ref"] = "copied-view"
+    else:
+        oc_view["view_instant"] = "not-an-instant"
+    reseal_unit_context_view(fresh)
+    with pytest.raises(B2BTerminalRefusal):
+        be.assert_source_equivalent(original, fresh)
+
+
+@pytest.mark.parametrize("field", [
+    "context_digest", "view_digest", "source_basis_digest", "source_basis_contract",
+])
+def test_context_proof_recomputes_all_versions_and_digests(field):
+    proof = be.context_proof(build_unit_native_oc_view(_cap().policy, {}))
+    assert be.verify_context_proof(proof) == proof
+    proof[field] = "forged"
+    with pytest.raises(B2BTerminalRefusal, match="context_proof_invalid"):
+        be.verify_context_proof(proof)
+
+
+@pytest.mark.parametrize("ordered", [False, True], ids=["receipt-v1", "receipt-v2"])
+def test_recheck_cannot_reuse_receipt_from_an_intermediate_boundary(ordered):
+    cap = _cap()
+    agent = _bound_agent(cap)
+    original = build_unit_native_oc_view(cap.policy, {}, ordered=ordered)
+    fresh = renew_unit_oc_read(original)
+    cap.register_context_recheck(lambda execution: fresh)
+    token = bind_execution(cap)
+    try:
+        receipt = cap.publish_context(original, UNIT_RENDERED, turn_id="t1")
+        assert be.recheck_context(cap, receipt) == fresh
+        with pytest.raises(B2BTerminalRefusal, match="context_oc_read_replayed"):
+            be.recheck_context(cap, receipt)
+        assert agent._b2b_execution is cap
+    finally:
+        reset_execution(token)
+
 
 def _unit_policy():
     """Cap policy carrying the REAL pinned contract root -- the schema validation

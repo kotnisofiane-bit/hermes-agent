@@ -177,6 +177,24 @@ def build_context_view(policy: dict, source_body: dict, *, mode: str = "valid",
     view["memory"]["mission_binding"] = {
         "mission_id": binding["mission_id"], "revision": binding["revision"],
         "authority_digest": binding["authority_digest"]}
+    # UNIT producer data, not a native Memory read. The governed contract now
+    # requires nonempty advisory Memory even when operational freshness is unknown.
+    view["memory"]["relations"] = [{
+        "depth": 1,
+        "namespace_id": (project.get("allowed_namespaces") or
+                         view["namespaces_searched"])[0],
+        "predicate": "recorded_context",
+        "subject_key": "project:" + project_id,
+        "relation_id": "unit-memory-relation:1",
+        "statement": "UNIT Memory fixture: recorded advisory project context.",
+        "supersedes": None,
+        "provenance": {
+            "source_id": "unit-memory-source:1", "content_digest": "c" * 64,
+            "evidence_ref": None, "mywork_mission_ref": None,
+            "oc_observation_ref": None, "mywork_mission_id": None,
+            "mywork_mission_revision": None, "mywork_mission_authority_digest": None,
+        },
+    }]
     oc_view = view["operational_context"].get("view")
     if isinstance(oc_view, dict):
         oc_view["project_id"] = project_id
@@ -390,6 +408,69 @@ const json = (res, code, obj) => {
     actors: Object.keys(bench.credentials) }));
 })().catch((e) => { console.log(JSON.stringify({ ready: false, error: String(e) })); });
 """
+
+
+def reseal_unit_context_view(view: dict) -> dict:
+    """UNIT data only: recompute the real r2 digest and serialized-size fixpoint."""
+    from agent.b2b_execution import json_utf8, native_context_digest
+    view["context_digest"] = native_context_digest(view)
+    for _ in range(8):
+        size = len(json_utf8(view))
+        if view["bounds"]["serialized_bytes"] == size:
+            return view
+        view["bounds"]["serialized_bytes"] = size
+    raise AssertionError("unit context size did not converge")
+
+
+def renew_unit_oc_read(view: dict, *, read_id: int = 2) -> dict:
+    """EXPLICIT UNIT READER DOUBLE, not a native OC read or C1 qualification."""
+    assert 1 <= read_id <= 9
+    fresh = json.loads(json.dumps(view))
+    instant = f"2026-10-30T12:00:0{read_id}.000Z"
+    fresh["captured_at"] = instant
+    oc_view = fresh["operational_context"]["view"]
+    if oc_view.get("format") in (
+            "dubsar.my-work-oc-context-view/1", "dubsar.my-work-oc-context-view/2"):
+        oc_view["view_ref"] = "ocv_" + format(read_id, "032x")
+        oc_view["view_instant"] = instant
+        if oc_view["format"].endswith("/2"):
+            oc_view["state_projection"]["instant"] = instant
+            oc_view["state_projection"]["age_ms"] = read_id * 1000
+    return reseal_unit_context_view(fresh)
+
+
+def build_unit_native_oc_view(policy: dict, source_body: dict, *, ordered: bool = False) -> dict:
+    """Native-shaped receipt UNIT DOUBLE; no source service or builder is called."""
+    view = build_context_view(policy, source_body)
+    value = {"observation_ref": "oco_" + "a" * 32, "producer_id": "producer:unit",
+             "result_kind": "measured", "value": "a" * 40,
+             "source_observed_at": "2026-10-30T12:00:00.000Z",
+             "received_at": "2026-10-30T12:00:00.001Z"}
+    qualification = {
+        "status": "current", "freshness": "current", "admissibility": "admissible",
+        "agreement": "single", "coverage": "measured", "comparability": "comparable",
+        "limits": [], "support_refs": [value["observation_ref"]], "values": [dict(value)],
+        "mapping_ref": "mapping:unit", "mapping_version": 1,
+        "rule_ref": "rule:unit", "rule_version": 1}
+    receipt = {
+        "format": "dubsar.my-work-oc-context-view/" + ("2" if ordered else "1"),
+        "ok": True, "selection_receipt": "complete_in_authorized_selection",
+        "qualification": qualification, "reserves": [{"code": "AUTHORIZED_SELECTION_ONLY"}],
+        "bounds": {"max_resources": 20, "relation_depth": 0,
+                   "max_observations_examined": 200, "truncated": False}}
+    if ordered:
+        receipt["state_projection"] = {
+            "contract": "dubsar.operational-context.state-projection/1",
+            "resource_ref": "ocr_" + "b" * 32, "property": "mywork.release.current_sha",
+            "binding_ref": "binding:unit", "binding_version": 1,
+            "mapping_ref": "mapping:unit", "mapping_version": 1,
+            "rule_ref": "rule:unit", "rule_version": 1, "producer_epoch": "epoch:unit",
+            "freshness": "current", "freshness_max_age_ms": 10000,
+            "eligible": True, "head_complete": True, "history_truncated": False,
+            "candidate": {**value, "state_order": {"producer_epoch": "epoch:unit", "sequence": 1}},
+            "history": [], "limits": [], "reserves": []}
+    view["operational_context"]["view"] = receipt
+    return renew_unit_oc_read(view, read_id=1)
 
 
 class P1Node:
