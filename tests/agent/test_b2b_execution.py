@@ -522,14 +522,14 @@ def _timeout_worker(cap):
     return req, made
 
 
-def _cap_with_timeout(seconds):
+def _cap_with_timeout(seconds, **over):
     policy = _unit_policy()
     if seconds is not None:
         project = dict(policy["project"])
         project["request_timeout_seconds"] = seconds
         policy = dict(policy)
         policy["project"] = project
-    return _cap(policy=policy)
+    return _cap(policy=policy, **over)
 
 
 def test_make_client_uses_project_request_timeout(monkeypatch):
@@ -563,4 +563,187 @@ def test_make_client_rejects_invalid_runtime_timeout(monkeypatch):
     req, made = _timeout_worker(_cap_with_timeout(901))
     with pytest.raises(B2BTerminalRefusal, match="b2b_timeout_policy"):
         req._make_client("test")
-    assert made[0].with_options_calls == []
+    # The refusal lands BEFORE any request client is built — nothing leaks.
+    assert made == []
+
+
+def test_make_client_closes_client_when_isolation_impossible(monkeypatch):
+    import agent.b2b_execution as _be_mod
+    monkeypatch.setattr(_be_mod, "before_sdk_dispatch", lambda *a, **k: None)
+    closed = []
+
+    class _NoCloneClient:
+        max_retries = 0
+
+    req, made = _timeout_worker(_cap_with_timeout(60))
+    req.agent._create_request_openai_client = lambda **kw: made.append(1) or _NoCloneClient()
+    req.agent._close_request_openai_client = lambda c, **kw: closed.append(c)
+    with pytest.raises(B2BTerminalRefusal, match="b2b_retries_not_disabled"):
+        req._make_client("test")
+    assert len(closed) == 1 and isinstance(closed[0], _NoCloneClient)
+
+
+# ---------------------------------------------------------------------------
+# stale watchdog on the B2B lane — policy floor, run-budget bound
+# ---------------------------------------------------------------------------
+
+def _b2b_env(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME + no ambient timeout env leaking into the watchdog math."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / ".env").write_text("", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+    for var in ("HERMES_API_CALL_STALE_TIMEOUT", "HERMES_API_TIMEOUT",
+                "HERMES_CODEX_TTFB_TIMEOUT_SECONDS",
+                "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def _fresh_agent(*, base_url="https://llm.example.com/v1", session_id=None):
+    """A REAL AIAgent on a remote endpoint. The first ``import run_agent`` (and
+    agent init) exports ``TMPDIR``/``TMP``/``TEMP``/``HERMES_SCRATCH_DIR`` →
+    ``<HERMES_HOME>/cache/scratch`` as a process-global; snapshot BEFORE the
+    import and restore afterwards so later fixtures (P1Node's authorized-temp
+    check) keep the platform temp root."""
+    import os as _os
+    import tempfile as _tf
+    saved = {k: _os.environ.get(k) for k in ("TMPDIR", "TEMP", "TMP", "HERMES_SCRATCH_DIR")}
+    saved_tempdir = _tf.tempdir
+    kw = {} if session_id is None else {"session_id": session_id}
+    try:
+        from run_agent import AIAgent
+        agent = AIAgent(
+            model="unit-double", provider="custom", api_key="sk-dummy",
+            base_url=base_url, quiet_mode=True, skip_context_files=True,
+            skip_memory=True, platform="cli", **kw)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+        _tf.tempdir = saved_tempdir
+    agent.api_mode = "chat_completions"
+    return agent
+
+
+def _remote_b2b_agent(tmp_path, monkeypatch, cap, *,
+                      base_url="https://llm.example.com/v1"):
+    """A REAL AIAgent on a REMOTE endpoint, bound to ``cap`` the way the host binds it."""
+    from agent.b2b_execution import install_bounded_agent_policy
+    agent = _fresh_agent(base_url=base_url, session_id=cap.session_id)
+    token = bind_execution(cap)
+    try:
+        install_bounded_agent_policy(agent, cap)
+    finally:
+        reset_execution(token)
+    return agent
+
+
+def test_b2b_watchdog_floors_at_project_timeout_on_remote(tmp_path, monkeypatch):
+    """Remote endpoint + request_timeout_seconds=600: the stale watchdog tracks the
+    project policy — never the implicit 90s fuse that fires mid-call on slow
+    upstreams — and stays bounded by the remaining run budget."""
+    _b2b_env(tmp_path, monkeypatch)
+    import time as _time
+    from agent.chat_completion_helpers import _resolve_nonstream_watchdogs
+    kwargs = {"model": "unit-double", "messages": [{"role": "user", "content": "hi"}]}
+
+    cap = _cap_with_timeout(600)
+    agent = _remote_b2b_agent(tmp_path, monkeypatch, cap)
+    assert _resolve_nonstream_watchdogs(agent, kwargs).stale_timeout == 600.0
+
+    # Bounded by the run budget: the policy floor can never outlive the run.
+    agent.run_budget_seconds = 300.0
+    agent._run_budget_started_at = _time.time()
+    wd = _resolve_nonstream_watchdogs(agent, kwargs)
+    assert 280.0 < wd.stale_timeout <= 300.0
+
+    # Control: the same REMOTE agent without a B2B cap keeps the 90s implicit fuse.
+    plain = _fresh_agent()
+    assert _resolve_nonstream_watchdogs(plain, kwargs).stale_timeout == 90.0
+
+
+def _gate_run(tmp_path, monkeypatch, cap, *, elapsed_offset):
+    """Run a REAL _NonStreamRequest whose worker answers only when the gate opens,
+    with the call clock already ``elapsed_offset`` seconds in. Returns
+    (response|None, error|None, cap)."""
+    import threading
+    import agent.b2b_execution as _be_mod
+    from agent.chat_completion_nonstream import _NonStreamRequest
+    from types import SimpleNamespace
+    monkeypatch.setattr(_be_mod, "before_sdk_dispatch", lambda *a, **k: None)
+    gate = threading.Event()
+    response = _Resp(content=_good_proposal())
+    outcome = {}
+
+    class _GateClient:
+        def __init__(self):
+            self.max_retries = 0
+            self.base_url = "https://llm.example.com/v1"
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+        def with_options(self, **kw):
+            clone = _GateClient()
+            clone.max_retries = kw.get("max_retries", 0)
+            return clone
+
+        def _create(self, **_kw):
+            gate.wait(30)
+            return response
+
+    agent = _remote_b2b_agent(tmp_path, monkeypatch, cap)
+    agent._create_request_openai_client = lambda **kw: _GateClient()
+    agent._close_request_openai_client = lambda *a, **k: None
+    agent._abort_request_openai_client = lambda *a, **k: None
+    token = bind_execution(cap)
+    try:
+        req = _NonStreamRequest(
+            agent, {"model": "unit-double",
+                    "messages": [{"role": "user", "content": "hi"}]})
+        req._b2b_execution = cap
+        req._b2b_receipt = object()
+        req._b2b_request_digest = "d" * 64
+        req.call_start -= elapsed_offset
+
+        def _drive():
+            try:
+                outcome["response"] = req.run()
+            except Exception as exc:  # noqa: BLE001 — surfaced by the assertion
+                outcome["error"] = exc
+
+        driver = threading.Thread(target=_drive, daemon=True)
+        try:
+            driver.start()
+            driver.join(timeout=4.0)
+            outcome["killed_early"] = not driver.is_alive()
+        finally:
+            gate.set()
+        driver.join(timeout=10.0)
+    finally:
+        gate.set()
+        reset_execution(token)
+    outcome["req"] = req
+    return outcome
+
+
+def test_b2b_remote_run_survives_past_implicit_stale(tmp_path, monkeypatch):
+    """Through run(): a remote worker answering at elapsed>90s is NOT stale-killed
+    when the project pins 600s — the defect the review scenario described."""
+    _b2b_env(tmp_path, monkeypatch)
+    cap = _cap_with_timeout(600, sink=_TSink())
+    out = _gate_run(tmp_path, monkeypatch, cap, elapsed_offset=100.0)
+    assert out["req"].wd.stale_timeout == 600.0
+    assert not out["killed_early"]          # still polling at ~103s, past 90
+    assert out.get("error") is None and out.get("response") is not None
+    assert cap.sink.committed is not None   # result passed the B2B result fence
+
+
+def test_b2b_remote_run_still_killed_without_policy_floor(tmp_path, monkeypatch):
+    """Control: without the configured key the implicit 90s fuse still cuts the
+    remote call — proving the policy floor, not the lane, carries the 600s."""
+    _b2b_env(tmp_path, monkeypatch)
+    cap = _cap_with_timeout(None, sink=_TSink())
+    out = _gate_run(tmp_path, monkeypatch, cap, elapsed_offset=100.0)
+    assert out["req"].wd.stale_timeout == 90.0
+    assert out["killed_early"]
+    assert isinstance(out.get("error"), TimeoutError)

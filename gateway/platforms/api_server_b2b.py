@@ -288,7 +288,7 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
             if not isinstance(v, str) or not v or _CONTROL_CHARS.search(v) or not _ABS_PATH_RE.match(v):
                 raise B2BConfigError(
                     f"b2b config: project {binding_id}: project_context.{k} must be absolute")
-    return {
+    normalized = {
         "project_id": project_id,
         "bot_id": entry["bot_id"], "profile_id": entry["profile_id"],
         "allowed_namespaces": list(entry["allowed_namespaces"]),
@@ -296,8 +296,14 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
         "model": entry["model"], "provider": entry["provider"],
         "base_url": entry["base_url"], "api_mode": entry["api_mode"],
         "logical_mission": logical_mission,
-        "project_context": dict(pc) if pc is not None else None,
-        "request_timeout_seconds": request_timeout_seconds}
+        "project_context": dict(pc) if pc is not None else None}
+    # Replay compatibility: the optional key enters the canonical project — hence
+    # policy_json and the fingerprint — only when the operator sets it. An attempt
+    # admitted before this key existed keeps replaying instead of conflicting on
+    # the injected default.
+    if "request_timeout_seconds" in entry:
+        normalized["request_timeout_seconds"] = request_timeout_seconds
+    return normalized
 
 
 @dataclasses.dataclass(frozen=True, init=False)
@@ -669,12 +675,16 @@ def _policy_digest(profile: str, entry: Mapping[str, Any], project: Mapping[str,
         "base_url": project["base_url"], "api_mode": project["api_mode"],
         "logical_mission": project["logical_mission"],
         "project_context": project["project_context"],
-        "request_timeout_seconds": project["request_timeout_seconds"],
         "source_url": entry["source_url"],
         "portal_issuer": entry["portal_issuer"], "hermes_issuer": entry["hermes_issuer"],
         "schema_pins": R2_SCHEMA_PINS, "execution_policy": "h1/proposal-v1",
         "profile_home": resolved.get("profile_home"),
     }
+    # Optional operator key: absent from the digest basis unless explicitly
+    # configured, so a pre-versioning admission replays byte-for-byte while a
+    # configured value still revokes a running cap when changed mid-run.
+    if "request_timeout_seconds" in project:
+        basis["request_timeout_seconds"] = project["request_timeout_seconds"]
     return hashlib.sha256(canonical_json(basis)).hexdigest()
 
 

@@ -21,7 +21,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
@@ -1160,6 +1160,26 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
         hard_timeout = env_float("HERMES_CODEX_HARD_TIMEOUT_SECONDS", 1500.0)
         if hard_timeout > 0:
             stale_timeout = min(stale_timeout, hard_timeout)
+
+    # B2B lane: the operator-pinned ``request_timeout_seconds`` IS the provider-call
+    # budget — the implicit stale fuse (90s) must never fire first on a remote
+    # endpoint, or a healthy slow upstream gets killed mid-request. The floor tracks
+    # the policy; the run budget still bounds it so the watchdog cannot outlive
+    # the run it serves.
+    from agent.b2b_execution import BoundExecution
+    b2b_cap = getattr(agent, "_b2b_execution", None)
+    if isinstance(b2b_cap, BoundExecution):
+        project = b2b_cap.policy_get("project", {})
+        policy_timeout = (project.get("request_timeout_seconds")
+                          if isinstance(project, Mapping) else None)
+        if isinstance(policy_timeout, int) and not isinstance(policy_timeout, bool):
+            stale_timeout = max(stale_timeout, float(policy_timeout))
+        run_budget = getattr(agent, "run_budget_seconds", None)
+        started = getattr(agent, "_run_budget_started_at", None)
+        if (isinstance(run_budget, (int, float)) and run_budget
+                and isinstance(started, (int, float)) and started):
+            remaining = float(run_budget) - (time.time() - started)
+            stale_timeout = min(stale_timeout, max(60.0, remaining))
 
     idle_default = max(effort_floor, next(
         (default for threshold, default in ((100_000, 180.0), (50_000, 120.0), (10_000, 60.0)) if est_tokens > threshold),

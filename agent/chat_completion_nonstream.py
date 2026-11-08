@@ -68,6 +68,18 @@ class _NonStreamRequest:
                  not getattr(self, "_b2b_request_digest", None))):
             from agent.b2b_execution import B2BTerminalRefusal
             raise B2BTerminalRefusal("terminal_guard_required")
+        request_timeout = None
+        if getattr(self, "_b2b_execution", None) is not None:
+            # Validate the policy BEFORE building the per-request client: a refusal
+            # raised past construction would leak it — it is not yet registered with
+            # the abort machinery nor covered by the try/finally below.
+            from agent.b2b_execution import B2BTerminalRefusal
+            project_policy = self._b2b_execution.policy_get("project", {})
+            raw_timeout = project_policy.get("request_timeout_seconds", 5)
+            if (isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int)
+                    or not 1 <= raw_timeout <= 900):
+                raise B2BTerminalRefusal("b2b_timeout_policy")
+            request_timeout = float(raw_timeout)
         # Per-request clients are registered with the abort machinery so the watchdogs
         # force-close the worker's connection, never the shared client (#67142).
         if kind == "anthropic_messages":
@@ -76,15 +88,14 @@ class _NonStreamRequest:
             client = self.agent._create_request_openai_client(reason=reason, api_kwargs=self.api_kwargs)
         if getattr(self, "_b2b_execution", None) is not None:
             from agent.b2b_execution import B2BTerminalRefusal, before_sdk_dispatch
-            project_policy = self._b2b_execution.policy_get("project", {})
-            raw_timeout = project_policy.get("request_timeout_seconds", 5)
-            if (isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int)
-                    or not 1 <= raw_timeout <= 900):
-                raise B2BTerminalRefusal("b2b_timeout_policy")
-            request_timeout = float(raw_timeout)
             # SDK options belong to this request, never to an agent/shared client.
             clone = getattr(client, "with_options", None)
             if not callable(clone):
+                if client is not getattr(self.agent, "client", None):
+                    if kind == "anthropic_messages":
+                        self.agent._close_request_anthropic_client(client, reason="b2b_isolated_transport")
+                    else:
+                        self.agent._close_request_openai_client(client, reason="b2b_isolated_transport")
                 raise B2BTerminalRefusal("b2b_retries_not_disabled")
             original = client
             transport = httpx.HTTPTransport(retries=0, trust_env=False)
