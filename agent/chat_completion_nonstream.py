@@ -76,6 +76,12 @@ class _NonStreamRequest:
             client = self.agent._create_request_openai_client(reason=reason, api_kwargs=self.api_kwargs)
         if getattr(self, "_b2b_execution", None) is not None:
             from agent.b2b_execution import B2BTerminalRefusal, before_sdk_dispatch
+            project_policy = self._b2b_execution.policy_get("project", {})
+            raw_timeout = project_policy.get("request_timeout_seconds", 5)
+            if (isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int)
+                    or not 1 <= raw_timeout <= 900):
+                raise B2BTerminalRefusal("b2b_timeout_policy")
+            request_timeout = float(raw_timeout)
             # SDK options belong to this request, never to an agent/shared client.
             clone = getattr(client, "with_options", None)
             if not callable(clone):
@@ -83,9 +89,9 @@ class _NonStreamRequest:
             original = client
             transport = httpx.HTTPTransport(retries=0, trust_env=False)
             http_client = httpx.Client(
-                transport=transport, trust_env=False, follow_redirects=False, timeout=5.0)
+                transport=transport, trust_env=False, follow_redirects=False, timeout=request_timeout)
             try:
-                client = clone(max_retries=0, http_client=http_client, timeout=5.0)
+                client = clone(max_retries=0, http_client=http_client, timeout=request_timeout)
                 if client is original:
                     raise B2BTerminalRefusal("b2b_request_client_not_isolated")
             except Exception:
@@ -103,7 +109,7 @@ class _NonStreamRequest:
             headers["X-Dubsar-Attempt-Id"] = cap.attempt_id
             headers["X-Dubsar-Request-Digest"] = self._b2b_request_digest
             self.api_kwargs["extra_headers"] = headers
-            self.api_kwargs["timeout"] = 5.0
+            self.api_kwargs["timeout"] = request_timeout
         return self.clients.set_client(client, kind=kind)
 
     def _call(self):

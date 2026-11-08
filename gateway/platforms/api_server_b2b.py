@@ -81,7 +81,9 @@ _PROFILE_ENTRY_KEYS = frozenset({
     "portal_public_key_pem", "hermes_private_key_pem", "projects"})
 _PROJECT_ENTRY_KEYS = frozenset({
     "project_id", "bot_id", "profile_id", "allowed_namespaces", "context_contract_root",
-    "model", "provider", "base_url", "api_mode", "logical_mission", "project_context"})
+    "model", "provider", "base_url", "api_mode", "logical_mission", "project_context",
+    "request_timeout_seconds"})
+_PROJECT_ENTRY_REQUIRED_KEYS = _PROJECT_ENTRY_KEYS - {"request_timeout_seconds"}
 _PROJECT_CONTEXT_KEYS = frozenset({"allocation_root", "project_id", "start"})
 _API_MODES = frozenset({"chat_completions"})
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -236,7 +238,9 @@ def _validate_source_url(value: Any) -> str:
 
 
 def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
-    if not isinstance(entry, Mapping) or set(entry.keys()) != _PROJECT_ENTRY_KEYS:
+    if (not isinstance(entry, Mapping)
+            or not set(entry.keys()).issubset(_PROJECT_ENTRY_KEYS)
+            or not set(entry.keys()).issuperset(_PROJECT_ENTRY_REQUIRED_KEYS)):
         raise B2BConfigError(f"b2b config: project {binding_id}: closed keys required")
     project_id = entry["project_id"]
     if not isinstance(project_id, str) or not _PROJECT_ID.fullmatch(project_id):
@@ -264,6 +268,13 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
     logical_mission = entry.get("logical_mission")
     if logical_mission is not None:
         _req_str(logical_mission, "project.logical_mission", allow_none=False)
+    # Integer seconds: the project policy is canonical JSON (floats are refused).
+    raw_timeout = entry.get("request_timeout_seconds", 5)
+    if (isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int)
+            or not 1 <= raw_timeout <= 900):
+        raise B2BConfigError(
+            f"b2b config: project {binding_id}: request_timeout_seconds")
+    request_timeout_seconds = raw_timeout
     pc = entry.get("project_context")
     if pc is not None:
         if not isinstance(pc, Mapping) or set(pc.keys()) != _PROJECT_CONTEXT_KEYS:
@@ -285,7 +296,8 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
         "model": entry["model"], "provider": entry["provider"],
         "base_url": entry["base_url"], "api_mode": entry["api_mode"],
         "logical_mission": logical_mission,
-        "project_context": dict(pc) if pc is not None else None}
+        "project_context": dict(pc) if pc is not None else None,
+        "request_timeout_seconds": request_timeout_seconds}
 
 
 @dataclasses.dataclass(frozen=True, init=False)
@@ -657,6 +669,7 @@ def _policy_digest(profile: str, entry: Mapping[str, Any], project: Mapping[str,
         "base_url": project["base_url"], "api_mode": project["api_mode"],
         "logical_mission": project["logical_mission"],
         "project_context": project["project_context"],
+        "request_timeout_seconds": project["request_timeout_seconds"],
         "source_url": entry["source_url"],
         "portal_issuer": entry["portal_issuer"], "hermes_issuer": entry["hermes_issuer"],
         "schema_pins": R2_SCHEMA_PINS, "execution_policy": "h1/proposal-v1",

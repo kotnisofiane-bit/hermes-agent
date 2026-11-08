@@ -362,3 +362,44 @@ async def test_h1_08_proposal_bounds_are_contract_exact(tmp_path):
     assert 1 <= len(PROVIDER_FIXTURE["steps"]) <= 12
     assert all(len(s) <= 500 for s in PROVIDER_FIXTURE["steps"])
     assert len(json.dumps(PROVIDER_FIXTURE).encode()) <= 32768
+
+
+# ---------------------------------------------------------------------------
+# request_timeout_seconds -- optional project policy key
+# ---------------------------------------------------------------------------
+
+def _timeout_project_entry(**over):
+    entry = {
+        "project_id": "proj-a", "bot_id": "bot", "profile_id": "p",
+        "allowed_namespaces": ["ns"], "context_contract_root": None,
+        "model": "m", "provider": "custom",
+        "base_url": "http://127.0.0.1:9/v1",
+        "api_mode": "chat_completions",
+        "logical_mission": None, "project_context": None,
+    }
+    entry.update(over)
+    return entry
+
+
+def test_project_request_timeout_absent_defaults_to_five():
+    from gateway.platforms import api_server_b2b as b2b
+    out = b2b._validate_project_entry(_timeout_project_entry(), "b")
+    assert out["request_timeout_seconds"] == 5
+    assert isinstance(out["request_timeout_seconds"], int)
+
+
+@pytest.mark.parametrize("value", [1, 120, 300, 600, 900])
+def test_project_request_timeout_accepts_int_bounds(value):
+    from gateway.platforms import api_server_b2b as b2b
+    out = b2b._validate_project_entry(
+        _timeout_project_entry(request_timeout_seconds=value), "b")
+    assert out["request_timeout_seconds"] == value
+
+
+@pytest.mark.parametrize(
+    "value", [True, False, 0, 901, -1, 0.5, 60.0, "60", None])
+def test_project_request_timeout_rejects_invalid(value):
+    from gateway.platforms import api_server_b2b as b2b
+    with pytest.raises(b2b.B2BConfigError, match="request_timeout_seconds"):
+        b2b._validate_project_entry(
+            _timeout_project_entry(request_timeout_seconds=value), "b")

@@ -471,3 +471,96 @@ def test_is_b2b_predicates():
     assert not is_b2b_session_id("api_x")
     assert is_b2b_attempt_id("b2bp_" + "b" * 64)
     assert not is_b2b_attempt_id("b2b_" + "b" * 64)
+
+
+# ---------------------------------------------------------------------------
+# request_timeout_seconds -- worker propagation into the request-local client
+# ---------------------------------------------------------------------------
+
+class _TimeoutFakeClient:
+    def __init__(self):
+        self.max_retries = 0
+        self.with_options_calls = []
+
+    def with_options(self, **kw):
+        self.with_options_calls.append(kw)
+        new = _TimeoutFakeClient()
+        new.max_retries = kw.get("max_retries", self.max_retries)
+        return new
+
+
+class _TimeoutClients:
+    def __init__(self):
+        self.calls = []
+
+    def set_client(self, client, kind=None):
+        self.calls.append((client, kind))
+        return client
+
+
+def _timeout_worker(cap):
+    from agent.chat_completion_nonstream import _NonStreamRequest
+    made = []
+
+    def _factory(reason, api_kwargs=None):
+        c = _TimeoutFakeClient()
+        made.append(c)
+        return c
+
+    agent = _TimeoutFakeClient()
+    agent.api_mode = "chat_completions"
+    agent.client = None
+    agent._create_request_openai_client = _factory
+    agent._close_request_openai_client = lambda *a, **k: None
+    req = _NonStreamRequest.__new__(_NonStreamRequest)
+    req.agent = agent
+    req.api_kwargs = {"model": "m"}
+    req.clients = _TimeoutClients()
+    req._b2b_execution = cap
+    req._b2b_receipt = object()
+    req._b2b_request_digest = "d" * 64
+    return req, made
+
+
+def _cap_with_timeout(seconds):
+    policy = _unit_policy()
+    if seconds is not None:
+        project = dict(policy["project"])
+        project["request_timeout_seconds"] = seconds
+        policy = dict(policy)
+        policy["project"] = project
+    return _cap(policy=policy)
+
+
+def test_make_client_uses_project_request_timeout(monkeypatch):
+    import agent.b2b_execution as _be_mod
+    monkeypatch.setattr(_be_mod, "before_sdk_dispatch", lambda *a, **k: None)
+    req, made = _timeout_worker(_cap_with_timeout(600))
+    req._make_client("test")
+    assert len(made) == 1
+    kw = made[0].with_options_calls[0]
+    assert kw["max_retries"] == 0
+    assert kw["timeout"] == 600.0
+    assert float(kw["http_client"].timeout.connect) == 600.0
+    assert req.api_kwargs["timeout"] == 600.0
+    assert req.clients.calls[0][1] == "openai"
+
+
+def test_make_client_request_timeout_defaults_to_five(monkeypatch):
+    import agent.b2b_execution as _be_mod
+    monkeypatch.setattr(_be_mod, "before_sdk_dispatch", lambda *a, **k: None)
+    req, made = _timeout_worker(_cap_with_timeout(None))
+    req._make_client("test")
+    kw = made[0].with_options_calls[0]
+    assert kw["timeout"] == 5.0
+    assert float(kw["http_client"].timeout.connect) == 5.0
+    assert req.api_kwargs["timeout"] == 5.0
+
+
+def test_make_client_rejects_invalid_runtime_timeout(monkeypatch):
+    import agent.b2b_execution as _be_mod
+    monkeypatch.setattr(_be_mod, "before_sdk_dispatch", lambda *a, **k: None)
+    req, made = _timeout_worker(_cap_with_timeout(901))
+    with pytest.raises(B2BTerminalRefusal, match="b2b_timeout_policy"):
+        req._make_client("test")
+    assert made[0].with_options_calls == []
