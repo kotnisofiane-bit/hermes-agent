@@ -81,7 +81,9 @@ _PROFILE_ENTRY_KEYS = frozenset({
     "portal_public_key_pem", "hermes_private_key_pem", "projects"})
 _PROJECT_ENTRY_KEYS = frozenset({
     "project_id", "bot_id", "profile_id", "allowed_namespaces", "context_contract_root",
-    "model", "provider", "base_url", "api_mode", "logical_mission", "project_context"})
+    "model", "provider", "base_url", "api_mode", "logical_mission", "project_context",
+    "request_timeout_seconds"})
+_PROJECT_ENTRY_REQUIRED_KEYS = _PROJECT_ENTRY_KEYS - {"request_timeout_seconds"}
 _PROJECT_CONTEXT_KEYS = frozenset({"allocation_root", "project_id", "start"})
 _API_MODES = frozenset({"chat_completions"})
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -241,7 +243,9 @@ def _validate_source_url(value: Any) -> str:
 
 
 def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
-    if not isinstance(entry, Mapping) or set(entry.keys()) != _PROJECT_ENTRY_KEYS:
+    if (not isinstance(entry, Mapping)
+            or not set(entry.keys()).issubset(_PROJECT_ENTRY_KEYS)
+            or not set(entry.keys()).issuperset(_PROJECT_ENTRY_REQUIRED_KEYS)):
         raise B2BConfigError(f"b2b config: project {binding_id}: closed keys required")
     project_id = entry["project_id"]
     if not isinstance(project_id, str) or not _PROJECT_ID.fullmatch(project_id):
@@ -269,6 +273,13 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
     logical_mission = entry.get("logical_mission")
     if logical_mission is not None:
         _req_str(logical_mission, "project.logical_mission", allow_none=False)
+    # Integer seconds: the project policy is canonical JSON (floats are refused).
+    raw_timeout = entry.get("request_timeout_seconds", 5)
+    if (isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int)
+            or not 1 <= raw_timeout <= 900):
+        raise B2BConfigError(
+            f"b2b config: project {binding_id}: request_timeout_seconds")
+    request_timeout_seconds = raw_timeout
     pc = entry.get("project_context")
     if pc is not None:
         if not isinstance(pc, Mapping) or set(pc.keys()) != _PROJECT_CONTEXT_KEYS:
@@ -282,7 +293,7 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
             if not isinstance(v, str) or not v or _CONTROL_CHARS.search(v) or not _ABS_PATH_RE.match(v):
                 raise B2BConfigError(
                     f"b2b config: project {binding_id}: project_context.{k} must be absolute")
-    return {
+    normalized = {
         "project_id": project_id,
         "bot_id": entry["bot_id"], "profile_id": entry["profile_id"],
         "allowed_namespaces": list(entry["allowed_namespaces"]),
@@ -291,6 +302,13 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
         "base_url": entry["base_url"], "api_mode": entry["api_mode"],
         "logical_mission": logical_mission,
         "project_context": dict(pc) if pc is not None else None}
+    # Replay compatibility: the optional key enters the canonical project — hence
+    # policy_json and the fingerprint — only when the operator sets it. An attempt
+    # admitted before this key existed keeps replaying instead of conflicting on
+    # the injected default.
+    if "request_timeout_seconds" in entry:
+        normalized["request_timeout_seconds"] = request_timeout_seconds
+    return normalized
 
 
 @dataclasses.dataclass(frozen=True, init=False)
@@ -667,6 +685,11 @@ def _policy_digest(profile: str, entry: Mapping[str, Any], project: Mapping[str,
         "schema_pins": R2_SCHEMA_PINS, "execution_policy": "h1/proposal-v1",
         "profile_home": resolved.get("profile_home"),
     }
+    # Optional operator key: absent from the digest basis unless explicitly
+    # configured, so a pre-versioning admission replays byte-for-byte while a
+    # configured value still revokes a running cap when changed mid-run.
+    if "request_timeout_seconds" in project:
+        basis["request_timeout_seconds"] = project["request_timeout_seconds"]
     return hashlib.sha256(canonical_json(basis)).hexdigest()
 
 
