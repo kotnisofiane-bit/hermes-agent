@@ -17,9 +17,21 @@ Contracts proven here, as behavior:
   still refuse ``b2b_capability_mismatch`` cheaply — no admitted cap can
   exist on a disabled lane.
 * **Carrier isolation.** ``run.b2b_execution`` belongs to the topical
-  helpers — generic run plumbing never reads it. A ``_RunLaunch`` whose
-  carrier accessor explodes still completes a full native run (construction
-  → executor turn → finalize → retire) on absent/disabled lanes.
+  helpers. A ``_RunLaunch`` whose carrier READ explodes still drives a full
+  generic ``_execute_run`` on absent/disabled lanes — the nominal turn AND
+  every terminal except branch (``except Exception``, provider-auth,
+  ``except asyncio.CancelledError``) plus ``_finish``/``finally``.
+* **Facade-state trap.** On a disabled lane, a ``_b2b_state`` whose only
+  readable attribute is ``.config.enabled`` — every deeper access raises —
+  still lets generic session routes and OpenAI response routes answer
+  normally: the ONLY state the generic surface may consume is the delegated
+  lane check itself, exactly once per seam call. A fully opaque state cannot
+  be the contract: the delegated check legitimately reads
+  ``state.config.enabled`` — trapping it too would require a production
+  change, which is out of scope (the residual a behavior test cannot see —
+  a generic module inlining only that same cheap enabled read — is
+  structural, not behavioral, and is explicitly abandoned with the removed
+  source-reading guard).
 """
 
 from __future__ import annotations
@@ -29,7 +41,7 @@ import inspect
 import sqlite3
 import threading
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiohttp import web
@@ -40,6 +52,7 @@ from gateway.platforms import api_server_runs as _runs
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+from hermes_state import SessionDB
 from tests.gateway import b2b_unit_fixtures
 
 
@@ -473,13 +486,23 @@ class _CarrierTrapRun(_runs._RunLaunch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["absent", "disabled"])
+@pytest.mark.parametrize("outcome", ["completed", "failed", "auth_failed", "cancelled"])
 async def test_execute_run_generic_path_never_reads_b2b_carrier(
-        tmp_path, mode, monkeypatch):
-    """A full generic run — construction, executor turn, finalize, retire —
-    completes NATIVE on an absent/disabled lane even though reading the
-    carrier explodes. ``construct_run_agent``/``run_execution_resets``/
-    ``finalize_run`` consult it only after their state check, and no generic
-    line in ``api_server_runs`` may reach it."""
+        tmp_path, mode, outcome, monkeypatch):
+    """A full generic ``_execute_run`` — construction, executor turn, the
+    terminal ``except`` branches, ``_finish``/``finally`` — runs NATIVE on an
+    absent/disabled lane even though reading the carrier explodes.
+
+    Branches exercised via the agent double: nominal ``completed`` turn;
+    ``except Exception`` (``block_failed_run`` → ``failed`` + redacted
+    message); ``except _ProviderAuthResolutionError`` (``block_provider_
+    unavailable_run`` → ``failed`` + ``user_text``); ``except
+    asyncio.CancelledError`` (``block_interrupted_run`` → ``cancelled`` then
+    re-raise). ``construct_run_agent``/``run_execution_resets``/
+    ``finalize_run``/``block_*`` consult the carrier only after their state
+    check — a read in any traversed branch lands in the generic ``except``
+    (or propagates the cancellation) instead of the asserted terminal
+    state."""
     import gateway.platforms.api_server as _api_server
 
     adapter = _adapter({"b2b": {"enabled": False, "profiles": {}}} if mode == "disabled" else {})
@@ -491,9 +514,14 @@ async def test_execute_run_generic_path_never_reads_b2b_carrier(
         run_id = "run_trap"
         adapter._run_streams[run_id] = queue
 
-        agent = SimpleNamespace(
-            session_id=None,
-            run_conversation=_Recorder(fn=lambda **kw: {"final_response": "ok"}))
+        turn = {
+            "completed": _Recorder(fn=lambda **kw: {"final_response": "ok"}),
+            "failed": _Recorder(exc=RuntimeError("boom-run")),
+            "auth_failed": _Recorder(
+                exc=_api_server._ProviderAuthResolutionError("no key")),
+            "cancelled": _Recorder(exc=asyncio.CancelledError()),
+        }[outcome]
+        agent = SimpleNamespace(session_id=None, run_conversation=turn)
         monkeypatch.setattr(adapter, "_create_agent", lambda **kw: agent)
 
         launch = _CarrierTrapRun(
@@ -507,16 +535,224 @@ async def test_execute_run_generic_path_never_reads_b2b_carrier(
             browser_control_transport_family=None, turn_author=None,
             b2b_execution=None)
 
-        await _runs._execute_run(adapter, launch, _api_server=_api_server)
+        if outcome == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await _runs._execute_run(adapter, launch, _api_server=_api_server)
+        else:
+            await _runs._execute_run(adapter, launch, _api_server=_api_server)
 
-        # A carrier read anywhere above lands in the generic except and
-        # finishes "failed" — "completed" proves the whole path stayed native.
-        assert adapter._run_statuses[run_id]["status"] == "completed"
-        assert len(agent.run_conversation.calls) == 1
+        record = adapter._run_statuses[run_id]
+        if outcome == "completed":
+            # A carrier read lands in the generic except → "failed";
+            # "completed" proves the whole nominal path stayed native.
+            assert record["status"] == "completed"
+            assert len(agent.run_conversation.calls) == 1
+        elif outcome == "cancelled":
+            assert record["status"] == "cancelled"
+        else:
+            # A carrier read inside the block_* helper would explode the
+            # except branch itself — reaching "failed" with the right error
+            # proves the helpers checked state before the carrier.
+            assert record["status"] == "failed"
+            expected = ("boom-run" if outcome == "failed"
+                        else "Provider authentication failed")
+            assert expected in record["error"], record
+
         events = []
         while not queue.empty():
             events.append(queue.get_nowait())
-        assert any(e and e.get("event") == "run.completed" for e in events), events
+        assert any(e and e.get("event") == f"run.{record['status']}" for e in events), events
         assert events[-1] is None
     finally:
         store.close()
+
+
+# ---------------------------------------------------------------------------
+# g) Facade-state trap: generic + OpenAI surfaces read ONLY the lane check
+# ---------------------------------------------------------------------------
+
+_SURFACE_KEY = "k" * 32
+_SURFACE_AUTH = {"Authorization": f"Bearer {_SURFACE_KEY}"}
+
+
+class _TrappedB2BConfig:
+    """Disabled B2B config double: ``enabled`` is the ONLY readable attribute.
+
+    The delegated lane check legitimately consumes ``config.enabled`` — every
+    deeper attribute a real B2B policy would need (``profiles``,
+    ``profile_entry``, keyrings) explodes on contact. Reads are counted so the
+    test can relate them to the delegated seam calls that performed them.
+    """
+
+    def __init__(self):
+        self.enabled_reads = 0
+
+    @property
+    def enabled(self):
+        self.enabled_reads += 1
+        return False
+
+    def __getattr__(self, name):
+        raise AssertionError(
+            f"disabled-lane B2B config attribute {name!r} read — "
+            "the delegated lane check needs .enabled only")
+
+
+class _TrappedB2BState:
+    """``_b2b_state`` double whose ONLY readable attribute is ``config``.
+
+    This is the «piégé» contract as deep as production permits: a state that
+    raised on EVERY attribute read cannot coexist with delegation, because
+    the topical siblings' disabled-lane check itself reads
+    ``state.config.enabled``. Everything the lane check does not need raises
+    instead — so any B2B-state work on a generic surface explodes, and any
+    state read the delegated seams did not perform shows in the read counts.
+    """
+
+    def __init__(self):
+        self._config = _TrappedB2BConfig()
+        self.config_reads = 0
+
+    @property
+    def config(self):
+        self.config_reads += 1
+        return self._config
+
+    def __getattr__(self, name):
+        raise AssertionError(
+            f"disabled-lane _b2b_state attribute {name!r} read — "
+            "only .config.enabled is delegated-check surface")
+
+
+# Seams whose own body performs the ``state.config.enabled`` lane check —
+# exactly one read per call today. Only these may read B2B state on the
+# generic surfaces below; callers-in-the-middle delegate into them.
+_LANE_CHECK_SEAMS = {
+    "gateway.platforms.api_server_b2b_sessions": (
+        "resolve_generic_session_id", "list_generic_sessions"),
+    "gateway.platforms.api_server_b2b_execution": (
+        "guard_agent_construction", "construct_run_agent",
+        "run_execution_resets", "finalize_run", "generic_run_visible",
+        "_cap_or_none"),
+}
+
+
+def _lane_check_calls(monkeypatch) -> list:
+    """Record every invocation of the lane-check seams (module-global lookups
+    and lazy imports both land on the patched attribute)."""
+    import importlib
+    calls = []
+    for mod_name, names in _LANE_CHECK_SEAMS.items():
+        mod = importlib.import_module(mod_name)
+        for name in names:
+            original = getattr(mod, name)
+
+            def _spied(*args, _original=original, _name=name, **kwargs):
+                calls.append(_name)
+                return _original(*args, **kwargs)
+
+            monkeypatch.setattr(mod, name, _spied)
+    return calls
+
+
+def _surface_app(adapter: APIServerAdapter) -> web.Application:
+    """The full native route table — same shape ``connect()`` registers."""
+    app = web.Application(
+        middlewares=[adapter._make_profile_prefix_middleware()])
+    app["api_server_adapter"] = adapter
+    for method, path, handler in adapter._http_route_table():
+        app.router.add_route(method, path, handler)
+    return app
+
+
+@pytest.mark.asyncio
+async def test_generic_and_openai_surfaces_consume_only_the_lane_check(
+        tmp_path, monkeypatch):
+    """Disabled lane + ``_b2b_state`` trapped beyond ``.config.enabled``:
+    generic session routes and OpenAI response routes answer NORMALLY —
+    proving the generic surface performs zero B2B-state work past the
+    delegated lane check.
+
+    Two assertions make the contract discriminating, not a smoke test:
+
+    * Every trapped attribute (profiles, keyrings, ``profile_entry``, any
+      other state/config member) raises — a generic surface doing real B2B
+      work fails its request outright.
+    * ``config_reads``/``enabled_reads`` must equal the lane-check seam call
+      count: each delegated seam performs exactly one enabled read today, so
+      a state read NO seam made — e.g. a facade inlining its own
+      ``self._b2b_state.config.enabled`` — breaks the equality.
+
+    Residual NOT covered (documented, not silently omitted): a generic
+    module inlining only that same cheap enabled read is indistinguishable
+    from the seam's own read *behaviorally* — no request-level contract can
+    see WHERE a read happens, which is why the source-reading AST guard was
+    the only tool for it and why its removal leaves that residual (follow-up:
+    a dedicated architecture lint outside ``tests/``).
+    """
+    adapter = _adapter({"key": _SURFACE_KEY,
+                        "b2b": {"enabled": False, "profiles": {}}})
+    state = _TrappedB2BState()
+    adapter._b2b_state = state
+    adapter.gateway_runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=False))
+    db = SessionDB(tmp_path / "state.db")
+    adapter._session_db = db
+    monkeypatch.setattr(adapter, "_run_agent", AsyncMock(return_value=(
+        {"final_response": "ok", "completed": True},
+        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2})))
+
+    db.create_session("api_surface_1", "api_server")
+    db.create_session("api_surface_del", "api_server")
+    db.append_message("api_surface_1", "user", content="seeded question")
+    resp_id = "resp_" + "a" * 28
+    adapter._current_response_store().put(resp_id, {
+        "response": {"id": resp_id, "object": "response", "status": "completed"},
+        "conversation_history": [{"role": "user", "content": "q"}],
+        "session_id": "api_surface_1"})
+
+    calls = _lane_check_calls(monkeypatch)
+    try:
+        async with TestClient(TestServer(_surface_app(adapter))) as client:
+            cases = [
+                # Generic session surfaces — each must answer normally.
+                ("GET", "/api/sessions", {}, 200),
+                ("GET", "/api/sessions/api_surface_1", {}, 200),
+                ("GET", "/api/sessions/api_surface_1/messages", {}, 200),
+                ("PATCH", "/api/sessions/api_surface_1",
+                 {"json": {"title": "renamed"}}, 200),
+                ("POST", "/api/sessions",
+                 {"json": {"id": "api_created_1"}}, 201),
+                ("POST", "/api/sessions/api_surface_1/fork",
+                 {"json": {"id": "api_forked_1"}}, 201),
+                ("DELETE", "/api/sessions/api_surface_del", {}, 200),
+                # OpenAI response surfaces — same normal answers.
+                ("POST", "/v1/chat/completions",
+                 {"json": {"messages": [{"role": "user", "content": "hi"}]},
+                  "headers": {"X-Hermes-Session-Id": "api_surface_1"}}, 200),
+                ("POST", "/v1/chat/completions",
+                 {"json": {"messages": [{"role": "user", "content": "hi"}]}}, 200),
+                ("POST", "/v1/responses", {"json": {"input": "hi"}}, 200),
+                ("POST", "/v1/responses",
+                 {"json": {"input": "hi", "previous_response_id": resp_id}}, 200),
+                ("GET", f"/v1/responses/{resp_id}", {}, 200),
+                ("DELETE", f"/v1/responses/{resp_id}", {}, 200),
+            ]
+            for method, path, kwargs, expected in cases:
+                headers = {**_SURFACE_AUTH, **kwargs.pop("headers", {})}
+                resp = await client.request(method, path, headers=headers, **kwargs)
+                assert resp.status == expected, (
+                    method, path, resp.status, await resp.text())
+    finally:
+        db.close()
+        adapter._run_idempotency_store.close()
+        adapter._response_store.close()
+
+    # Both session-seam families were actually exercised — the relation below
+    # is not vacuously true on an empty call set.
+    assert {"resolve_generic_session_id", "list_generic_sessions"} <= set(calls)
+    # Every B2B-state read is accounted for by a delegated lane check: one
+    # ``.config.enabled`` per seam call, nothing else, nothing more.
+    assert state.config_reads == len(calls), (state.config_reads, calls)
+    assert state._config.enabled_reads == len(calls), (
+        state._config.enabled_reads, calls)
