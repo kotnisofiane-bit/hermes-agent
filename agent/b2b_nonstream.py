@@ -26,10 +26,12 @@ class _B2BNonStreamRequest(_NonStreamRequest):
         self._b2b_execution = cap
         self._b2b_receipt = receipt
         self._b2b_request_digest = request_digest
-        # Until the actual SDK send the stale fuse is the remaining run budget
-        # alone -- client build, dispatch checks and the CAS can never spend
-        # the operator-pinned ``request_timeout_seconds`` (a 1s policy must
-        # still reach the wire). The provider budget arms only at the send.
+        # Preparation -- client build, dispatch checks and the pre-CAS gate --
+        # runs on the remaining run budget alone, so it can never spend the
+        # operator-pinned ``request_timeout_seconds`` (a 1s policy must still
+        # reach the wire). An ACCEPTED gate arms that policy timeout as the
+        # CAS watchdog (see _check_dispatch_allowed); the actual send renews
+        # the full policy-timeout response window.
         self._arm_stale_window(self._remaining_run_budget())
 
     def _remaining_run_budget(self) -> float:
@@ -43,22 +45,25 @@ class _B2BNonStreamRequest(_NonStreamRequest):
             return float("inf")
         return max(0.0, float(budget) - (h.time.time() - float(started)))
 
-    def _check_dispatch_allowed(self) -> None:
+    def _check_dispatch_allowed(self, request_timeout: float) -> None:
         """The ONE budget/cancel rejection gate, invoked by
         ``before_sdk_dispatch`` AFTER the final C1 + source renewal and
         immediately BEFORE the durable dispatch CAS. Refusing here is still
-        safe -- no committed marker exists. Once the CAS has committed, the
-        run may overrun by up to ``request_timeout_seconds`` (<=900s):
-        abandoning the send then would turn a bounded overrun into a
-        nonretryable, possibly-billed ``indeterminate`` -- strictly worse.
-        This is no voluntary abort after CAS, not a guarantee that the
-        network cannot fail."""
+        safe -- no committed marker exists. On acceptance it arms
+        ``request_timeout`` as the CAS watchdog (the poll loop keeps a live
+        deadline while the marker serializes): once the CAS has committed
+        there is no voluntary run-budget stop -- abandoning the send would
+        turn a bounded overrun into a nonretryable, possibly-billed
+        ``indeterminate`` -- strictly worse. The watchdog is no strict total
+        bound across both windows and no immunity from a genuine timeout,
+        interrupt or network failure."""
         if self.cancelled or self._remaining_run_budget() <= 0:
             # Persist BEFORE raising: _call swallows a cancelled worker's
             # exception -- without the durable block the attempt would stay
             # context_ready forever.
             self._b2b_execution.sink.block("provider_result_unavailable")
             raise B2BTerminalRefusal("provider_result_unavailable")
+        self._arm_stale_window(request_timeout)
 
     def _arm_stale_window(self, requested_timeout: float) -> float:
         """Arm the stale deadline on the construction-origin clock and return
@@ -118,7 +123,7 @@ class _B2BNonStreamRequest(_NonStreamRequest):
         before_sdk_dispatch(
             self.agent, self.api_kwargs, cap, receipt=self._b2b_receipt,
             expected_digest=self._b2b_request_digest, client=client,
-            dispatch_gate=self._check_dispatch_allowed)
+            dispatch_gate=lambda: self._check_dispatch_allowed(request_timeout))
         headers = dict(self.api_kwargs.get("extra_headers") or {})
         headers["X-Dubsar-Attempt-Id"] = cap.attempt_id
         headers["X-Dubsar-Request-Digest"] = self._b2b_request_digest
@@ -138,15 +143,16 @@ class _B2BNonStreamRequest(_NonStreamRequest):
             # The B2B chat-only lane has no virtual provider/last-moment payload
             # transform between the durable dispatch fence and this single SDK call.
             client = self._make_client("b2b_chat_completion_request")
-            # Arm the validated provider timeout AT the actual send. A spent
-            # run budget or a cancel was already refused inside
-            # before_sdk_dispatch's single pre-CAS gate; once the dispatch CAS
-            # has committed the send runs unconditionally -- the run may
-            # overrun by up to request_timeout_seconds (<=900s). Abandoning
-            # here would turn a bounded overrun into a nonretryable,
-            # possibly-billed indeterminate -- strictly worse. This is no
-            # voluntary abort after CAS, not a guarantee the network cannot
-            # fail.
+            # Renew the full validated provider timeout AT the actual send:
+            # the accepted gate already armed it as the CAS watchdog; the
+            # response window starts here fresh (deadline = elapsed +
+            # request_timeout, no remaining-budget clamp). A spent run budget
+            # or a cancel was already refused inside before_sdk_dispatch's
+            # single pre-CAS gate; after it there is no voluntary run-budget
+            # stop -- abandoning a committed dispatch would turn a bounded
+            # overrun into a nonretryable, possibly-billed indeterminate.
+            # This is no strict total bound across both windows, and no
+            # guarantee the network cannot fail.
             self._arm_stale_window(float(self.api_kwargs["timeout"]))
             response = client.chat.completions.create(**self.api_kwargs)
             # Validate + persist the public result BEFORE the response is

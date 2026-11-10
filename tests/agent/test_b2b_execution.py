@@ -494,6 +494,55 @@ def test_publish_context_validates_and_persists():
 
 
 # ---------------------------------------------------------------------------
+# qualify_recorded_memory — one advisory-Memory rule at every boundary:
+# freshness must be "current" (unknown is stale, never an authority grant)
+# and limits must be an empty list/tuple.
+# ---------------------------------------------------------------------------
+
+_MEMORY_FRESHNESS_UNKNOWN_LIMIT = {
+    "component": "memory", "code": "MEMORY_FRESHNESS_UNKNOWN",
+    "detail": "Source freshness is unknown."}
+
+_MEMORY_QUALIFICATION_CASES = [
+    ("current_empty_limits", "current", [], None),
+    ("unknown_uncertainty_limit", "unknown",
+     [dict(_MEMORY_FRESHNESS_UNKNOWN_LIMIT)], "context_source_stale"),
+    ("unknown_empty_limits", "unknown", [], "context_source_stale"),
+    ("stale_empty_limits", "stale", [], "context_source_stale"),
+]
+
+
+@pytest.mark.parametrize(
+    ("case", "freshness", "limits", "reason"), _MEMORY_QUALIFICATION_CASES,
+    ids=[c[0] for c in _MEMORY_QUALIFICATION_CASES])
+def test_recorded_memory_freshness_full_qualification_boundary(
+        case, freshness, limits, reason):
+    """Full qualification on the REAL pinned contract: a recorded view whose
+    advisory Memory cannot attest ``current`` freshness is refused
+    ``context_source_stale`` — ``unknown`` never rides an uncertainty limit
+    into the lane — at BOTH common boundary seams
+    (``qualify_context_view`` and ``verify_context_proof``)."""
+    cap = _cap()
+    view = build_context_view(cap.policy, {})
+    view["memory"]["freshness"] = freshness
+    view["memory"]["limits"] = limits
+    # Reseal so digests/bounds stay valid: the Memory freshness/limits guard
+    # is the only qualification that can fire.
+    reseal_unit_context_view(view)
+    if reason is None:
+        assert be.qualify_context_view(cap, view) is not None
+        checked = be.verify_context_proof(be.context_proof(view))
+        assert checked["view"]["memory"]["freshness"] == "current"
+        return
+    with pytest.raises(B2BTerminalRefusal) as exc:
+        be.qualify_context_view(cap, view)
+    assert str(exc.value) == reason
+    with pytest.raises(B2BTerminalRefusal) as exc:
+        be.verify_context_proof(be.context_proof(view))
+    assert str(exc.value) == reason
+
+
+# ---------------------------------------------------------------------------
 # execute_terminal — ordering: context → recheck → kwargs → before_provider → CAS
 # ---------------------------------------------------------------------------
 

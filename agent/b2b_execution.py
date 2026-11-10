@@ -659,8 +659,9 @@ def _qualify_memory_relation(relation, allowed_namespaces, binding) -> None:
 def qualify_recorded_memory(view: Mapping[str, Any]) -> None:
     """One advisory-Memory rule for worker, sink and durable proof verification.
 
-    The trusted C1 producer performs new authorized reads. Recorded operational
-    freshness is independent: unknown remains unknown, never an authority grant.
+    The trusted C1 producer performs new authorized reads; a recorded view
+    that cannot attest ``current`` source freshness is stale -- advisory
+    Memory is never an authority grant.
     """
     if any(view.get(key) != value for key, value in (
             ("authority", "none"), ("content_trust", "advisory_data"),
@@ -676,18 +677,15 @@ def qualify_recorded_memory(view: Mapping[str, Any]) -> None:
         raise B2BTerminalRefusal("context_memory_malformed")
     if memory.get("availability") != "available":
         raise B2BTerminalRefusal("context_source_unavailable")
-    if memory.get("freshness") not in ("unknown", "current"):
+    if memory.get("freshness") != "current":
         raise B2BTerminalRefusal("context_source_stale")
     for key, expected in (("api", "v2"), ("source_contract", "memory-plane.v2/context-view"),
                           ("v1_fallback", False), ("truncated", False)):
         if memory.get(key) != expected or (
                 expected is False and memory.get(key) is not False):
             raise B2BTerminalRefusal("context_memory_malformed_" + key)
-    uncertainty = {"component": "memory", "code": "MEMORY_FRESHNESS_UNKNOWN",
-                   "detail": "Source freshness is unknown."}
     limits = memory.get("limits")
-    if (not isinstance(limits, (list, tuple)) or len(limits) > 1 or
-            any(item != uncertainty or memory["freshness"] != "unknown" for item in limits)):
+    if not isinstance(limits, (list, tuple)) or limits:
         raise B2BTerminalRefusal("context_memory_malformed_limits")
     relations = memory.get("relations")
     if not isinstance(relations, (list, tuple)):
