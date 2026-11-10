@@ -1125,11 +1125,12 @@ async def test_b2b_finalize_seal_recheck_is_bounded(
 # ---------------------------------------------------------------------------
 # Post-CAS budget overrun -- the dispatch gate sits BEFORE the committed CAS;
 # once cas_dispatch commits there is NO voluntary abort: a run budget spent BY
-# the CAS itself must not stop the send (a bounded overrun, never an invented
-# retry) -- durable result_received, then the real seal path. The ACCEPTED
-# gate arms the policy timeout as the CAS watchdog BEFORE the marker, so the
-# inherited poll loop never sees a spent construction-armed budget while the
-# dispatch commits.
+# the CAS itself must not stop the send (an overrun, never an invented
+# retry) -- durable result_received, then the real seal path. The stale
+# watchdog is NEVER armed before the send: construction leaves
+# ``wd.stale_timeout`` at ``inf`` so the generic stale poll can never kill the
+# CAS or the fence work around it; the ONE arm lands on the actual ``create``
+# call with the validated policy timeout.
 #
 # Converted from the pass-4 post-CAS-window witness: real _AttemptSink, real
 # disk store, real ``_NonStreamRequest.run()`` (worker thread + poll loop),
@@ -1145,56 +1146,73 @@ CAS_COST_S = 11.0
 @pytest.mark.parametrize(
     "pause_phase", ["before_real_cas", "after_real_cas"],
     ids=["pause_before_real_cas", "pause_after_real_cas_before_return"])
+@pytest.mark.parametrize(
+    "run_budget,policy_timeout",
+    [(None, None), (RUN_BUDGET_S, None), (RUN_BUDGET_S, 600)],
+    ids=["no-budget-default-5", "finite-budget-default-5",
+         "finite-budget-configured-600"])
 def test_b2b_post_cas_budget_overrun_still_sends_and_seals(
-        tmp_path, monkeypatch, pause_phase):
+        tmp_path, monkeypatch, pause_phase, run_budget, policy_timeout):
     """A run budget still positive at the pre-CAS gate but spent INSIDE the
     CAS wrapper leaves the send committed: real ``req.run()`` (inherited poll
     loop + worker), real sink/store, real SDK -> loopback double. The held
     ``cas_dispatch`` forces the poll to evaluate the EXHAUSTED budget while
     the worker waits -- a real ``_stale_kill`` there would abort the
-    committed dispatch. With the gate-accepted CAS watchdog armed there is
-    no kill and no error: one real POST, durable
+    committed dispatch. With ``wd.stale_timeout`` held at ``inf`` until the
+    send there is no kill and no error: one real POST, durable
     ``provider_result``/``result_received`` (never ``indeterminate``), then
-    ``_b2b_finalize``/``seal`` produce the proposal.
+    ``_b2b_finalize``/``seal`` produce the proposal. The 11 simulated CAS
+    seconds also overrun the default 5s policy window, so a missing
+    ``request_timeout_seconds`` is covered the same as a configured 600.
 
     ``before_real_cas`` holds BEFORE the real CAS (no committed marker yet);
     ``after_real_cas`` holds AFTER the commit (marker already durable)."""
     lane, provider, agent = _terminal_lane(
-        tmp_path, monkeypatch, request_timeout_seconds=600)
+        tmp_path, monkeypatch, request_timeout_seconds=policy_timeout)
+    # None policy -> the lane's default (5), never an explicit 5.
+    effective_timeout = (
+        float(policy_timeout) if policy_timeout is not None else 5.0)
     request = None
     driver = None
     cas_hold = threading.Event()
     try:
         clock = _FakeClock(time.time())
         monkeypatch.setattr(h, "time", clock)
-        agent.run_budget_seconds = RUN_BUDGET_S
-        agent._run_budget_started_at = clock.time()
+        if run_budget is not None:
+            agent.run_budget_seconds = run_budget
+            agent._run_budget_started_at = clock.time()
 
         api_kwargs = copy.deepcopy(_api_kwargs(lane))
         request = _B2BNonStreamRequest(
             agent, api_kwargs, cap=lane.cap, receipt=lane.receipt,
             request_digest=provider_request_digest(api_kwargs))
-        # Armed AT construction from the remaining run budget alone.
+        # No watchdog before the send: construction leaves the stale window
+        # at ``inf`` whether or not a run budget exists.
         init_stale_timeout = request.wd.stale_timeout
 
         second_poll = threading.Event()   # 2nd poll emit at the spent clock
         killed = threading.Event()        # the REAL _stale_kill fired
         release_ready = threading.Event() # either -> release the held CAS
         evidence = {"pre_cas_remaining": None, "committed_status": None,
-                    "dispatch_marker_at_commit": None}
+                    "dispatch_marker_at_commit": None,
+                    "cas_entry_stale_timeout": None}
         original_cas_dispatch = lane.sink.cas_dispatch
 
         def cas_dispatch_witness(*, request_digest, receipt,
                                  rechecked_view=None):
-            # The pre-CAS gate already passed: the budget is still positive.
-            remaining = (RUN_BUDGET_S
-                         - (clock.time() - agent._run_budget_started_at))
+            # The pre-CAS gate already passed: the REAL remaining-budget
+            # check is still positive (``inf`` with no budget installed).
+            remaining = request._remaining_run_budget()
             evidence["pre_cas_remaining"] = remaining
             assert remaining > 0, remaining
+            # CAS-entry stale window: still ``inf`` -- the accepted gate is a
+            # budget/cancel check only, it never arms a watchdog.
+            evidence["cas_entry_stale_timeout"] = request.wd.stale_timeout
             if pause_phase == "before_real_cas":
-                # The wrapper spends the 10s budget and is HELD before the
-                # real CAS: the poll evaluates the exhausted budget while no
-                # committed marker exists yet.
+                # The wrapper spends 11s (past the 10s run budget AND the 5s
+                # default policy) and is HELD before the real CAS: the poll
+                # evaluates the spent clock while no committed marker exists
+                # yet.
                 clock.advance(CAS_COST_S)
                 assert cas_hold.wait(30.0), "held CAS never released"
             committed = original_cas_dispatch(
@@ -1209,8 +1227,9 @@ def test_b2b_post_cas_budget_overrun_still_sends_and_seals(
                     kind="provider_dispatch") is not None)
             if pause_phase == "after_real_cas":
                 # The CAS itself (proof validation, record serialization,
-                # disk CAS) consumed 11s of the 10s run budget; the poll then
-                # evaluates the exhausted budget with the marker durable.
+                # disk CAS) consumed 11s -- past the 10s run budget AND the
+                # 5s default policy; the poll then evaluates the spent clock
+                # with the marker durable.
                 clock.advance(CAS_COST_S)
                 assert cas_hold.wait(30.0), "held CAS never released"
             return committed
@@ -1289,16 +1308,18 @@ def test_b2b_post_cas_budget_overrun_still_sends_and_seals(
             request.thread.join(timeout=10.0)
             assert not request.thread.is_alive()
 
-        # The pre-CAS gate passed with the full budget; the real CAS committed
-        # durably before the budget ran out INSIDE it.
-        assert evidence["pre_cas_remaining"] == RUN_BUDGET_S
+        # The pre-CAS gate passed -- ``inf`` when no run budget is installed,
+        # the full 10s otherwise; the real CAS committed durably before the
+        # budget ran out INSIDE it.
+        assert evidence["pre_cas_remaining"] == (
+            RUN_BUDGET_S if run_budget is not None else float("inf"))
         assert evidence["committed_status"] == "dispatch_committed"
         assert evidence["dispatch_marker_at_commit"] is True
 
-        # No stale kill, no error: the accepted gate armed the policy 600 CAS
-        # watchdog BEFORE the CAS, so the spent run budget could not stop the
-        # committed send -- exactly one POST, the provider observing the
-        # committed marker, durable provider_result / result_received.
+        # No stale kill, no error: ``wd.stale_timeout`` stayed ``inf`` until
+        # the send, so the spent run budget could not stop the committed
+        # dispatch -- exactly one POST, the provider observing the committed
+        # marker, durable provider_result / result_received.
         assert stale_kill_calls == []
         assert not killed.is_set()
         assert outcome.get("error") is None
@@ -1319,17 +1340,16 @@ def test_b2b_post_cas_budget_overrun_still_sends_and_seals(
         assert response.choices[0].message.content == json.loads(
             result_row["payload"])["text"]
 
-        # Armed-window detail: construction armed the remaining run budget
-        # (10); the ACCEPTED gate armed the full policy window (600) BEFORE
-        # the CAS (0s elapsed -> raw deadline 600); the send re-armed the
-        # FULL policy window on the construction-origin clock -- raw 611
-        # retains the effective 600, never a run-budget clamp.
-        assert init_stale_timeout == RUN_BUDGET_S
-        assert [call["requested"] for call in arm_calls] == [600.0, 600.0]
-        assert arm_calls[0]["window"] == 600.0
-        assert arm_calls[0]["stale_timeout"] == 600.0
-        assert arm_calls[1]["window"] == 600.0
-        assert arm_calls[1]["stale_timeout"] == CAS_COST_S + 600.0
+        # Armed-window detail: ``inf`` from construction THROUGH the CAS
+        # entry (the accepted gate is budget/cancel-only, it never arms);
+        # exactly ONE arm, AT the send -- the full effective policy window
+        # (default 5 or configured 600) on the construction-origin clock, so
+        # the raw deadline is elapsed + effective_timeout.
+        assert init_stale_timeout == float("inf")
+        assert evidence["cas_entry_stale_timeout"] == float("inf")
+        assert [call["requested"] for call in arm_calls] == [effective_timeout]
+        assert arm_calls[0]["window"] == effective_timeout
+        assert arm_calls[0]["stale_timeout"] == CAS_COST_S + effective_timeout
 
         # The real finalize/seal path: attested result -> sealed proposal.
         lane.adapter._profile_scope = (

@@ -940,8 +940,9 @@ def test_b2b_send_arms_policy_timeout_without_run_budget(
 
 
 def test_b2b_send_arms_policy_timeout_under_wide_run_budget(tmp_path, monkeypatch):
-    """Wide run budget (900s): the policy 600 still wins at the send — the
-    preparation ceiling was the run budget, never the 60s floor."""
+    """Wide run budget (900s): the policy 600 still wins at the send — no
+    stale watchdog runs during preparation at all (``inf`` from
+    construction, never the run budget and never the 60s floor)."""
     _b2b_env(tmp_path, monkeypatch)
     clock = _FakeClock(1000.0)
     cap = _cap_with_timeout(600, sink=_TSink())
@@ -950,7 +951,7 @@ def test_b2b_send_arms_policy_timeout_under_wide_run_budget(tmp_path, monkeypatc
     try:
         out["driver"].join(timeout=10.0)
         send = out["sends"][0]
-        assert out["prep_stale_timeout"] == 900.0
+        assert out["prep_stale_timeout"] == float("inf")
         assert send["call_start"] == 1000.0
         assert send["stale_timeout"] == 600.0
         assert out.get("error") is None and cap.sink.committed is not None
@@ -962,9 +963,10 @@ def test_b2b_send_arms_policy_timeout_despite_tight_run_budget(
         tmp_path, monkeypatch):
     """budget 120s with 115s already elapsed: the single pre-CAS gate still
     sees remaining >0 so the dispatch commits — and the send then arms the
-    FULL policy window (600), never the remaining 5s. A committed dispatch
-    may overrun by up to request_timeout_seconds; the preparation ceiling
-    itself stays the remaining run budget."""
+    FULL policy window (600), never the remaining 5s. The policy timeout
+    bounds the post-send response window only, not a CAS + send total;
+    preparation carries no stale watchdog (``inf``), so the tight budget
+    could not have killed it either."""
     _b2b_env(tmp_path, monkeypatch)
     clock = _FakeClock(1000.0)
     cap = _cap_with_timeout(600, sink=_TSink())
@@ -973,7 +975,7 @@ def test_b2b_send_arms_policy_timeout_despite_tight_run_budget(
     try:
         out["driver"].join(timeout=10.0)
         send = out["sends"][0]
-        assert out["prep_stale_timeout"] == 5.0
+        assert out["prep_stale_timeout"] == float("inf")
         assert send["call_start"] == 1000.0
         assert send["stale_timeout"] == 600.0
         assert out.get("error") is None and cap.sink.committed is not None
@@ -983,8 +985,9 @@ def test_b2b_send_arms_policy_timeout_despite_tight_run_budget(
 
 def test_b2b_send_arms_policy_timeout_after_slow_preparation(tmp_path, monkeypatch):
     """Fake clock: budget 120 from t1000, +8s of client/dispatch preparation —
-    the raw deadline covers preparation (8 + 600) while the effective window
-    at the send is the full policy 600, never the fresh remaining 112."""
+    preparation runs watchdog-free (``inf``), and the raw deadline armed at
+    the send covers it (8 + 600) while the effective window is the full
+    policy 600, never the fresh remaining 112."""
     _b2b_env(tmp_path, monkeypatch)
     clock = _FakeClock(1000.0)
     cap = _cap_with_timeout(600, sink=_TSink())
@@ -994,7 +997,7 @@ def test_b2b_send_arms_policy_timeout_after_slow_preparation(tmp_path, monkeypat
     try:
         out["driver"].join(timeout=10.0)
         send = out["sends"][0]
-        assert out["prep_stale_timeout"] == 120.0
+        assert out["prep_stale_timeout"] == float("inf")
         assert send["call_start"] == 1000.0 and send["now"] == 1008.0
         assert send["stale_timeout"] == 608.0
         assert send["stale_timeout"] - (send["now"] - send["call_start"]) == 600.0
@@ -1191,16 +1194,18 @@ def test_b2b_run_budget_start_at_epoch_zero_is_a_real_start(tmp_path, monkeypatc
 
 def _terminal_gate_probe(tmp_path, monkeypatch, *, run_budget=None,
                          budget_started=None, on_resolve=None):
-    """Real ``_terminal_lane`` driven through ``request._call()`` under the
+    """Real ``_terminal_lane`` driven through ``request.run()`` under the
     execution binding: real ``_AttemptSink``/disk store/SDK -> loopback
-    double, REAL ``before_sdk_dispatch`` + CAS fence -- never a stubbed
-    dispatch. A ``_FakeClock`` binds ``_helpers.time`` only; the sink's
-    signed-window checks keep real clocks. Invocation counts of the
-    worker-side C1, the source renewal and ``cas_dispatch`` are recorded;
-    ``on_resolve(request, clock)`` runs inside the REAL renewal after it
-    returns True and before the gate (clock spend / cancel injection).
-    ``request._call()`` isolates the generic poll loop exactly like the
-    post-CAS witness did. Caller closes via ``_close_probe``."""
+    double, REAL ``before_sdk_dispatch`` + CAS fence, real worker thread +
+    inherited poll loop -- never a stubbed dispatch. A ``_FakeClock`` binds
+    ``_helpers.time`` only; the sink's signed-window checks keep real
+    clocks. Invocation counts of the worker-side C1, the source renewal and
+    ``cas_dispatch`` are recorded; ``on_resolve(request, clock)`` runs inside
+    the REAL renewal after it returns True and before the gate (clock spend
+    / cancel injection). A ``B2BTerminalRefusal`` raised out of ``run()`` is
+    returned on ``probe.run_error`` so tests can classify it; anything else
+    (TimeoutError, a real bug) propagates. Caller closes via
+    ``_close_probe``."""
     request = None
     recheck_calls = []
 
@@ -1243,18 +1248,29 @@ def _terminal_gate_probe(tmp_path, monkeypatch, *, run_budget=None,
             agent, api_kwargs, cap=lane.cap, receipt=lane.receipt,
             request_digest=be.provider_request_digest(api_kwargs))
 
+        run_error = None
         token = bind_execution(lane.cap)
         try:
-            request._call()
+            request.run()
+        except B2BTerminalRefusal as exc:
+            # The expected pre-CAS refusal surfaced through the real poll
+            # loop; returned for the caller to classify.
+            run_error = exc
         finally:
             reset_execution(token)
+        # The worker is a real thread: join it before the caller can close
+        # the store underneath any lingering teardown.
+        if request.thread is not None:
+            request.thread.join(timeout=10.0)
 
         return SimpleNamespace(
             lane=lane, provider=provider, agent=agent, request=request,
-            clock=clock, recheck_calls=recheck_calls,
+            clock=clock, run_error=run_error, recheck_calls=recheck_calls,
             resolve_calls=resolve_calls, cas_calls=cas_calls)
     except BaseException:
         if request is not None:
+            if request.thread is not None:
+                request.thread.join(timeout=10.0)
             request.clients.close_once("gate_probe_error_cleanup")
         agent.client.close()
         lane.store.close()
@@ -1264,6 +1280,8 @@ def _terminal_gate_probe(tmp_path, monkeypatch, *, run_budget=None,
 
 def _close_probe(probe, reason):
     if probe.request is not None:
+        if probe.request.thread is not None:
+            probe.request.thread.join(timeout=10.0)
         probe.request.clients.close_once(reason)
     probe.agent.client.close()
     probe.lane.store.close()
@@ -1286,11 +1304,11 @@ def test_b2b_budget_spent_inside_preparation_stops_before_send(
         on_resolve=lambda request, clock: clock.advance(15.0))
     try:
         request = probe.request
-        # The gate refusal normalized inside the worker like any classified
-        # refusal: no response, the typed error surfaced.
+        # The gate refusal surfaced through the real run() like any
+        # classified refusal: no response, the typed error raised.
         assert request.result["response"] is None
-        assert isinstance(request.result["error"], B2BTerminalRefusal)
-        assert str(request.result["error"]) == "provider_result_unavailable"
+        assert isinstance(probe.run_error, B2BTerminalRefusal)
+        assert str(probe.run_error) == "provider_result_unavailable"
         # The worker-side C1 and the renewal ran; the gate sits between the
         # renewal and the CAS -- the CAS never executed.
         assert probe.recheck_calls == [1]
@@ -1328,8 +1346,8 @@ def test_b2b_exhausted_budget_blocks_real_sink_as_failed(
     try:
         request = probe.request
         assert request.result["response"] is None
-        assert isinstance(request.result["error"], B2BTerminalRefusal)
-        assert str(request.result["error"]) == "provider_result_unavailable"
+        assert isinstance(probe.run_error, B2BTerminalRefusal)
+        assert str(probe.run_error) == "provider_result_unavailable"
         assert probe.recheck_calls == [1]
         assert probe.resolve_calls == [1]
         assert probe.cas_calls == []
@@ -1359,8 +1377,10 @@ def test_b2b_cancel_during_preparation_blocks_failed_at_gate(
             request, "cancelled", True))
     try:
         request = probe.request
-        # _call swallowed the refusal as an ordinary cancel: neither response
-        # nor error surfaced -- but the durable block already landed.
+        # _call swallowed the refusal as an ordinary cancel: run() returned
+        # with neither response nor error surfaced -- but the durable block
+        # already landed before the raise.
+        assert probe.run_error is None
         assert request.result["response"] is None
         assert request.result["error"] is None
         # The worker-side C1 and the renewal ran; the gate is AFTER them and
