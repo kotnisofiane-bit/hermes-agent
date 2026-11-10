@@ -27,7 +27,8 @@ from urllib.parse import urlsplit
 from agent.b2b_execution import (
     B2BTerminalRefusal, BoundExecution, R2_SCHEMA_PINS, _deep_freeze, _plain_json,
     _public_text, canonical_json, is_b2b_attempt_id, is_b2b_session_id, json_utf8,
-    source_basis, mission_prompt, recheck_context, validate_proposal, extract_allowed_refs)
+    assert_source_equivalent, context_proof, qualify_context_view, verify_context_proof,
+    mission_prompt, recheck_context, validate_proposal, extract_allowed_refs)
 
 logger = logging.getLogger("gateway.platforms.api_server")
 
@@ -39,6 +40,9 @@ _READ_OPERATION = "read"
 _PURPOSES = frozenset({"bind", "before_provider", "before_seal"})
 _BODY_MAX = 65536
 _SOURCE_DEADLINE_S = 1.0
+# Slack between a bounded C1 deadline and the hard signed-window edge, so the
+# renewal exchange itself still fits inside the window the C1 respected.
+_CONTEXT_RECHECK_SAFETY_S = 0.1
 _REQUEST_TTL_S = 10
 _MAX_WINDOW_S = 30
 _SIG_RE = re.compile(r"^[A-Za-z0-9_-]{86}$")
@@ -80,7 +84,9 @@ _PROFILE_ENTRY_KEYS = frozenset({
     "portal_public_key_pem", "hermes_private_key_pem", "projects"})
 _PROJECT_ENTRY_KEYS = frozenset({
     "project_id", "bot_id", "profile_id", "allowed_namespaces", "context_contract_root",
-    "model", "provider", "base_url", "api_mode", "logical_mission", "project_context"})
+    "model", "provider", "base_url", "api_mode", "logical_mission", "project_context",
+    "request_timeout_seconds"})
+_PROJECT_ENTRY_REQUIRED_KEYS = _PROJECT_ENTRY_KEYS - {"request_timeout_seconds"}
 _PROJECT_CONTEXT_KEYS = frozenset({"allocation_root", "project_id", "start"})
 _API_MODES = frozenset({"chat_completions"})
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -240,7 +246,9 @@ def _validate_source_url(value: Any) -> str:
 
 
 def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
-    if not isinstance(entry, Mapping) or set(entry.keys()) != _PROJECT_ENTRY_KEYS:
+    if (not isinstance(entry, Mapping)
+            or not set(entry.keys()).issubset(_PROJECT_ENTRY_KEYS)
+            or not set(entry.keys()).issuperset(_PROJECT_ENTRY_REQUIRED_KEYS)):
         raise B2BConfigError(f"b2b config: project {binding_id}: closed keys required")
     project_id = entry["project_id"]
     if not isinstance(project_id, str) or not _PROJECT_ID.fullmatch(project_id):
@@ -268,6 +276,13 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
     logical_mission = entry.get("logical_mission")
     if logical_mission is not None:
         _req_str(logical_mission, "project.logical_mission", allow_none=False)
+    # Integer seconds: the project policy is canonical JSON (floats are refused).
+    raw_timeout = entry.get("request_timeout_seconds", 5)
+    if (isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int)
+            or not 1 <= raw_timeout <= 900):
+        raise B2BConfigError(
+            f"b2b config: project {binding_id}: request_timeout_seconds")
+    request_timeout_seconds = raw_timeout
     pc = entry.get("project_context")
     if pc is not None:
         if not isinstance(pc, Mapping) or set(pc.keys()) != _PROJECT_CONTEXT_KEYS:
@@ -281,7 +296,7 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
             if not isinstance(v, str) or not v or _CONTROL_CHARS.search(v) or not _ABS_PATH_RE.match(v):
                 raise B2BConfigError(
                     f"b2b config: project {binding_id}: project_context.{k} must be absolute")
-    return {
+    normalized = {
         "project_id": project_id,
         "bot_id": entry["bot_id"], "profile_id": entry["profile_id"],
         "allowed_namespaces": list(entry["allowed_namespaces"]),
@@ -290,6 +305,13 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
         "base_url": entry["base_url"], "api_mode": entry["api_mode"],
         "logical_mission": logical_mission,
         "project_context": dict(pc) if pc is not None else None}
+    # Replay compatibility: the optional key enters the canonical project — hence
+    # policy_json and the fingerprint — only when the operator sets it. An attempt
+    # admitted before this key existed keeps replaying instead of conflicting on
+    # the injected default.
+    if "request_timeout_seconds" in entry:
+        normalized["request_timeout_seconds"] = request_timeout_seconds
+    return normalized
 
 
 @dataclasses.dataclass(frozen=True, init=False)
@@ -666,6 +688,11 @@ def _policy_digest(profile: str, entry: Mapping[str, Any], project: Mapping[str,
         "schema_pins": R2_SCHEMA_PINS, "execution_policy": "h1/proposal-v1",
         "profile_home": resolved.get("profile_home"),
     }
+    # Optional operator key: absent from the digest basis unless explicitly
+    # configured, so a pre-versioning admission replays byte-for-byte while a
+    # configured value still revokes a running cap when changed mid-run.
+    if "request_timeout_seconds" in project:
+        basis["request_timeout_seconds"] = project["request_timeout_seconds"]
     return hashlib.sha256(canonical_json(basis)).hexdigest()
 
 
@@ -729,7 +756,10 @@ def _genesis_vs_native(session: Mapping[str, Any], session_id: str, profile: str
 # Durable terminal classification for _AttemptSink.block: explicit reason ->
 # status entries; anything unlisted defaults to "failed". Exception text is
 # never mined for substrings — a reason not in this table is a bug or an
-# untyped failure, and both are "failed".
+# untyped failure, and both are "failed". The emitted refusal universe is
+# enumerated in agent.b2b_execution.BLOCK_REASONS; every member MUST have an
+# explicit entry below — the classification tests walk that constant against
+# this table, so a new raise site or block() call extends BOTH in one change.
 _BLOCK_CONTEXT_STALE_REASONS = frozenset({
     "context_schema_invalid", "context_contract_unavailable",
     "context_digest_invalid", "context_identity_source",
@@ -739,8 +769,17 @@ _BLOCK_CONTEXT_STALE_REASONS = frozenset({
     "context_my_work_mismatch", "context_my_work_authority",
     "context_memory_unqualified", "context_memory_namespace",
     "context_memory_provenance", "context_memory_mission",
+    "context_memory_malformed_globals", "context_memory_malformed",
+    "context_memory_malformed_api", "context_memory_malformed_source_contract",
+    "context_memory_malformed_v1_fallback",
+    "context_memory_malformed_truncated", "context_memory_malformed_limits",
+    "context_memory_missing",
     "context_contradictions", "context_oc_malformed", "context_oc_mismatch",
-    "context_oc_unavailable", "context_accepted_unavailable",
+    "context_oc_unavailable", "context_oc_read_metadata",
+    "context_oc_unqualified", "context_oc_projection",
+    "context_oc_source_stale", "context_oc_read_replayed",
+    "context_proof_missing", "context_proof_invalid",
+    "context_accepted_unavailable",
     "context_accepted_malformed", "context_accepted_unqualified",
     "context_support_unqualified", "context_relation_bounds",
     "context_view_bounds", "context_view_not_object",
@@ -759,7 +798,7 @@ _BLOCK_POLICY_CHANGED_REASONS = frozenset({
     "b2b_model_mismatch", "b2b_alternate_provider", "b2b_alternate_api_call",
     "b2b_sdk_override", "b2b_sdk_headers", "b2b_client_policy",
     "b2b_retries_not_disabled", "b2b_request_client_not_isolated",
-    "terminal_guard_required", "kwargs_not_permitted",
+    "b2b_timeout_policy", "terminal_guard_required", "kwargs_not_permitted",
 })
 _BLOCK_SOURCE_DENIED_REASONS = frozenset({
     "source_before_provider_denied", "source_before_seal_denied",
@@ -768,15 +807,40 @@ _BLOCK_SOURCE_DENIED_REASONS = frozenset({
 _BLOCK_RESULT_INVALID_REASONS = frozenset({
     "result_invalid", "proposal_invalid", "response_not_public",
 })
+# Emitted refusal reasons whose classified status IS "failed": serializer
+# invariant failures (host-side data defects — the same json_* guards run on
+# non-context payloads), missing capability plumbing, no-receipt/commit-
+# integrity conditions and untyped run exits. Explicit membership makes the
+# durable "failed" deliberate; genuinely untyped exception text re-fed by
+# block_failed_run still lands on the generic default below.
+_BLOCK_FAILED_REASONS = frozenset({
+    "json_depth", "json_key", "json_scalar",
+    "sink_missing", "context_sink_missing",
+    "dispatch_already_committed", "request_changed_before_sdk",
+    "provider_result_unavailable", "result_unattested",
+    "middleware_response_unattested",
+    "result_commit_failed", "context_commit_failed", "seal_commit_failed",
+    "seal_unattested", "launch_failed", "native_run_interrupted",
+    "b2b_run_failed", "policy_provider_unavailable",
+})
+# Terminal durable statuses re-fed to block() by _b2b_finalize's already-
+# blocked fast path are known values, not untyped text — self-mapping.
+_BLOCK_TERMINAL_STATUSES = frozenset({
+    "context_unavailable", "context_stale", "policy_changed",
+    "source_denied", "result_invalid", "indeterminate", "failed",
+    "interrupted",
+})
 _BLOCK_STATUS = {
     "context_unavailable": "context_unavailable",
     **{r: "context_stale" for r in _BLOCK_CONTEXT_STALE_REASONS},
     **{r: "policy_changed" for r in _BLOCK_POLICY_CHANGED_REASONS},
     **{r: "source_denied" for r in _BLOCK_SOURCE_DENIED_REASONS},
     **{r: "result_invalid" for r in _BLOCK_RESULT_INVALID_REASONS},
+    **{r: "failed" for r in _BLOCK_FAILED_REASONS},
+    **{s: s for s in _BLOCK_TERMINAL_STATUSES},
 }
 # NO-RECEIPT conditions (provider_result_unavailable, result_unattested,
-# middleware_response_unattested) intentionally default to "failed" here: the
+# middleware_response_unattested) intentionally classify "failed" here: the
 # dispatch may or may not have reached the provider, so the post-CAS override
 # below turns them "indeterminate" once a committed marker exists with no
 # durable result — never the known-invalid result_invalid.
@@ -835,12 +899,26 @@ class _AttemptSink:
     def block(self, reason: str) -> None:
         # Durable classification comes from the explicit reason -> status table:
         # arbitrary exception text is NEVER mined for substrings.
-        status = _BLOCK_STATUS.get(reason, "failed")
+        # ``result_invalid:<validator detail>`` raises embed the validator
+        # reason in the exception string — classify on their prefix.
+        status = _BLOCK_STATUS.get(reason.partition(":")[0], "failed")
         row = self._store.b2b_attempt(profile=self.profile, attempt_id=self.attempt_id)
-        if (row is not None and row["status"] == "dispatch_committed" and
-                self._store.b2b_artifact(attempt_id=self.attempt_id, kind="provider_result") is None
-                and status != "result_invalid"):
-            status = "indeterminate"
+        # Two distinct guards share one artifact read:
+        # - dispatch_committed with NO durable result: the dispatch may have
+        #   reached the provider, so the outcome is unknown -> indeterminate
+        #   (never the known-invalid result_invalid).
+        # - result_received WITH a durable provider_result: a paid answer must
+        #   not be degraded to "failed" by a racing failure-mapped block ->
+        #   indeterminate. Typed source/context/policy/invalid outcomes stay
+        #   exactly as classified — the guard is failed-only.
+        if (row is not None and
+                ((row["status"] == "dispatch_committed" and status != "result_invalid") or
+                 (row["status"] == "result_received" and status == "failed"))):
+            provider_result = self._store.b2b_artifact(
+                attempt_id=self.attempt_id, kind="provider_result")
+            if ((row["status"] == "dispatch_committed" and provider_result is None) or
+                    (row["status"] == "result_received" and provider_result is not None)):
+                status = "indeterminate"
         self._store.b2b_update_attempt(profile=self.profile, attempt_id=self.attempt_id, status=status)
 
     def resolve_before_provider(self) -> bool:
@@ -854,28 +932,76 @@ class _AttemptSink:
         self._before_provider = resolved
         return True
 
-    def cas_dispatch(self, *, request_digest: str, receipt: Any) -> bool:
+    def context_recheck_deadline(self) -> float:
+        """Monotonic deadline for the next bounded C1 recheck: an explicit
+        source/C1 budget, never the worker/provider timeout. With a completed
+        ``before_provider`` exchange it is the earliest request/response
+        ``expires_at`` minus ``now`` minus the renewal reserve — strictly below
+        the remaining TTL, short response window included; before any exchange
+        it is the prospective ``_REQUEST_TTL_S`` window."""
+        resolved = self._before_provider
+        if resolved is not None:
+            remaining = min(
+                resolved["_signed_request"]["expires_at"],
+                resolved["_signed_response"]["expires_at"]) - time.time()
+        else:
+            remaining = float(_REQUEST_TTL_S)
+        budget = max(
+            0.0, remaining - (_SOURCE_DEADLINE_S + _CONTEXT_RECHECK_SAFETY_S))
+        return time.monotonic() + budget
+
+    def seal_recheck_deadline(self) -> float:
+        """Monotonic deadline for the SEAL-time bounded C1 recheck: the
+        ``before_seal`` exchange is only issued AFTER this read returns, so
+        the prospective ``_REQUEST_TTL_S`` window applies — never the
+        already-spent ``before_provider`` budget."""
+        return time.monotonic() + max(
+            0.0, _REQUEST_TTL_S - (_SOURCE_DEADLINE_S + _CONTEXT_RECHECK_SAFETY_S))
+
+    def _qualify_context(self, view: Mapping[str, Any]) -> Dict[str, Any]:
+        # Validate against the sink's frozen policy, without minting a capability.
+        policy = types.SimpleNamespace(policy_get=self.policy.get)
+        return qualify_context_view(policy, view)
+
+    def cas_dispatch(self, *, request_digest: str, receipt: Any,
+                     rechecked_view: Optional[Mapping[str, Any]] = None) -> bool:
         resolved = self._before_provider
         if (receipt is not self.context_receipt or resolved is None or
-                not self._matches_source(resolved) or not self._source_matches_context(resolved)):
+                not self._matches_source(resolved) or not self._source_matches_context(resolved) or
+                not isinstance(rechecked_view, Mapping)):
             return False
+        fresh = self._qualify_context(rechecked_view)
+        assert_source_equivalent(receipt.view, fresh)
+        proof = context_proof(fresh)
+        # Serialize BOTH durable records before the final signed-window check so
+        # no local preparation stands between the check and the store CAS.
+        source_record = _source_record(resolved)
         now = time.time()
-        if not all(env["issued_at"] <= now < env["expires_at"] for env in
+        dispatch_record = json_utf8({
+            "format": "dubsar.b2b-provider-dispatch/1",
+            "attempt_id": self.attempt_id, "run_id": self.run_id,
+            "binding_digest": self.binding_digest, "request_digest": request_digest,
+            "context_digest": receipt.digest,
+            "source_basis_digest": receipt.source_basis_digest,
+            "source_basis_contract": receipt.source_basis_contract,
+            "view_digest": receipt.view_digest,
+            "context_recheck": {
+                "format": "dubsar.b2b-context-recheck/2",
+                "attempt_id": self.attempt_id, "run_id": self.run_id, **proof},
+            "rendered_digest": receipt.rendered_digest,
+            "model": self.policy["project"]["model"],
+            "provider": self.policy["project"]["provider"], "committed_at": now})
+        window_now = time.time()
+        if not all(env["issued_at"] <= window_now < env["expires_at"] for env in
                    (resolved["_signed_request"], resolved["_signed_response"])):
+            # The signed window closed after the last exchange: a typed refusal,
+            # never the duplicate-CAS False (that answer stays exclusive to a
+            # genuinely committed dispatch marker).
             self.block("source_window_closed")
-            return False
+            raise B2BTerminalRefusal("source_window_closed")
         return self._store.b2b_cas_dispatch(
             profile=self.profile, attempt_id=self.attempt_id,
-            source_record=_source_record(resolved),
-            dispatch_record=json_utf8({
-                "format": "dubsar.b2b-provider-dispatch/1",
-                "attempt_id": self.attempt_id, "run_id": self.run_id,
-                "binding_digest": self.binding_digest, "request_digest": request_digest,
-                "context_digest": receipt.digest,
-                "source_basis_digest": receipt.source_basis_digest,
-                "rendered_digest": receipt.rendered_digest,
-                "model": self.policy["project"]["model"],
-                "provider": self.policy["project"]["provider"], "committed_at": now}))
+            source_record=source_record, dispatch_record=dispatch_record)
 
     def commit_result(self, *, text: Any, parsed: Any, reason: str) -> None:
         receipt = self.context_receipt
@@ -910,12 +1036,15 @@ class _AttemptSink:
 
     def put_context(self, receipt: Any) -> None:
         """Persist the published context (view + rendered bytes + digest) once."""
+        proof = context_proof(receipt.view)
+        if (proof["context_digest"] != receipt.digest or
+                proof["source_basis_digest"] != receipt.source_basis_digest):
+            raise B2BTerminalRefusal("context_proof_invalid")
         payload = json_utf8({
             "format": "dubsar.b2b-context-artifact/1", "attempt_id": self.attempt_id,
-            "run_id": self.run_id, "view": receipt.view,
+            "run_id": self.run_id, **proof,
             "rendered": receipt.rendered.decode("utf-8"), "turn_id": receipt.turn_id,
-            "context_digest": receipt.digest, "rendered_digest": receipt.rendered_digest,
-            "source_basis_digest": receipt.source_basis_digest})
+            "rendered_digest": receipt.rendered_digest})
         if not self._store.b2b_commit_context(
                 profile=self.profile, attempt_id=self.attempt_id, payload=payload):
             raise B2BTerminalRefusal("context_commit_failed")
@@ -962,17 +1091,23 @@ class _AttemptSink:
         if len(sealed_utf8) > 32768:
             raise B2BTerminalRefusal("proposal_invalid")
         # Compare source content, not capture metadata or public proposal fields.
-        fresh_basis_bytes = json_utf8(source_basis(rechecked_view))
-        if fresh_basis_bytes != receipt.source_basis_bytes:
-            raise B2BTerminalRefusal("context_stale")
+        fresh = self._qualify_context(rechecked_view)
+        assert_source_equivalent(receipt.view, fresh)
+        marker = self._store.b2b_artifact(
+            attempt_id=self.attempt_id, kind="provider_dispatch")
+        if marker is None:
+            raise B2BTerminalRefusal("context_proof_missing")
+        dispatch = json.loads(marker["payload"])
+        previous = verify_context_proof(dispatch.get("context_recheck"))
+        assert_source_equivalent(previous["view"], fresh)
+        proof = context_proof(fresh)
         stored = self._store.b2b_seal(
             profile=self.profile, attempt_id=self.attempt_id,
             artifacts={
                 "source_before_seal": _source_record(source_before_seal),
                 "context_recheck": json_utf8({
-                    "format": "dubsar.b2b-context-recheck/1", "attempt_id": self.attempt_id,
-                    "run_id": self.run_id, "view": rechecked_view,
-                    "source_basis_digest": hashlib.sha256(fresh_basis_bytes).hexdigest()}),
+                    "format": "dubsar.b2b-context-recheck/2", "attempt_id": self.attempt_id,
+                    "run_id": self.run_id, **proof}),
                 "proposal": json_utf8(proposal)})
         if stored is None:
             raise B2BTerminalRefusal("seal_commit_failed")
@@ -1236,6 +1371,8 @@ async def _b2b_get(adapter: Any, request: Any, *, want_context: bool):
             "object": "b2b.context", **identity,
             **{key: context[key] for key in
                ("view", "rendered", "context_digest", "rendered_digest", "source_basis_digest")},
+            **{key: context[key] for key in ("view_digest", "source_basis_contract")
+               if key in context},
             "artifact": next(item for item in manifests if item["kind"] == "context")})
     from gateway.platforms.api_server_runs import _owner_alive
     native = json.loads(row["native_status_json"])

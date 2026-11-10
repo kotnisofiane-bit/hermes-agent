@@ -25,9 +25,37 @@ from tests.gateway.b2b_process_harness import (
 )
 
 
+class _FakeClock:
+    """Module-shaped stand-in patched onto ``agent.chat_completion_helpers.time``
+    (the binding ``h.time`` the worker/poll actually read) — never global
+    ``time.time``, which would contaminate fixture and event timing.
+    ``time()`` reads a controllable value; every other attribute (monotonic,
+    sleep, ...) delegates to the real module so unrelated helpers keep a real
+    clock."""
+
+    def __init__(self, now=1000.0):
+        self.now = float(now)
+        self.on_read = None
+
+    def time(self):
+        value = self.now
+        if self.on_read is not None:
+            self.on_read(value)
+        return value
+
+    def advance(self, seconds):
+        self.now += float(seconds)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
 def build_b2b_dispatch_lane(tmp_path, *,
                             provider_base_url="http://127.0.0.1:1/v1",
-                            mission_source_refs=()):
+                            mission_source_refs=(),
+                            project_id="b2b-bench",
+                            view_factory=build_context_view,
+                            request_timeout_seconds=None):
     """One admitted B2B attempt with a published context receipt -- ready for the
     dispatch fence. NO CAS and NO result commit: ``status == "context_ready"``.
 
@@ -49,19 +77,24 @@ def build_b2b_dispatch_lane(tmp_path, *,
              "portal_issuer": "portal-h1", "hermes_issuer": "hermes-h1-hub",
              "portal_public_key_pem": portal_pub,
              "hermes_private_key_pem": hermes_priv,
-             "projects": {"b2b-bench": {
-                 "project_id": "b2b-bench", "bot_id": "bot", "profile_id": profile,
+             "projects": {project_id: {
+                 "project_id": project_id, "bot_id": "bot", "profile_id": profile,
                  "allowed_namespaces": ["ns"], "context_contract_root": contract_root,
                  "model": "unit-double", "provider": "custom",
                  "base_url": provider_base_url, "api_mode": "chat_completions",
                  "logical_mission": None, "project_context": None}}}
+    # Threaded into the project BEFORE config/policy/sink exist -- the
+    # admission fingerprint then covers it, never a post-hoc policy mutation.
+    if request_timeout_seconds is not None:
+        entry["projects"][project_id]["request_timeout_seconds"] = (
+            request_timeout_seconds)
     config = b2b.B2BConfig({"enabled": True, "profiles": {profile: entry}})
     state = b2b._B2BState(config)
     adapter = SimpleNamespace(_b2b_state=state)
     policy = {
         "attempt_id": attempt_id, "binding_digest": binding,
-        "requester_id": "1" * 24, "project_id": "b2b-bench",
-        "project_binding_id": "b2b-bench", "mission_id": "DUB-001",
+        "requester_id": "1" * 24, "project_id": project_id,
+        "project_binding_id": project_id, "mission_id": "DUB-001",
         "mission_revision": 1, "profile": profile, "session_id": sid,
         "profile_home": str(get_hermes_home().resolve()),
         "reservation_ref": {"collection": "dubsar_b2b_agent_sessions", "id": binding},
@@ -76,8 +109,8 @@ def build_b2b_dispatch_lane(tmp_path, *,
             "tool_call_count": 0, "api_call_count": 0},
         "mission_request": {"title": "m", "objective": "o",
                              "criteria": [], "source_refs": list(mission_source_refs)},
-        "project": entry["projects"]["b2b-bench"]}
-    view = build_context_view(policy, {"mission_source_digest": "c" * 64})
+        "project": entry["projects"][project_id]}
+    view = view_factory(policy, {"mission_source_digest": "c" * 64})
     db_path = os.path.join(str(tmp_path), "runs.db")
     store = RunIdempotencyStore(db_path)
     keys = b2b._KeyRing(entry)

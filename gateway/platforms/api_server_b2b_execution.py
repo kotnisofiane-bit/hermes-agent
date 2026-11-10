@@ -228,7 +228,11 @@ async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[s
                     result.get("final_response", "").strip() != public["text"].strip()):
                 return blocked("result_invalid")
             # The rechecker runs in the copied profile/capability scope; original context stays immutable.
-            fresh = await asyncio.to_thread(recheck_context, cap, receipt)
+            # Bounded like the provider-boundary C1s: a blocking callback must
+            # refuse on the prospective before_seal window, never hang sealing.
+            fresh = await asyncio.to_thread(
+                recheck_context, cap, receipt,
+                deadline=sink.seal_recheck_deadline())
             source = await sink.resolve_before_seal()
             if source is None:
                 return blocked("source_before_seal_denied")

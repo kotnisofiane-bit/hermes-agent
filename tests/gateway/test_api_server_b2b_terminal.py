@@ -17,27 +17,36 @@ design (see tests/gateway/test_api_server_b2b_runtime.py).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import copy
 import http.server
 import json
 import logging
 import sqlite3
 import threading
+import time
+import types
 import uuid
 
 import openai
 import pytest
 
+from agent import chat_completion_helpers as h
 from agent.b2b_execution import (
-    B2BTerminalRefusal, bind_execution, execute_terminal, extract_allowed_refs,
-    install_bounded_agent_policy, json_utf8, mission_prompt,
-    provider_request_digest, reset_execution, validate_proposal,
-    validate_terminal_result,
+    BLOCK_REASONS, B2BTerminalRefusal, bind_execution, current_execution,
+    execute_terminal, extract_allowed_refs, install_bounded_agent_policy,
+    json_utf8, mission_prompt, provider_request_digest, recheck_context,
+    reset_execution, validate_proposal, validate_terminal_result,
 )
+from agent.b2b_nonstream import _B2BNonStreamRequest
 from gateway.platforms import api_server_b2b as b2b
+from gateway.platforms import api_server_b2b_execution as bxe
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from tests.gateway import b2b_unit_fixtures
-from tests.gateway.b2b_process_harness import UNIT_RENDERED
+from tests.gateway.b2b_unit_fixtures import _FakeClock
+from tests.gateway.b2b_process_harness import (
+    UNIT_RENDERED, build_unit_native_oc_view, renew_unit_oc_read)
 
 
 @pytest.fixture
@@ -51,77 +60,80 @@ def b2b_dispatch_lane(tmp_path):
 
 # ---------------------------------------------------------------------------
 # _AttemptSink.block -- explicit reason -> durable status table
+#
+# The emitted reason universe is agent.b2b_execution.BLOCK_REASONS -- the
+# shared production enumeration (raise sites + block() literals across the
+# lane). The durable invariants below walk THAT constant, so a new emitted
+# reason with no explicit _BLOCK_STATUS entry fails the suite instead of
+# silently recording "failed".
 # ---------------------------------------------------------------------------
 
-_CONTEXT_STALE_REASONS = [
-    "context_schema_invalid", "context_contract_unavailable",
-    "context_digest_invalid", "context_identity_source",
-    "context_identity_mismatch", "context_catalogue_mismatch",
-    "context_authority_mismatch", "context_selection_mismatch",
-    "context_namespaces", "context_source_unavailable", "context_source_stale",
-    "context_my_work_mismatch", "context_my_work_authority",
-    "context_memory_unqualified", "context_memory_namespace",
-    "context_memory_provenance", "context_memory_mission",
-    "context_contradictions", "context_oc_malformed", "context_oc_mismatch",
-    "context_oc_unavailable", "context_accepted_unavailable",
-    "context_accepted_malformed", "context_accepted_unqualified",
-    "context_support_unqualified", "context_relation_bounds",
-    "context_view_bounds", "context_view_not_object",
-    "context_recheck_unavailable", "context_recheck_already_registered",
-    "context_render_bounds", "context_rendered_type",
-    "context_rendered_encoding", "context_too_large", "context_turn_id",
-    "context_turn_mismatch", "context_publication_conflict",
-    "context_absent_from_kwargs", "context_changed_before_sdk",
-    "context_stale",
-]
-
-_POLICY_CHANGED_REASONS = [
-    "b2b_capability_mismatch", "b2b_capability_missing",
-    "b2b_agent_binding_missing", "b2b_agent_binding_mismatch",
-    "b2b_profile_mismatch", "b2b_policy_override", "b2b_policy_changed",
-    "b2b_runtime_mismatch", "b2b_runtime_policy", "b2b_destination_mismatch",
-    "b2b_model_mismatch", "b2b_alternate_provider", "b2b_alternate_api_call",
-    "b2b_sdk_override", "b2b_sdk_headers", "b2b_client_policy",
-    "b2b_retries_not_disabled", "b2b_request_client_not_isolated",
-    "terminal_guard_required", "kwargs_not_permitted",
-]
-
-_SOURCE_DENIED_REASONS = [
-    "source_before_provider_denied", "source_before_seal_denied",
-    "source_window_closed",
-]
-
-_RESULT_INVALID_REASONS = ["result_invalid", "proposal_invalid",
-                           "response_not_public"]
-
-_FAILED_REASONS = [
-    # policy_provider_unavailable once classified as policy_changed purely
-    # because its name contains "policy".
-    "policy_provider_unavailable",
-    # NO-RECEIPT conditions default failed pre-CAS (post-CAS -> indeterminate).
-    "result_unattested", "middleware_response_unattested",
-    "provider_result_unavailable",
-    # Commit/seal storage failures and launch/run failures.
-    "result_commit_failed", "context_commit_failed", "seal_commit_failed",
-    "seal_unattested", "launch_failed", "native_run_interrupted",
-    "b2b_run_failed", "sink_missing", "dispatch_already_committed",
-    "request_changed_before_sdk",
-    # Arbitrary exception text must never be mined for a classification.
+# Arbitrary exception text must never be mined for a classification.
+_UNTYPED_REASON_TEXT = [
     "sqlite3.OperationalError: no such context table",
     "RuntimeError: policy file missing",
     "TimeoutError: source read exceeded deadline",
     "ValueError: result could not decode",
 ]
 
+# Table-only entries with no current emitter still classify explicitly
+# (pre-declared families + the durable status passthrough).
+_TABLE_ONLY_PAIRS = (
+    [("b2b_alternate_provider", "policy_changed"),
+     ("response_not_public", "result_invalid")]
+    + [(s, s) for s in sorted(b2b._BLOCK_TERMINAL_STATUSES)])
+
+
+@pytest.mark.parametrize("reason", sorted(BLOCK_REASONS))
+def test_block_every_emitted_reason_classifies_explicitly(
+        b2b_dispatch_lane, reason):
+    """Every refusal reason the lane can emit has an EXPLICIT durable status:
+    ``_BLOCK_STATUS`` must contain it (a ``.get`` fallback is not a
+    classification) and ``block()`` must persist exactly the mapped status."""
+    lane = b2b_dispatch_lane
+    expected = b2b._BLOCK_STATUS[reason]  # KeyError: emitted reason unclassified
+    lane.sink.block(reason)
+    assert lane.store.b2b_attempt(
+        profile=lane.profile, attempt_id=lane.attempt_id)["status"] == expected
+
+
+def test_emitted_reason_families_match_review_semantics():
+    """The classification contract stated INDEPENDENTLY of the table: every
+    context-qualification/proof refusal is ``context_stale``
+    (``context_unavailable`` is the withdrawn-context refusal and
+    ``context_sink_missing`` is missing plumbing, not staleness); every
+    ``b2b_*`` capability/policy refusal is ``policy_changed``; signed-source
+    denials are ``source_denied``; public-result refusals are
+    ``result_invalid``. The remaining known reasons -- ``json_*`` serializer
+    guards (they also fire on non-context payloads), missing plumbing,
+    no-receipt conditions, commit integrity and untyped run exits -- are
+    explicitly ``failed``."""
+    expected = {}
+    for reason in BLOCK_REASONS:
+        if reason == "context_unavailable":
+            expected[reason] = "context_unavailable"
+        elif (reason.startswith("context_")
+                and reason != "context_sink_missing"
+                and not reason.endswith(("_failed", "_unattested"))):
+            expected[reason] = "context_stale"
+        elif reason.startswith("source_"):
+            expected[reason] = "source_denied"
+        elif (reason.startswith("b2b_")
+                and not reason.endswith(("_failed", "_unavailable"))
+                or reason in {"kwargs_not_permitted", "terminal_guard_required"}):
+            expected[reason] = "policy_changed"
+        elif reason in {"result_invalid", "proposal_invalid"}:
+            expected[reason] = "result_invalid"
+        else:
+            expected[reason] = "failed"
+    wrong = {r: (expected[r], b2b._BLOCK_STATUS.get(r)) for r in expected
+             if b2b._BLOCK_STATUS.get(r) != expected[r]}
+    assert not wrong, wrong
+
 
 @pytest.mark.parametrize(
     ("reason", "expected"),
-    ([(r, "context_stale") for r in _CONTEXT_STALE_REASONS]
-     + [(r, "policy_changed") for r in _POLICY_CHANGED_REASONS]
-     + [(r, "source_denied") for r in _SOURCE_DENIED_REASONS]
-     + [(r, "result_invalid") for r in _RESULT_INVALID_REASONS]
-     + [(r, "failed") for r in _FAILED_REASONS]
-     + [("context_unavailable", "context_unavailable")]))
+    _TABLE_ONLY_PAIRS + [(r, "failed") for r in _UNTYPED_REASON_TEXT])
 def test_block_maps_reason_to_explicit_status(b2b_dispatch_lane, reason, expected):
     lane = b2b_dispatch_lane
     lane.sink.block(reason)
@@ -132,15 +144,15 @@ def test_block_maps_reason_to_explicit_status(b2b_dispatch_lane, reason, expecte
 def _commit_dispatch(lane):
     lane.sink._before_provider = lane.resolved
     assert lane.sink.cas_dispatch(
-        request_digest=lane.policy["request_digest"], receipt=lane.receipt)
+        request_digest=lane.policy["request_digest"], receipt=lane.receipt,
+        rechecked_view=renew_unit_oc_read(lane.view))
     assert lane.store.b2b_attempt(
         profile=lane.profile, attempt_id=lane.attempt_id)[
             "status"] == "dispatch_committed"
 
 
-@pytest.mark.parametrize("reason", _FAILED_REASONS + _CONTEXT_STALE_REASONS[:6]
-                         + _POLICY_CHANGED_REASONS[:6] + _SOURCE_DENIED_REASONS
-                         + ["context_unavailable"])
+@pytest.mark.parametrize("reason", sorted(
+    r for r in BLOCK_REASONS if b2b._BLOCK_STATUS[r] != "result_invalid"))
 def test_block_after_committed_dispatch_is_indeterminate(b2b_dispatch_lane, reason):
     """CAS committed + NO durable provider result => indeterminate, whatever the
     reason -- the dispatch may have reached the provider."""
@@ -151,12 +163,18 @@ def test_block_after_committed_dispatch_is_indeterminate(b2b_dispatch_lane, reas
         profile=lane.profile, attempt_id=lane.attempt_id)["status"] == "indeterminate"
 
 
-def test_block_after_committed_dispatch_keeps_result_invalid(b2b_dispatch_lane):
+@pytest.mark.parametrize(
+    "reason", sorted(b2b._BLOCK_RESULT_INVALID_REASONS)
+    + ["result_invalid:summary_bounds;steps[0]_bounds"])
+def test_block_after_committed_dispatch_keeps_result_invalid(
+        b2b_dispatch_lane, reason):
     """A proven-invalid result is a KNOWN outcome, not an unknown one: the
-    indeterminate override never applies to result_invalid."""
+    indeterminate override never applies to result_invalid -- including the
+    ``result_invalid:<validator detail>`` raises that embed the validator
+    reason in the exception string."""
     lane = b2b_dispatch_lane
     _commit_dispatch(lane)
-    lane.sink.block("result_invalid")
+    lane.sink.block(reason)
     assert lane.store.b2b_attempt(
         profile=lane.profile, attempt_id=lane.attempt_id)["status"] == "result_invalid"
 
@@ -486,15 +504,23 @@ class _UnitSDKAgent:
         self._close_request_openai_client(client, reason=reason)
 
 
-def _terminal_lane(tmp_path, monkeypatch, *, fail_body=None):
+def _terminal_lane(tmp_path, monkeypatch, *, fail_body=None, view_factory=None,
+                   recheck=None, request_timeout_seconds=None):
     """Dispatch lane bound to a live loopback provider; real SDK stand-in agent
     installed through install_bounded_agent_policy; only ``resolve_source`` is
-    mocked to the supplied resolved unit double."""
+    mocked to the supplied resolved unit double.
+
+    ``view_factory``/``recheck`` extend the shared fixture IN THIS FILE ONLY:
+    a real native-receipt unit view and a labelled C1 callback double.
+    """
     provider = _LoopbackProvider(fail_body=fail_body)
     lane = None
     try:
+        lane_kw = {} if view_factory is None else {"view_factory": view_factory}
+        if request_timeout_seconds is not None:
+            lane_kw["request_timeout_seconds"] = request_timeout_seconds
         lane = b2b_unit_fixtures.build_b2b_dispatch_lane(
-            tmp_path, provider_base_url=provider.base_url)
+            tmp_path, provider_base_url=provider.base_url, **lane_kw)
         provider.db_path = lane.db_path
         monkeypatch.setattr(
             b2b, "resolve_source", lambda *a, **k: (lane.resolved, "ok"))
@@ -502,7 +528,9 @@ def _terminal_lane(tmp_path, monkeypatch, *, fail_body=None):
         object.__setattr__(lane.cap, "_agent_ref", None)
         # Registered qualified context rechecker (unit double): re-qualifies the
         # same view, so recheck_context passes with an identical source_basis.
-        lane.cap.register_context_recheck(lambda _cap: copy.deepcopy(lane.view))
+        lane.cap.register_context_recheck(
+            recheck if recheck is not None else
+            (lambda _cap: copy.deepcopy(lane.view)))
         token = bind_execution(lane.cap)
         try:
             install_bounded_agent_policy(agent, lane.cap)
@@ -649,6 +677,996 @@ def test_execute_terminal_provider_error_is_safe_indeterminate(
                 attempt_id=lane.attempt_id, kind="provider_result") is None
         finally:
             reopened.close()
+    finally:
+        agent.client.close()
+        lane.store.close()
+        provider.stop()
+
+
+# ---------------------------------------------------------------------------
+# C1 bounded-deadline invariants -- a context recheck must never outlive the
+# signed source window it has to fit inside, and the worker boundary renews
+# the before_provider exchange AFTER the final C1, immediately before the CAS.
+#
+# The lane is REAL (disk store, _AttemptSink, execute_terminal -> worker ->
+# real SDK -> loopback provider); the C1 callback and the source envelopes are
+# explicitly labelled UNIT DOUBLES.
+# ---------------------------------------------------------------------------
+
+def _resolved_with_window(lane, request_ttl_s, response_ttl_s=None):
+    """The same attested unit source double, re-windowed: distinct
+    ``expires_at`` per signed envelope (negative ttl => already expired), so a
+    shorter response window provably drives the deadline's ``min``. Only the
+    window fields differ -- identity/policy matching is untouched."""
+    resolved = copy.deepcopy(lane.resolved)
+    now = time.time()
+    req_expires = now + request_ttl_s
+    resp_expires = now + (request_ttl_s if response_ttl_s is None
+                          else response_ttl_s)
+    resolved["_signed_request"] = {
+        "issued_at": min(now - 0.1, req_expires - 0.1), "expires_at": req_expires}
+    resolved["_signed_response"] = {
+        "issued_at": min(now - 0.1, resp_expires - 0.1),
+        "expires_at": resp_expires}
+    return resolved
+
+
+def _table_dump(db_path, table):
+    """Reopen the disk store file on a second connection: proof of durable
+    content, not an in-memory view of the store's own connection."""
+    conn = sqlite3.connect(db_path, timeout=30)
+    try:
+        return conn.execute(f"SELECT * FROM {table}").fetchall()
+    finally:
+        conn.close()
+
+
+def _persisted_baseline(lane):
+    return {table: _table_dump(lane.db_path, table) for table in
+            ("run_idempotency", "b2b_bindings", "b2b_attempts", "b2b_artifacts")}
+
+
+def _assert_zero_new_durable_rows(lane, baseline, *, expect_status):
+    """The fixture starts with an ADMITTED binding+attempt+run+context already
+    durable: a refusal must create ZERO new rows in run_idempotency /
+    b2b_bindings / b2b_artifacts and flip ONLY the pre-existing attempt's
+    status (reopened from disk). History is never deleted to look clean."""
+    for table in ("run_idempotency", "b2b_bindings", "b2b_artifacts"):
+        assert _table_dump(lane.db_path, table) == baseline[table], table
+    attempts = _table_dump(lane.db_path, "b2b_attempts")
+    assert len(attempts) == len(baseline["b2b_attempts"]) == 1
+    reopened = RunIdempotencyStore(str(lane.db_path))
+    try:
+        row = reopened.b2b_attempt(
+            profile=lane.profile, attempt_id=lane.attempt_id)
+        assert row["status"] == expect_status
+    finally:
+        reopened.close()
+
+
+@pytest.mark.parametrize("boundary", ["pre_terminal", "worker"])
+def test_execute_terminal_slow_c1_refuses_source_window_closed(
+        tmp_path, monkeypatch, boundary):
+    """A C1 callback that outlives the signed source window must refuse
+    ``source_window_closed`` BEFORE the stalled callback returns -- never an
+    unbounded wait inside the context lock, never
+    ``dispatch_already_committed`` -- with zero provider posts, zero new
+    durable rows and no late ``_last_context_read`` mutation.
+
+    ``pre_terminal``: the FIRST C1 (prospective ``_REQUEST_TTL_S`` window,
+    shortened here so the deadline is ~0.4 s) stalls.
+    ``worker``: the initial C1 is fast, the initial exchange reports a short
+    signed RESPONSE window (request +10 s, response +2.5 s -- the earlier
+    expiry drives the ~1.4 s C1 budget), and the SECOND C1 stalls.
+    """
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    state = {"calls": 0, "cb_thread": None}
+
+    def _recheck(_cap):
+        state["calls"] += 1
+        if boundary == "worker" and state["calls"] == 1:
+            return copy.deepcopy(lane.view)      # initial C1: fast
+        state["cb_thread"] = threading.current_thread()
+        entered.set()
+        try:
+            release.wait(30)
+            return copy.deepcopy(lane.view)
+        finally:
+            finished.set()
+
+    lane, provider, agent = _terminal_lane(tmp_path, monkeypatch, recheck=_recheck)
+    try:
+        resolve_calls = []
+        if boundary == "pre_terminal":
+            # Shrink the prospective first-boundary budget ONLY (not a generic
+            # timeout): TTL 1.5 s - (1 s reserve + 0.1 s slack) ~= 0.4 s.
+            monkeypatch.setattr(b2b, "_REQUEST_TTL_S", 1.5)
+
+        def _resolve(entry, keys, purpose, **kw):
+            resolve_calls.append(purpose)
+            return (_resolved_with_window(lane, 10.0, 2.5)
+                    if boundary == "worker" else lane.resolved), "ok"
+        monkeypatch.setattr(b2b, "resolve_source", _resolve)
+        baseline = _persisted_baseline(lane)
+        outcome = {}
+
+        def _drive():
+            token = bind_execution(lane.cap)
+            try:
+                outcome["response"] = execute_terminal(
+                    agent, _api_kwargs(lane), lane.cap, turn_id=lane.turn_id)
+            except Exception as exc:  # noqa: BLE001 -- asserted below
+                outcome["error"] = exc
+            finally:
+                reset_execution(token)
+
+        driver = threading.Thread(target=_drive, daemon=True)
+        last_read = None
+        try:
+            driver.start()
+            assert entered.wait(5.0), "the C1 callback never started"
+            driver.join(timeout=5.0)            # outer guard: refusal << 30 s stall
+            assert not driver.is_alive(), (
+                "terminal did not refuse before the stalled callback returned")
+            # The refusal landed while the callback is STILL blocked: pin the
+            # published read before releasing anything.
+            last_read = lane.cap._last_context_read
+        finally:
+            release.set()
+            driver.join(timeout=10.0)
+        # The late callback ran to completion AFTER the refusal -- its result
+        # was discarded, never published.
+        state["cb_thread"].join(timeout=5.0)
+        assert finished.is_set() and not state["cb_thread"].is_alive()
+        assert lane.cap._last_context_read is last_read
+        # The classified refusal, not a mislabeled duplicate-CAS error.
+        assert str(outcome.get("error")) == "source_window_closed"
+        # No source renewal / CAS / provider send ever ran.
+        expected = [] if boundary == "pre_terminal" else ["before_provider"]
+        assert resolve_calls == expected
+        assert provider.posts == []
+        assert lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="provider_dispatch") is None
+        assert json_utf8(lane.cap._last_context_read) == json_utf8(lane.view)
+        # A timed-out capability refuses any later boundary callback on EITHER
+        # seam (fresh deadline AND the legacy direct one), without invoking it.
+        expected_calls = 2 if boundary == "worker" else 1
+        assert state["calls"] == expected_calls
+        with pytest.raises(B2BTerminalRefusal) as retry_exc:
+            recheck_context(lane.cap, lane.receipt,
+                            deadline=time.monotonic() + 5.0)
+        assert str(retry_exc.value) == "source_window_closed"
+        with pytest.raises(B2BTerminalRefusal) as retry_exc:
+            recheck_context(lane.cap, lane.receipt)
+        assert str(retry_exc.value) == "source_window_closed"
+        assert state["calls"] == expected_calls
+        assert lane.cap._last_context_read is last_read
+        assert getattr(lane.cap, "_context_recheck_timed_out", False) is True
+        # The context lock was released and stays reusable.
+        assert lane.cap._context_lock.acquire(timeout=1.0)
+        lane.cap._context_lock.release()
+        # Durable: source_denied on the pre-existing attempt; zero new rows.
+        _assert_zero_new_durable_rows(lane, baseline, expect_status="source_denied")
+    finally:
+        agent.client.close()
+        lane.store.close()
+        provider.stop()
+
+
+def test_execute_terminal_renews_source_after_final_c1_before_cas(
+        tmp_path, monkeypatch):
+    """Native /2 view through the REAL lane: C1(initial) -> resolve(initial) ->
+    client build -> C1(final) -> resolve(RENEWED) -> CAS -> exactly one SDK
+    call, dispatch+result persisted, the last C1 read published."""
+    events = []
+    views = {}
+    reads = {"n": 0}
+    ctx_seen = []
+
+    def _view_factory(policy, source_body):
+        # Real native-receipt UNIT DOUBLE view (ordered /2 projection).
+        return build_unit_native_oc_view(policy, source_body, ordered=True)
+
+    def _recheck(_cap):
+        reads["n"] += 1
+        events.append("c1")
+        # The callback runs under a copied context: the bound execution /
+        # profile scope must still resolve inside it.
+        ctx_seen.append(
+            current_execution(_cap.profile, _cap.session_id) is _cap)
+        return copy.deepcopy(views[min(reads["n"], 2)])
+
+    lane, provider, agent = _terminal_lane(
+        tmp_path, monkeypatch, view_factory=_view_factory, recheck=_recheck)
+    try:
+        # Fresh native reads with new view_refs: never a replayed receipt.
+        views[1] = renew_unit_oc_read(lane.view, read_id=2)
+        views[2] = renew_unit_oc_read(lane.view, read_id=3)
+        resolve_calls = []
+
+        def _resolve(entry, keys, purpose, **kw):
+            resolve_calls.append(purpose)
+            events.append("resolve")
+            return lane.resolved, "ok"
+        monkeypatch.setattr(b2b, "resolve_source", _resolve)
+        orig_cas = lane.sink.cas_dispatch
+
+        def _cas(**kw):
+            events.append("cas")
+            return orig_cas(**kw)
+        lane.sink.cas_dispatch = _cas
+        orig_with_options = agent.client.with_options
+
+        def _spy(**kw):
+            events.append("client")
+            return orig_with_options(**kw)
+        agent.client.with_options = _spy
+
+        token = bind_execution(lane.cap)
+        try:
+            response = execute_terminal(
+                agent, _api_kwargs(lane), lane.cap, turn_id=lane.turn_id)
+        finally:
+            reset_execution(token)
+
+        # The RENEWED before_provider exchange lands after the final C1 and
+        # before the durable CAS; the SDK send follows the committed marker.
+        assert resolve_calls == ["before_provider", "before_provider"]
+        assert events == ["c1", "resolve", "client", "c1", "resolve", "cas"]
+        assert len(provider.posts) == 1
+        assert lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="provider_dispatch") is not None
+        assert lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="provider_result") is not None
+        assert lane.store.b2b_attempt(
+            profile=lane.profile, attempt_id=lane.attempt_id)[
+                "status"] == "result_received"
+        assert response.choices[0].message.content
+        # The FINAL C1's fresh native read is the published last read.
+        assert lane.cap._last_context_read[
+            "operational_context"]["view"]["view_ref"] == "ocv_" + format(3, "032x")
+        # Both C1 invocations ran inside the copied execution/profile context.
+        assert ctx_seen == [True, True]
+    finally:
+        agent.client.close()
+        lane.store.close()
+        provider.stop()
+
+
+@pytest.mark.parametrize("scenario", ["expired_envelope", "clock_advance"])
+def test_execute_terminal_expired_renewal_at_cas_is_source_window_closed(
+        tmp_path, monkeypatch, scenario):
+    """The renewed before_provider exchange can arrive with its signed window
+    already closed -- or still valid but closed by the time dispatch records
+    are serialized: the sink must refuse ``source_window_closed`` at the final
+    CAS check -- never the duplicate-CAS ``dispatch_already_committed`` --
+    with zero SDK posts and zero new durable rows/artifacts."""
+    lane, provider, agent = _terminal_lane(tmp_path, monkeypatch)
+    try:
+        resolve_calls = []
+        renewal = {}
+
+        def _resolve(entry, keys, purpose, **kw):
+            resolve_calls.append(purpose)
+            if len(resolve_calls) == 1:
+                return lane.resolved, "ok"       # fresh initial exchange
+            if scenario == "expired_envelope":
+                return _resolved_with_window(lane, -5.0), "ok"
+            renewal["resolved"] = _resolved_with_window(lane, 30.0)
+            return renewal["resolved"], "ok"     # still-valid renewal
+        monkeypatch.setattr(b2b, "resolve_source", _resolve)
+
+        if scenario == "clock_advance":
+            # No wall sleep: a fake clock drives the sink's time.time; the
+            # dispatch-record serialization itself advances it past the renewed
+            # expires_at, so a stale check-time would wrongly commit.
+            fake_now = {"value": None}
+            real_time = time.time
+            monkeypatch.setattr(b2b, "time", types.SimpleNamespace(
+                time=lambda: (fake_now["value"]
+                              if fake_now["value"] is not None
+                              else real_time()),
+                monotonic=time.monotonic))
+            orig_ju = b2b.json_utf8
+
+            def _ju(value):
+                if (isinstance(value, dict) and value.get("format")
+                        == "dubsar.b2b-provider-dispatch/1"):
+                    fake_now["value"] = (
+                        renewal["resolved"]["_signed_request"]["expires_at"]
+                        + 60.0)
+                return orig_ju(value)
+            monkeypatch.setattr(b2b, "json_utf8", _ju)
+
+        baseline = _persisted_baseline(lane)
+        token = bind_execution(lane.cap)
+        try:
+            with pytest.raises(B2BTerminalRefusal) as exc:
+                execute_terminal(agent, _api_kwargs(lane), lane.cap,
+                                 turn_id=lane.turn_id)
+        finally:
+            reset_execution(token)
+        assert str(exc.value) == "source_window_closed"
+        assert len(resolve_calls) == 2          # initial + renewal
+        assert provider.posts == []
+        for kind in ("source_before_provider", "provider_dispatch",
+                     "provider_result", "proposal"):
+            assert lane.store.b2b_artifact(
+                attempt_id=lane.attempt_id, kind=kind) is None
+        _assert_zero_new_durable_rows(lane, baseline, expect_status="source_denied")
+    finally:
+        agent.client.close()
+        lane.store.close()
+        provider.stop()
+
+
+# ---------------------------------------------------------------------------
+# Seal-time C1 -- the sealing seam bounds its context recheck on the same
+# prospective signed window the provider-boundary checkpoints use; a blocking
+# callback can never hang finalization.
+# ---------------------------------------------------------------------------
+
+def test_seal_recheck_deadline_is_prospective(b2b_dispatch_lane):
+    """The seal-time C1 must fit inside the PROSPECTIVE ``before_seal``
+    exchange -- never the already-spent ``before_provider`` window: with an
+    EXPIRED provider exchange on the sink the seal deadline stays a full
+    prospective budget where ``context_recheck_deadline`` collapses."""
+    lane = b2b_dispatch_lane
+    lane.sink._before_provider = _resolved_with_window(lane, -5.0)
+    seal_budget = lane.sink.seal_recheck_deadline() - time.monotonic()
+    provider_budget = lane.sink.context_recheck_deadline() - time.monotonic()
+    prospective = (b2b._REQUEST_TTL_S
+                   - (b2b._SOURCE_DEADLINE_S + b2b._CONTEXT_RECHECK_SAFETY_S))
+    assert provider_budget <= 0 < seal_budget <= prospective + 0.5
+
+
+def test_seal_recheck_stalled_c1_refuses_source_window_closed(
+        b2b_dispatch_lane, monkeypatch):
+    """A producer callback that outlives the seal-time prospective window
+    refuses ``source_window_closed`` BEFORE it returns -- durable
+    ``source_denied``, the late result discarded, the lock reusable, the cap
+    refusing every later recheck on either seam."""
+    lane = b2b_dispatch_lane
+    monkeypatch.setattr(b2b, "_REQUEST_TTL_S", 1.5)
+    entered, release, finished = (threading.Event() for _ in range(3))
+
+    def _stalled(_cap):
+        entered.set()
+        try:
+            release.wait(30)
+            return copy.deepcopy(lane.view)
+        finally:
+            finished.set()
+
+    lane.cap.register_context_recheck(_stalled)
+    last_read = lane.cap._last_context_read
+    outcome = {}
+
+    def _drive():
+        try:
+            outcome["view"] = recheck_context(
+                lane.cap, lane.receipt,
+                deadline=lane.cap.sink.seal_recheck_deadline())
+        except Exception as exc:  # noqa: BLE001 -- asserted below
+            outcome["error"] = exc
+
+    driver = threading.Thread(target=_drive, daemon=True)
+    driver.start()
+    try:
+        assert entered.wait(5.0), "the C1 callback never started"
+        driver.join(timeout=5.0)    # outer guard: refusal << 30 s stall
+        assert not driver.is_alive(), (
+            "seal recheck did not refuse before the stalled callback returned")
+    finally:
+        release.set()
+        driver.join(timeout=10.0)
+    # The late callback ran to completion AFTER the refusal.
+    assert finished.wait(5.0)
+    assert str(outcome["error"]) == "source_window_closed"
+    assert lane.store.b2b_attempt(
+        profile=lane.profile, attempt_id=lane.attempt_id)[
+            "status"] == "source_denied"
+    # The timed-out cap refuses every later boundary callback on EITHER seam.
+    assert getattr(lane.cap, "_context_recheck_timed_out", False) is True
+    with pytest.raises(B2BTerminalRefusal) as retry_exc:
+        recheck_context(lane.cap, lane.receipt,
+                        deadline=time.monotonic() + 5.0)
+    assert str(retry_exc.value) == "source_window_closed"
+    with pytest.raises(B2BTerminalRefusal) as retry_exc:
+        recheck_context(lane.cap, lane.receipt)
+    assert str(retry_exc.value) == "source_window_closed"
+    assert lane.cap._last_context_read is last_read
+    assert lane.cap._context_lock.acquire(timeout=1.0)
+    lane.cap._context_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_b2b_finalize_seal_recheck_is_bounded(
+        b2b_dispatch_lane, monkeypatch):
+    """``_b2b_finalize`` hands the seal-time C1 the sink's prospective
+    deadline: a stalled producer ends the run ``failed`` with durable
+    ``source_denied`` -- the sealing path can never hang on a C1 callback."""
+    lane = b2b_dispatch_lane
+    _commit_dispatch(lane)
+    text = _proposal_text()
+    parsed, reason = validate_proposal(
+        text, extract_allowed_refs(lane.receipt.view))
+    assert parsed is not None, reason
+    lane.sink.commit_result(text=text, parsed=parsed, reason=reason)
+    # The fixture adapter only carries ``_b2b_state``; the profile scope the
+    # finalize path enters is a no-op here.
+    lane.adapter._profile_scope = lambda profile: contextlib.nullcontext()
+    monkeypatch.setattr(b2b, "_REQUEST_TTL_S", 1.5)
+    entered, release = threading.Event(), threading.Event()
+
+    def _stalled(_cap):
+        entered.set()
+        release.wait(30)
+        return copy.deepcopy(lane.view)
+
+    lane.cap.register_context_recheck(_stalled)
+    try:
+        status, fields, extra = await asyncio.wait_for(
+            bxe._b2b_finalize(
+                lane.cap, {"final_response": text}, "completed", {}),
+            timeout=10.0)
+        assert entered.is_set(), "the C1 callback never started"
+        assert status == "failed" and fields["error"] == "source_window_closed"
+        assert extra is None
+        assert lane.store.b2b_attempt(
+            profile=lane.profile, attempt_id=lane.attempt_id)[
+                "status"] == "source_denied"
+    finally:
+        release.set()
+
+
+# ---------------------------------------------------------------------------
+# Post-CAS budget overrun -- the dispatch gate sits BEFORE the committed CAS;
+# once cas_dispatch commits there is NO voluntary abort: a run budget spent BY
+# the CAS itself must not stop the send (an overrun, never an invented
+# retry) -- durable result_received, then the real seal path. The stale
+# watchdog is NEVER armed before the send: construction leaves
+# ``wd.stale_timeout`` at ``inf`` so the generic stale poll can never kill the
+# CAS or the fence work around it; the ONE arm lands on the actual ``create``
+# call with the validated policy timeout.
+#
+# Converted from the pass-4 post-CAS-window witness: real _AttemptSink, real
+# disk store, real ``_NonStreamRequest.run()`` (worker thread + poll loop),
+# real SDK -> loopback double. Only ``agent.chat_completion_helpers.time`` is
+# the controllable _FakeClock; the sink's signed-window checks, the store and
+# the source rechecks keep real clocks, exactly like production.
+# ---------------------------------------------------------------------------
+
+RUN_BUDGET_S = 10.0
+CAS_COST_S = 11.0
+
+
+@pytest.mark.parametrize(
+    "pause_phase", ["before_real_cas", "after_real_cas"],
+    ids=["pause_before_real_cas", "pause_after_real_cas_before_return"])
+@pytest.mark.parametrize(
+    "run_budget,policy_timeout",
+    [(None, None), (RUN_BUDGET_S, None), (RUN_BUDGET_S, 600)],
+    ids=["no-budget-default-5", "finite-budget-default-5",
+         "finite-budget-configured-600"])
+def test_b2b_post_cas_budget_overrun_still_sends_and_seals(
+        tmp_path, monkeypatch, pause_phase, run_budget, policy_timeout):
+    """A run budget still positive at the pre-CAS gate but spent INSIDE the
+    CAS wrapper leaves the send committed: real ``req.run()`` (inherited poll
+    loop + worker), real sink/store, real SDK -> loopback double. The held
+    ``cas_dispatch`` forces the poll to evaluate the EXHAUSTED budget while
+    the worker waits -- a real ``_stale_kill`` there would abort the
+    committed dispatch. With ``wd.stale_timeout`` held at ``inf`` until the
+    send there is no kill and no error: one real POST, durable
+    ``provider_result``/``result_received`` (never ``indeterminate``), then
+    ``_b2b_finalize``/``seal`` produce the proposal. The 11 simulated CAS
+    seconds also overrun the default 5s policy window, so a missing
+    ``request_timeout_seconds`` is covered the same as a configured 600.
+
+    ``before_real_cas`` holds BEFORE the real CAS (no committed marker yet);
+    ``after_real_cas`` holds AFTER the commit (marker already durable)."""
+    lane, provider, agent = _terminal_lane(
+        tmp_path, monkeypatch, request_timeout_seconds=policy_timeout)
+    # None policy -> the lane's default (5), never an explicit 5.
+    effective_timeout = (
+        float(policy_timeout) if policy_timeout is not None else 5.0)
+    request = None
+    driver = None
+    cas_hold = threading.Event()
+    try:
+        clock = _FakeClock(time.time())
+        monkeypatch.setattr(h, "time", clock)
+        if run_budget is not None:
+            agent.run_budget_seconds = run_budget
+            agent._run_budget_started_at = clock.time()
+
+        api_kwargs = copy.deepcopy(_api_kwargs(lane))
+        request = _B2BNonStreamRequest(
+            agent, api_kwargs, cap=lane.cap, receipt=lane.receipt,
+            request_digest=provider_request_digest(api_kwargs))
+        # No watchdog before the send: construction leaves the stale window
+        # at ``inf`` whether or not a run budget exists.
+        init_stale_timeout = request.wd.stale_timeout
+
+        second_poll = threading.Event()   # 2nd poll emit at the spent clock
+        killed = threading.Event()        # the REAL _stale_kill fired
+        release_ready = threading.Event() # either -> release the held CAS
+        evidence = {"pre_cas_remaining": None, "committed_status": None,
+                    "dispatch_marker_at_commit": None,
+                    "cas_entry_stale_timeout": None}
+        original_cas_dispatch = lane.sink.cas_dispatch
+
+        def cas_dispatch_witness(*, request_digest, receipt,
+                                 rechecked_view=None):
+            # The pre-CAS gate already passed: the REAL remaining-budget
+            # check is still positive (``inf`` with no budget installed).
+            remaining = request._remaining_run_budget()
+            evidence["pre_cas_remaining"] = remaining
+            assert remaining > 0, remaining
+            # CAS-entry stale window: still ``inf`` -- the accepted gate is a
+            # budget/cancel check only, it never arms a watchdog.
+            evidence["cas_entry_stale_timeout"] = request.wd.stale_timeout
+            if pause_phase == "before_real_cas":
+                # The wrapper spends 11s (past the 10s run budget AND the 5s
+                # default policy) and is HELD before the real CAS: the poll
+                # evaluates the spent clock while no committed marker exists
+                # yet.
+                clock.advance(CAS_COST_S)
+                assert cas_hold.wait(30.0), "held CAS never released"
+            committed = original_cas_dispatch(
+                request_digest=request_digest, receipt=receipt,
+                rechecked_view=rechecked_view)
+            assert committed is True
+            evidence["committed_status"] = lane.store.b2b_attempt(
+                profile=lane.profile, attempt_id=lane.attempt_id)["status"]
+            evidence["dispatch_marker_at_commit"] = (
+                lane.store.b2b_artifact(
+                    attempt_id=lane.attempt_id,
+                    kind="provider_dispatch") is not None)
+            if pause_phase == "after_real_cas":
+                # The CAS itself (proof validation, record serialization,
+                # disk CAS) consumed 11s -- past the 10s run budget AND the
+                # 5s default policy; the poll then evaluates the spent clock
+                # with the marker durable.
+                clock.advance(CAS_COST_S)
+                assert cas_hold.wait(30.0), "held CAS never released"
+            return committed
+
+        monkeypatch.setattr(lane.sink, "cas_dispatch", cas_dispatch_witness)
+
+        arm_calls = []
+        original_arm = request._arm_stale_window
+
+        def arm_spy(requested_timeout):
+            window = original_arm(requested_timeout)
+            arm_calls.append({
+                "requested": requested_timeout, "now": clock.time(),
+                "window": window, "stale_timeout": request.wd.stale_timeout})
+            return window
+
+        request._arm_stale_window = arm_spy
+
+        stale_kill_calls = []
+        original_kill = request._stale_kill
+
+        def kill_witness(elapsed):
+            # Record THEN invoke the real kill: a fired witness proves the
+            # poll's comparison ran (the client abort/TimeoutError is real),
+            # never a pass-by-call-count.
+            stale_kill_calls.append(elapsed)
+            killed.set()
+            release_ready.set()
+            return original_kill(elapsed)
+
+        request._stale_kill = kill_witness
+
+        poll = {"thread": None, "spent_emits": 0}
+        original_emit = request._emit_wait_notice
+
+        def emit_witness(elapsed, heartbeat=True):
+            original_emit(elapsed, heartbeat=heartbeat)
+            # Counted on the run/poll thread only, at the spent clock: a
+            # SECOND entry proves the prior iteration's stale comparison
+            # completed without killing.
+            if (threading.current_thread() is poll["thread"]
+                    and elapsed > RUN_BUDGET_S):
+                poll["spent_emits"] += 1
+                if poll["spent_emits"] >= 2:
+                    second_poll.set()
+                    release_ready.set()
+
+        request._emit_wait_notice = emit_witness
+
+        outcome = {}
+
+        def _drive():
+            poll["thread"] = threading.current_thread()
+            # The cap must be bound where run() spawns the worker -- the
+            # worker inherits THIS thread's ContextVars.
+            token = bind_execution(lane.cap)
+            try:
+                outcome["response"] = request.run()
+            except Exception as exc:  # noqa: BLE001 -- asserted below
+                outcome["error"] = exc
+            finally:
+                reset_execution(token)
+
+        driver = threading.Thread(target=_drive, daemon=True)
+        driver.start()
+
+        # Event-based, never a sleep: the poll must OBSERVE the spent budget
+        # while the CAS is held -- either a whole poll iteration survived it
+        # (second emit at the spent clock) or the real stale kill fired.
+        assert release_ready.wait(10.0), (
+            "poll never evaluated the exhausted run budget")
+        cas_hold.set()
+        driver.join(timeout=10.0)
+        assert not driver.is_alive()
+        if request.thread is not None:
+            request.thread.join(timeout=10.0)
+            assert not request.thread.is_alive()
+
+        # The pre-CAS gate passed -- ``inf`` when no run budget is installed,
+        # the full 10s otherwise; the real CAS committed durably before the
+        # budget ran out INSIDE it.
+        assert evidence["pre_cas_remaining"] == (
+            RUN_BUDGET_S if run_budget is not None else float("inf"))
+        assert evidence["committed_status"] == "dispatch_committed"
+        assert evidence["dispatch_marker_at_commit"] is True
+
+        # No stale kill, no error: ``wd.stale_timeout`` stayed ``inf`` until
+        # the send, so the spent run budget could not stop the committed
+        # dispatch -- exactly one POST, the provider observing the committed
+        # marker, durable provider_result / result_received.
+        assert stale_kill_calls == []
+        assert not killed.is_set()
+        assert outcome.get("error") is None
+        response = outcome.get("response")
+        assert response is not None
+        assert request.result["error"] is None
+        assert request.result["response"] is not None
+        assert len(provider.posts) == 1
+        obs = provider.db_observations[0]
+        assert obs["status"] == "dispatch_committed", obs
+        assert obs["provider_dispatch"] == 1 and obs["provider_result"] == 0, obs
+        assert lane.store.b2b_attempt(
+            profile=lane.profile, attempt_id=lane.attempt_id)[
+                "status"] == "result_received"
+        result_row = lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="provider_result")
+        assert result_row is not None
+        assert response.choices[0].message.content == json.loads(
+            result_row["payload"])["text"]
+
+        # Armed-window detail: ``inf`` from construction THROUGH the CAS
+        # entry (the accepted gate is budget/cancel-only, it never arms);
+        # exactly ONE arm, AT the send -- the full effective policy window
+        # (default 5 or configured 600) on the construction-origin clock, so
+        # the raw deadline is elapsed + effective_timeout.
+        assert init_stale_timeout == float("inf")
+        assert evidence["cas_entry_stale_timeout"] == float("inf")
+        assert [call["requested"] for call in arm_calls] == [effective_timeout]
+        assert arm_calls[0]["window"] == effective_timeout
+        assert arm_calls[0]["stale_timeout"] == CAS_COST_S + effective_timeout
+
+        # The real finalize/seal path: attested result -> sealed proposal.
+        lane.adapter._profile_scope = (
+            lambda profile: contextlib.nullcontext())
+
+        async def _seal_resolve(*a, **k):
+            return lane.resolved, "ok"
+        monkeypatch.setattr(b2b, "_resolve_source_async", _seal_resolve)
+        text = response.choices[0].message.content
+        status, fields, extra = asyncio.run(bxe._b2b_finalize(
+            lane.cap, {"final_response": text}, "completed", {}))
+        assert status == "completed" and fields["completed"] is True
+        assert extra["b2b"]["state"] == "prepared"
+        assert lane.store.b2b_attempt(
+            profile=lane.profile, attempt_id=lane.attempt_id)[
+                "status"] == "proposal_ready"
+        assert lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="proposal") is not None
+    finally:
+        cas_hold.set()
+        if driver is not None:
+            driver.join(timeout=10.0)
+        if request is not None and request.thread is not None:
+            request.thread.join(timeout=10.0)
+        if request is not None:
+            request.clients.close_once("post_cas_witness_teardown")
+        agent.client.close()
+        lane.store.close()
+        provider.stop()
+
+
+# ---------------------------------------------------------------------------
+# Provider window ends AT the SDK return (correction 8): the stale watchdog
+# covers ONLY ``client.chat.completions.create`` -- it excludes the local
+# validation, durable persistence, error handling and cleanup that follow it
+# (SQLite bounds their lock waits, never all local work), and a ``block()``
+# racing a durable provider_result can never degrade it to ``failed``.
+#
+# Real ``req.run()`` (inherited poll loop + worker), real disk store/sink,
+# real SDK -> loopback double. Only ``agent.chat_completion_helpers.time`` is
+# a controllable _FakeClock; the post-provider sink entry point
+# (``commit_result`` / ``block``) is held on events while the clock is
+# advanced PAST the armed window.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("outcome", ["success", "sdk_error"])
+def test_b2b_provider_window_ends_at_sdk_return(tmp_path, monkeypatch, outcome):
+    """The provider window disarms the moment the SDK call returns. The real
+    response (or the real SDK exception) lands at send+4.5s -- inside the
+    default 5s policy -- then the post-provider sink work is HELD while the
+    clock advances to send+8s, 3s past the armed window.
+
+    ``success``: the held real ``commit_result`` must survive >=2 whole poll
+    iterations at that clock -- zero ``_stale_kill``, no TimeoutError, durable
+    provider_result / result_received, then the real seal path reaches
+    proposal_ready. ``sdk_error``: the held real
+    ``block('provider_result_unavailable')`` survives the same past-window
+    polling -- still the normalized B2BTerminalRefusal (never a TimeoutError),
+    durable ``indeterminate``, no provider_result."""
+    lane, provider, agent = _terminal_lane(
+        tmp_path, monkeypatch,
+        fail_body=None if outcome == "success" else '{"error": "boom"}')
+    request = driver = None
+    hold_release = threading.Event()
+    try:
+        clock = _FakeClock(time.time())
+        monkeypatch.setattr(h, "time", clock)
+
+        api_kwargs = copy.deepcopy(_api_kwargs(lane))
+        request = _B2BNonStreamRequest(
+            agent, api_kwargs, cap=lane.cap, receipt=lane.receipt,
+            request_digest=provider_request_digest(api_kwargs))
+
+        send_at = {}
+        orig_with_options = agent.client.with_options
+
+        def _with_options(**kwargs):
+            clone = orig_with_options(**kwargs)
+            orig_create = clone.chat.completions.create
+
+            def _create(**kw):
+                send_at["value"] = clock.time()
+                try:
+                    # Real SDK send against the loopback double -- the
+                    # fake clock does not move during the wire call.
+                    return orig_create(**kw)
+                finally:
+                    # The provider answer (or SDK exception) lands at
+                    # send+4.5s -- inside the default 5s policy window.
+                    clock.now = send_at["value"] + 4.5
+
+            clone.chat.completions.create = _create
+            return clone
+
+        agent.client.with_options = _with_options
+
+        handler_stale_timeout = {}
+        hold_entered = threading.Event()
+        survived = threading.Event()   # >=2 poll iterations past the window
+        killed = threading.Event()     # the REAL _stale_kill fired
+        stale_kill_calls = []
+
+        if outcome == "success":
+            orig_commit = lane.sink.commit_result
+
+            def commit_result_hold(**kw):
+                handler_stale_timeout["value"] = request.wd.stale_timeout
+                hold_entered.set()
+                # The local durable write is held PAST the armed window.
+                clock.now = send_at["value"] + 8.0
+                hold_release.wait(60.0)
+                return orig_commit(**kw)
+
+            monkeypatch.setattr(lane.sink, "commit_result", commit_result_hold)
+        else:
+            orig_block = lane.sink.block
+
+            def block_hold(reason):
+                if reason == "provider_result_unavailable":
+                    handler_stale_timeout["value"] = request.wd.stale_timeout
+                    hold_entered.set()
+                    clock.now = send_at["value"] + 8.0
+                    hold_release.wait(60.0)
+                return orig_block(reason)
+
+            monkeypatch.setattr(lane.sink, "block", block_hold)
+
+        original_kill = request._stale_kill
+
+        def kill_witness(elapsed):
+            # Record THEN invoke the real kill: a fired witness proves the
+            # poll's comparison ran (client abort + TimeoutError are real),
+            # never a pass-by-call-count.
+            stale_kill_calls.append(elapsed)
+            killed.set()
+            return original_kill(elapsed)
+
+        request._stale_kill = kill_witness
+
+        poll = {"thread": None, "past_window": 0}
+        original_emit = request._emit_wait_notice
+
+        def emit_witness(elapsed, heartbeat=True):
+            original_emit(elapsed, heartbeat=heartbeat)
+            # Counted on the poll thread only, PAST the armed provider
+            # window: a second entry proves the prior iteration's stale
+            # comparison completed without killing.
+            if (threading.current_thread() is poll["thread"]
+                    and send_at.get("value") is not None
+                    and clock.time() > send_at["value"] + 5.0):
+                poll["past_window"] += 1
+                if poll["past_window"] >= 2:
+                    survived.set()
+
+        request._emit_wait_notice = emit_witness
+
+        outcome_result = {}
+
+        def _drive():
+            poll["thread"] = threading.current_thread()
+            # The cap must be bound where run() spawns the worker -- the
+            # worker inherits THIS thread's ContextVars.
+            token = bind_execution(lane.cap)
+            try:
+                outcome_result["response"] = request.run()
+            except Exception as exc:  # noqa: BLE001 -- asserted below
+                outcome_result["error"] = exc
+            finally:
+                reset_execution(token)
+
+        driver = threading.Thread(target=_drive, daemon=True)
+        driver.start()
+
+        # The post-provider handler must actually be reached; it holds with
+        # the clock already inside the armed window (send+4.5s).
+        assert hold_entered.wait(15.0), "post-provider handler never entered"
+        # Event-based, never a sleep: the poll must OBSERVE the past-window
+        # clock while the handler is held -- either >=2 whole poll iterations
+        # survived it or the real stale kill fired.
+        deadline = time.monotonic() + 15.0
+        while not survived.is_set() and not killed.is_set():
+            assert time.monotonic() < deadline, (
+                "poll never evaluated the clock past the provider window")
+            killed.wait(0.05)
+        if killed.is_set():
+            # Let the real kill land fully (the TimeoutError lands after the
+            # 2s worker await) BEFORE releasing the held handler.
+            driver.join(timeout=10.0)
+        hold_release.set()
+        driver.join(timeout=10.0)
+        assert not driver.is_alive()
+        if request.thread is not None:
+            request.thread.join(timeout=10.0)
+            assert not request.thread.is_alive()
+
+        # Zero kills past the SDK return: the provider window is the ONLY
+        # thing the watchdog covered -- exactly one real POST either way.
+        assert stale_kill_calls == []
+        assert not killed.is_set()
+        assert len(provider.posts) == 1
+
+        # Independent disk read of the durable outcome.
+        reopened = RunIdempotencyStore(str(lane.db_path))
+        try:
+            row = reopened.b2b_attempt(
+                profile=lane.profile, attempt_id=lane.attempt_id)
+            result_row = reopened.b2b_artifact(
+                attempt_id=lane.attempt_id, kind="provider_result")
+        finally:
+            reopened.close()
+
+        if outcome == "success":
+            assert outcome_result.get("error") is None
+            response = outcome_result.get("response")
+            assert response is not None
+            assert request.result["error"] is None
+            assert request.result["response"] is not None
+            assert row["status"] == "result_received"
+            assert result_row is not None
+            assert response.choices[0].message.content == json.loads(
+                result_row["payload"])["text"]
+        else:
+            # The SDK exception stays the normalized safe refusal -- never a
+            # TimeoutError and never claimed as success.
+            error = outcome_result.get("error")
+            assert isinstance(error, B2BTerminalRefusal)
+            assert str(error) == "provider_result_unavailable"
+            assert request.result["response"] is None
+            assert row["status"] == "indeterminate"
+            assert result_row is None
+
+        # The provider window ended AT the SDK return: the post-provider
+        # handler entered on an infinite stale window, still infinite after
+        # the worker's cleanup.
+        assert handler_stale_timeout["value"] == float("inf")
+        assert request.wd.stale_timeout == float("inf")
+
+        if outcome == "success":
+            # The real finalize/seal path: attested result -> sealed proposal.
+            lane.adapter._profile_scope = (
+                lambda profile: contextlib.nullcontext())
+
+            async def _seal_resolve(*a, **k):
+                return lane.resolved, "ok"
+
+            monkeypatch.setattr(b2b, "_resolve_source_async", _seal_resolve)
+            text = response.choices[0].message.content
+            status, fields, extra = asyncio.run(bxe._b2b_finalize(
+                lane.cap, {"final_response": text}, "completed", {}))
+            assert status == "completed" and fields["completed"] is True
+            assert extra["b2b"]["state"] == "prepared"
+            assert lane.store.b2b_attempt(
+                profile=lane.profile, attempt_id=lane.attempt_id)[
+                    "status"] == "proposal_ready"
+            assert lane.store.b2b_artifact(
+                attempt_id=lane.attempt_id, kind="proposal") is not None
+    finally:
+        hold_release.set()
+        if driver is not None:
+            driver.join(timeout=10.0)
+        if request is not None and request.thread is not None:
+            request.thread.join(timeout=10.0)
+        if request is not None:
+            request.clients.close_once("provider_window_teardown")
+        agent.client.close()
+        lane.store.close()
+        provider.stop()
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [("b2b_run_failed", "indeterminate"),
+     ("result_invalid", "result_invalid"),
+     ("source_window_closed", "source_denied")],
+    ids=["run_failed_is_indeterminate", "result_invalid_stays_known",
+         "source_denial_stays_known"])
+def test_block_received_durable_result_is_indeterminate(
+        tmp_path, monkeypatch, reason, expected):
+    """A paid, durable provider_result is never degraded to ``failed``: a
+    later ``block()`` on a ``result_received`` attempt with a failed-mapped
+    reason lands ``indeterminate`` -- the same mechanism as the existing
+    dispatch_committed arm -- while typed source/invalid refusals stay KNOWN
+    outcomes. The result_received row is produced by a real ``req.run()``
+    through ``execute_terminal`` -> real SDK -> loopback double; nothing
+    fabricates it."""
+    lane, provider, agent = _terminal_lane(tmp_path, monkeypatch)
+    try:
+        token = bind_execution(lane.cap)
+        try:
+            response = execute_terminal(
+                agent, _api_kwargs(lane), lane.cap, turn_id=lane.turn_id)
+        finally:
+            reset_execution(token)
+        assert response.choices[0].message.content
+        assert len(provider.posts) == 1
+        assert lane.store.b2b_attempt(
+            profile=lane.profile, attempt_id=lane.attempt_id)[
+                "status"] == "result_received"
+        payload_before = lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="provider_result")["payload"]
+
+        lane.sink.block(reason)
+
+        # Second disk connection: the durable status and the byte-identical
+        # paid payload, never an in-memory view of the store's connection.
+        reopened = RunIdempotencyStore(str(lane.db_path))
+        try:
+            row = reopened.b2b_attempt(
+                profile=lane.profile, attempt_id=lane.attempt_id)
+            result_row = reopened.b2b_artifact(
+                attempt_id=lane.attempt_id, kind="provider_result")
+        finally:
+            reopened.close()
+        assert row["status"] == expected
+        assert row["status"] != "failed"
+        assert result_row["payload"] == payload_before
+        assert len(provider.posts) == 1
     finally:
         agent.client.close()
         lane.store.close()
