@@ -531,11 +531,8 @@ async def run_internal_session_turn(self, *, session_id: str, text: str, profile
             # resolution the HTTP self-post consumes — a compressed origin must be woken on the
             # transcript that is actually live, never the retired parent slice. The central
             # seam owns tip resolution + lineage so a protected tip refuses before session/history.
-            from gateway.platforms.api_server_b2b_sessions import resolve_generic_session_id
-            resolved, guard_err = await resolve_generic_session_id(
-                self, session_id, resolve_tip=True)
-            if guard_err is not None:
-                raise RuntimeError("internal wake refused for a protected B2B session")
+            from gateway.platforms.api_server_b2b_sessions import resolve_internal_wake_session
+            resolved = await resolve_internal_wake_session(self, session_id)
             session = None
             db = await self._ensure_session_db_async()
             if db is not None:
@@ -754,9 +751,8 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     with self._profile_scope(run.request_profile):
         try:
             # Contextvars, not process env: concurrent runs must not share identity.
-            if run.b2b_execution is not None:
-                from agent.b2b_execution import bind_execution, reset_execution
-                resets.append((bind_execution(run.b2b_execution), reset_execution))
+            from gateway.platforms.api_server_b2b_execution import run_execution_resets
+            resets.extend(run_execution_resets(self, run))
             resets.append((set_current_session_key(run.approval_session_key), reset_current_session_key))
             # chat_id carries the raw session id like _run_agent() does; without it
             # tools.async_delegation sees no HERMES_SESSION_CHAT_ID and forces delegations sync.
@@ -885,6 +881,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     """Drive one admitted run, publish its terminal event/status, release live state."""
     _redact_api_error_text = _api_server._redact_api_error_text
     run_id, loop = run.run_id, asyncio.get_running_loop()
+    from gateway.platforms import api_server_b2b_execution as _b2b_exec
 
     def _text_cb(delta: Optional[str]) -> None:
         if delta is None or run_id not in self._run_streams:
@@ -923,33 +920,13 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
-        cap = run.b2b_execution
-        cap_token = None
-        if cap is not None:
-            from agent.b2b_execution import bind_execution
-            cap_token = bind_execution(cap)  # agent construction reads it through current_execution
-        try:
-            def _construct_agent():
-                with self._profile_scope(run.request_profile):
-                    return self._create_agent(
-                        stream_delta_callback=_text_cb,
-                        tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                        interim_assistant_callback=_interim_cb, **run.agent_kwargs)
-            if cap is None:
-                agent = _construct_agent()
-            else:
-                # B2B: cold AIAgent.__init__ (httpx import, client build) must not
-                # block the serving event loop — typed reads + control stay live.
-                # copy_context carries the bound execution across the worker;
-                # _submit_api_worker holds the worker's lifetime count.
-                from contextvars import copy_context
-                ctor_context = copy_context()
-                agent = await _submit_api_worker(
-                    loop, lambda: ctor_context.run(_construct_agent))
-        finally:
-            if cap_token is not None:
-                from agent.b2b_execution import reset_execution
-                reset_execution(cap_token)
+        def _construct_agent():
+            with self._profile_scope(run.request_profile):
+                return self._create_agent(
+                    stream_delta_callback=_text_cb,
+                    tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                    interim_assistant_callback=_interim_cb, **run.agent_kwargs)
+        agent = await _b2b_exec.construct_run_agent(self, run, _construct_agent, loop)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(
@@ -957,11 +934,12 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if not isinstance(result, dict):
             result = {}
         status, fields = terminal_run_status(result)
-        if cap is not None:
-            # B2B lanes: a nominal completed turn still needs before_seal + qualified
-            # recheck + source_basis equality + atomic seal; anything short of that is a
-            # classified blocked/terminal state, never "completed" without durable receipts.
-            status, fields, extra = await _b2b_finalize(cap, result, status, fields)
+        # A B2B lane's nominal turn still needs before_seal + qualified recheck +
+        # source_basis equality + atomic seal — the topical helper returns that
+        # classification; None means the ordinary native finish below applies.
+        finalized = await _b2b_exec.finalize_run(self, run, result, status, fields)
+        if finalized is not None:
+            status, fields, extra = finalized
             _finish(status, fields, **(extra or {}))
             return
         if status == "cancelled":
@@ -979,25 +957,19 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                               else "raw_request" if any(requested.values()) else "global"))
             _finish(status, fields, output=result.get("final_response", ""), usage=usage, runtime=served_runtime)
     except asyncio.CancelledError:
-        if run.b2b_execution is not None:
-            # The durable block is best-effort here: a failing sink must never
-            # replace the original CancelledError or skip the terminal finish.
-            with suppress(Exception):
-                run.b2b_execution.sink.block("native_run_interrupted")
+        # The durable block is best-effort inside the helper: a failing sink must
+        # never replace the original CancelledError or skip the terminal finish.
+        _b2b_exec.block_interrupted_run(self, run)
         _finish("cancelled")
         raise
     except _api_server._ProviderAuthResolutionError as exc:
         # Same controlled provider-auth message the _run_agent() endpoints give.
         logger.warning("Provider resolution failed for run=%s: %s", run_id, exc)
-        if run.b2b_execution is not None:
-            with suppress(Exception):
-                run.b2b_execution.sink.block("policy_provider_unavailable")
+        _b2b_exec.block_provider_unavailable_run(self, run)
         _finish("failed", error=exc.user_text())
     except Exception as exc:
         logger.exception("[api_server] run %s failed", run_id)
-        if run.b2b_execution is not None:
-            with suppress(Exception):
-                run.b2b_execution.sink.block(str(exc))
+        _b2b_exec.block_failed_run(self, run, exc)
         _finish("failed", error=_redact_api_error_text(exc))
     finally:
         # On cancellation (/stop) the executor thread may still block on an approval
@@ -1006,60 +978,6 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         with suppress(Exception):
             run.put_event(None)  # sentinel: close the SSE stream
         _retire_live_run(self, run_id)
-
-
-async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[str, Any]):
-    """Only worker-attested durable output can become a fully sealed proposal."""
-    from agent.b2b_execution import (
-        B2BTerminalRefusal, bind_execution, reset_execution, recheck_context, validate_proposal,
-        extract_allowed_refs)
-
-    sink = cap.sink
-
-    def blocked(reason, native_status="failed"):
-        sink.block(reason)
-        return native_status, {
-            **fields, "completed": False, "partial": False,
-            "interrupted": native_status in {"cancelled", "interrupted"}, "error": reason}, None
-
-    token = bind_execution(cap)
-    try:
-        with sink._adapter._profile_scope(cap.profile if cap.profile != "default" else None):
-            # First refusal wins: an attempt already blocked durably keeps its typed
-            # reason - never reclassify it as a later, unrelated family.
-            row = sink._store.b2b_attempt(profile=cap.profile, attempt_id=cap.attempt_id)
-            if row is not None and row["status"] not in {
-                    "admitted", "context_ready", "dispatch_committed", "result_received"}:
-                return blocked(row["status"], "interrupted" if row["status"] in
-                               {"cancelled", "interrupted"} else "failed")
-            receipt = cap.context_receipt
-            if receipt is None:
-                return blocked("context_unavailable")
-            if result.get("failed") or status != "completed":
-                return blocked("b2b_run_failed", status if status in {"cancelled", "interrupted"} else "failed")
-            artifact = sink._store.b2b_artifact(attempt_id=cap.attempt_id, kind="provider_result")
-            if artifact is None:
-                return blocked("result_unattested")
-            public = json.loads(artifact["payload"])
-            parsed, _ = validate_proposal(public["text"], extract_allowed_refs(receipt.view))
-            if (parsed is None or parsed != public.get("proposal") or
-                    result.get("final_response", "").strip() != public["text"].strip()):
-                return blocked("result_invalid")
-            # The rechecker runs in the copied profile/capability scope; original context stays immutable.
-            fresh = await asyncio.to_thread(recheck_context, cap, receipt)
-            source = await sink.resolve_before_seal()
-            if source is None:
-                return blocked("source_before_seal_denied")
-            proposal = sink.seal(
-                source_before_seal=source, rechecked_view=fresh,
-                created_at=dt.datetime.now(dt.timezone.utc).isoformat())
-            return "completed", {**fields, "completed": True}, {
-                "output": json.dumps(parsed, ensure_ascii=False),
-                "b2b": {key: proposal[key] for key in ("proposal_id", "state", "created_at")}}
-    except B2BTerminalRefusal as exc:
-        return blocked(str(exc))
-    finally:
-        reset_execution(token)
 
 
 def _unregister_approval_notify(approval_session_key: Optional[str]) -> None:
@@ -1079,25 +997,29 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
         self._run_owners.pop(run_id, None)
 
 
-def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
-    try:
-        if self._run_idempotency_store.b2b_is_run(run_id) is True:
-            return False
-    except Exception:
-        return False
+async def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
     scope = self._run_idempotency_scope(request)
     owner = self._run_owners.get(run_id)
     if owner is not None:
+        # The stamped owner answers FIRST — zero store I/O on every lane. Typed
+        # B2B admissions stamp a distinct ``b2b:`` scope, so a foreign generic
+        # caller still fails this equality check.
         return owner == scope
-    # No in-memory owner: only a durable record under the caller's scope admits it.
+    # Ownerless run: the topical gate decides B2B visibility first (enabled
+    # lanes hide durable attempt runs; disabled lanes skip the lookup), then
+    # the native durable scope check — SQLite off the event loop.
+    from gateway.platforms.api_server_b2b_execution import generic_run_visible
+    if not await generic_run_visible(self, run_id):
+        return False
+    # Only a durable record under the caller's scope admits it.
     # Under multiplex_profiles every profile holds a valid key, so ownerless = allow-all.
     # Run state that exists without an owner stamp is an unanswered authorization question, not a run anyone
     # may control — under gateway.multiplex_profiles every served profile holds a valid key, so admitting it
     # would make the boundary allow-all (#93689).
-    return self._run_idempotency_store.owns_run(scope, run_id)
+    return await asyncio.to_thread(self._run_idempotency_store.owns_run, scope, run_id)
 
 
-def _load_owned_run(self, request, *, _api_server, permission: Optional[str], active_fallback: bool):
+async def _load_owned_run(self, request, *, _api_server, permission: Optional[str], active_fallback: bool):
     """Authenticate (*permission* -> room-grant aware; ``None`` -> API key only) and resolve
     ``(run_id, status, agent, task, error)``; *active_fallback* reports a live in-process run
     without pollable status as ``running`` instead of 404."""
@@ -1106,7 +1028,7 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
         return None, None, None, None, auth_err
     _openai_error = _api_server._openai_error
     run_id = request.match_info["run_id"]
-    if not self._request_owns_run(request, run_id):
+    if not await self._request_owns_run(request, run_id):
         return run_id, None, None, None, _run_not_found(_openai_error, run_id)
     agent = self._active_run_agents.get(run_id)
     task = self._active_run_tasks.get(run_id)
@@ -1120,7 +1042,7 @@ def _load_owned_run(self, request, *, _api_server, permission: Optional[str], ac
 
 async def _handle_get_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """GET /v1/runs/{run_id} — return pollable run status for external UIs."""
-    _, status, _, _, err = _load_owned_run(
+    _, status, _, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="status", active_fallback=True)
     return err or web.json_response(status)
 
@@ -1131,7 +1053,7 @@ async def _handle_run_events(self, request: "web.Request", *, _api_server) -> "w
     if auth_err:
         return auth_err
     run_id = request.match_info["run_id"]
-    if not self._request_owns_run(request, run_id):
+    if not await self._request_owns_run(request, run_id):
         return _run_not_found(_api_server._openai_error, run_id)
     # Allow subscribing slightly before the run is registered (race window).
     # Confirm the force-kill actually reaped the process before we clear its PID file / scoped locks.
@@ -1184,7 +1106,7 @@ _APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "onc
 async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
     _openai_error = _api_server._openai_error
-    run_id, _, _, _, err = _load_owned_run(
+    run_id, _, _, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="approve", active_fallback=False)
     if err is not None:
         return err
@@ -1235,7 +1157,7 @@ async def _handle_run_approval(self, request: "web.Request", *, _api_server) -> 
 async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
     _openai_error = _api_server._openai_error
-    run_id, status, agent, _, err = _load_owned_run(
+    run_id, status, agent, _, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission=None, active_fallback=False)
     if err is not None:
         return err
@@ -1269,7 +1191,7 @@ async def _handle_steer_run(self, request: "web.Request", *, _api_server) -> "we
 async def _handle_stop_run(self, request: "web.Request", *, _api_server) -> "web.Response":
     """POST /v1/runs/{run_id}/stop — interrupt a running agent."""
     _openai_error = _api_server._openai_error
-    run_id, status, agent, task, err = _load_owned_run(
+    run_id, status, agent, task, err = await _load_owned_run(
         self, request, _api_server=_api_server, permission="stop", active_fallback=True)
     if err is not None:
         return err

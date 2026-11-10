@@ -195,6 +195,104 @@ def list_b2b_filtered_sessions(db: Any, *, source, limit: int, offset: int,
     return page + [p for p in pins if p.get("id") not in seen]
 
 
+async def list_generic_sessions(adapter: Any, db: Any, *, source, limit: int,
+                                offset: int, include_children: bool, title_filter,
+                                include_hidden: bool) -> list:
+    """``GET /api/sessions`` row source of truth. Absent/disabled lane: the
+    ONE native ``list_sessions_rich`` call this surface always made — the
+    caller's own offset/limit, pins back-filled, zero ancestry work. Enabled:
+    the protected-lineage filtered scan in ``list_b2b_filtered_sessions``.
+    Exact-title filtering stays the caller's job."""
+    state = _state_for(adapter)
+    if state is None or not getattr(state.config, "enabled", False):
+        # include_pinned back-fills pins past the recency window; search_query pushes the
+        # title needle into SQL (substring) so a hidden/old row is found, exact match above.
+        return await asyncio.to_thread(
+            db.list_sessions_rich, source=source, limit=limit, offset=offset,
+            include_children=include_children, order_by_last_active=True, include_pinned=True,
+            search_query=title_filter, include_hidden=include_hidden)
+    # Reserved-namespace rows must be excluded BEFORE the visible offset/limit
+    # is counted — a post-limit filter produces missing/duplicated ordinary pages.
+    return await asyncio.to_thread(
+        list_b2b_filtered_sessions, db, source=source, limit=limit,
+        offset=offset, include_children=include_children,
+        title_filter=title_filter, include_hidden=include_hidden)
+
+
+def validate_genesis_creation(adapter: Any, body: Any, raw_id: Any, session_id: str):
+    """``POST /api/sessions`` reserved-namespace gate -> ``(session_id, error)``.
+
+    Non-reserved ids return unchanged with zero work — the cheap namespace
+    contract holds on EVERY lane, disabled included. The ONLY generic create on
+    the reserved namespace is EXACTLY ``{"id": <b2b_…>, "source": "api_server"}``
+    — the literal id string, mandatory source, no alias and no other key (even
+    null) — under a real configured API key.
+    """
+    from agent.b2b_execution import is_b2b_session_id
+    if not (is_b2b_session_id(session_id) or is_b2b_session_id(raw_id)):
+        return session_id, None
+    exact = (set(body.keys()) == {"id", "source"}
+             and body.get("source") == "api_server"
+             and is_b2b_session_id(body.get("id"))
+             and adapter._expected_api_key())
+    if not exact:
+        from gateway.platforms.api_server import _error_response
+        return None, _error_response(
+            "B2B namespace sessions accept closed genesis creation only",
+            400, code="invalid_session_id")
+    return str(body["id"]), None  # exact, no strip/alias/normalize
+
+
+def guard_fork_destination(adapter: Any, fork_id: Any):
+    """``POST /api/sessions/{id}/fork`` destination gate -> error or ``None``.
+    A reserved ``b2b_`` fork id is a not-found on every lane — cheap namespace
+    contract, no state/store work."""
+    from agent.b2b_execution import is_b2b_session_id
+    if is_b2b_session_id(fork_id):
+        from gateway.platforms.api_server import _error_response
+        return _error_response(
+            f"Session not found: {fork_id}", 404, code="session_not_found")
+    return None
+
+
+async def resolve_internal_wake_session(adapter: Any, session_id: Any):
+    """In-process ``gateway.wake`` session resolution -> the selected tip id,
+    or the same native ``RuntimeError`` the generic site raised on a protected
+    refusal. The seam keeps tip resolution + lineage on both directions."""
+    resolved, guard_err = await resolve_generic_session_id(
+        adapter, session_id, resolve_tip=True)
+    if guard_err is not None:
+        raise RuntimeError("internal wake refused for a protected B2B session")
+    return resolved
+
+
+async def resolve_history_session(adapter: Any, session_id: Any, db: Any = None):
+    """History-path session resolution -> the validated id, or raises the
+    native ``RuntimeError`` the facade's history loader always raised on a
+    guarded refusal. The seam keeps its own gating semantics."""
+    resolved, guard_err = await resolve_generic_session_id(
+        adapter, session_id, db=db)
+    if guard_err is not None:
+        raise RuntimeError("protected B2B session history request refused")
+    return resolved
+
+
+async def get_generic_session(adapter: Any, session_id: Any):
+    """``GET /api/sessions/{id}`` orchestration: ordinary ids take the native
+    ``_get_existing_session_or_404`` + exact response; a reserved id's only
+    generic exception (empty unbound L2a genesis) lives in
+    ``get_reserved_genesis_session`` — disabled lanes included."""
+    _sid, guard_err = guarded_session_id(adapter, session_id)
+    if guard_err is None:
+        session, err = await adapter._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        from aiohttp import web
+        return web.json_response(
+            {"object": "hermes.session", "session": adapter._session_response(session)})
+    return await get_reserved_genesis_session(adapter, session_id, guard_err)
+
+
 async def get_reserved_genesis_session(adapter: Any, session_id: Any, guard_err: Any):
     """Reserved ``b2b_`` id: the ONE generic exception is an exact GET of a
     demonstrably EMPTY, UNBOUND L2a genesis row (pre-binding only) under a REAL

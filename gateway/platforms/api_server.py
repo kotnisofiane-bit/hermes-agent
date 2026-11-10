@@ -2211,37 +2211,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
         session ``/model`` override, disables the fallback chain and fails closed."""
-        from agent.b2b_execution import (
-            B2BTerminalRefusal, is_b2b_session_id, current_execution)
-        _b2b_lane = bool(session_id) and is_b2b_session_id(str(session_id))
-        if not _b2b_lane and current_execution() is not None:
-            raise B2BTerminalRefusal("b2b_capability_mismatch")
-        if _b2b_lane:
-            # A B2B-session turn is ONLY legal inside an admitted binding whose cap is
-            # bound to this context — anything else (foreign lane, stale scope, caller
-            # that reached _create_agent without admission) fails closed BEFORE runtime
-            # config resolution, credential reads or memory checkout.
-            from hermes_constants import get_hermes_home
-            cap = current_execution(profile=_api_request_profile.get() or "default",
-                                    session_id=str(session_id))
-            if (cap is None or str(get_hermes_home().resolve()) != cap.policy_get("profile_home") or
-                    not cap.sink.assert_current_policy()):
-                raise B2BTerminalRefusal("b2b_capability_mismatch")
-            project = cap.policy_get("project")
-            if (ephemeral_system_prompt is not None or gateway_session_key is not None or
-                    room_dispatch is not None or room_execution_policy is not None or
-                    session_model is not None or model_options is not None or route is not None or
-                    requested_model not in (None, project["model"]) or
-                    requested_provider not in (None, project["provider"])):
-                raise B2BTerminalRefusal("b2b_policy_override")
-            # H1: B2B runtime construction is WITHDRAWN. AIAgent.__init__ can reach
-            # the provider before any bounded policy could be installed (lazy
-            # context_length metadata probes), so the admitted attempt refuses
-            # durably here — before run_agent import, runtime/credential/tool
-            # resolution or memory checkout. A governed construction path returns
-            # with C1's context producer.
-            cap.sink.block("context_unavailable")
-            raise B2BTerminalRefusal("context_unavailable")
+        from gateway.platforms.api_server_b2b_execution import guard_agent_construction
+        guard_agent_construction(
+            self, session_id=session_id,
+            ephemeral_system_prompt=ephemeral_system_prompt,
+            gateway_session_key=gateway_session_key, room_dispatch=room_dispatch,
+            room_execution_policy=room_execution_policy, session_model=session_model,
+            model_options=model_options, route=route,
+            requested_model=requested_model, requested_provider=requested_provider)
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
@@ -2907,10 +2884,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return session, None
 
     async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
-        from gateway.platforms.api_server_b2b_sessions import resolve_generic_session_id
-        session_id, guard_err = await resolve_generic_session_id(self, session_id)
-        if guard_err is not None:
-            raise RuntimeError("protected B2B session history request refused")
+        from gateway.platforms.api_server_b2b_sessions import resolve_history_session
+        session_id = await resolve_history_session(self, session_id, None)
         db = await self._ensure_session_db_async()
         if db is None:
             return []
@@ -2944,29 +2919,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         include_hidden = bool(title_filter) and _coerce_request_bool(
             request.query.get("include_hidden"), default=False)
 
-        _b2b_state = getattr(self, "_b2b_state", None)
-        _b2b_listing = bool(
-            _b2b_state is not None and getattr(_b2b_state.config, "enabled", False))
-
         async def _list() -> list:
-            if _b2b_listing:
-                # Reserved-namespace rows must be excluded BEFORE the visible
-                # offset/limit is counted — a post-limit filter produces
-                # missing/duplicated ordinary pages. The scan lives in a
-                # dedicated sibling; the enabled lane only.
-                from gateway.platforms.api_server_b2b_sessions import (
-                    list_b2b_filtered_sessions)
-                rows = await asyncio.to_thread(
-                    list_b2b_filtered_sessions, db, source=source, limit=limit,
-                    offset=offset, include_children=include_children,
-                    title_filter=title_filter, include_hidden=include_hidden)
-            else:
-                # include_pinned back-fills pins past the recency window; search_query pushes the
-                # title needle into SQL (substring) so a hidden/old row is found, exact match below.
-                rows = await asyncio.to_thread(
-                    db.list_sessions_rich, source=source, limit=limit, offset=offset,
-                    include_children=include_children, order_by_last_active=True, include_pinned=True,
-                    search_query=title_filter, include_hidden=include_hidden)
+            # Row source of truth lives in the topical sibling: one native call
+            # on the ordinary lane, the protected-lineage scan when enabled.
+            from gateway.platforms.api_server_b2b_sessions import list_generic_sessions
+            rows = await list_generic_sessions(
+                self, db, source=source, limit=limit, offset=offset,
+                include_children=include_children, title_filter=title_filter,
+                include_hidden=include_hidden)
             if title_filter:
                 rows = [s for s in rows if (s.get("title") or "").strip() == title_filter]
             return rows
@@ -3011,20 +2971,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return self._session_db_unavailable()
         raw_id = body.get("id") or body.get("session_id")
         session_id = str(raw_id).strip() if raw_id else f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}"
-        from agent.b2b_execution import is_b2b_session_id
-        _reserved_b2b = is_b2b_session_id(session_id) or is_b2b_session_id(raw_id)
-        if _reserved_b2b:
-            # L2a closed-create exception: the ONLY generic create on the reserved
-            # namespace is EXACTLY {"id": <b2b_…>, "source": "api_server"} — the literal
-            # id string, mandatory source, no alias and no other key (even null).
-            _exact = (set(body.keys()) == {"id", "source"}
-                      and body.get("source") == "api_server"
-                      and is_b2b_session_id(body.get("id"))
-                      and self._expected_api_key())
-            if not _exact:
-                return _error_response("B2B namespace sessions accept closed genesis creation only",
-                                       400, code="invalid_session_id")
-            session_id = str(body["id"])  # exact, no strip/alias/normalize
+        # Reserved-namespace closed-create contract lives in the topical sibling.
+        from gateway.platforms.api_server_b2b_sessions import validate_genesis_creation
+        session_id, genesis_err = validate_genesis_creation(self, body, raw_id, session_id)
+        if genesis_err is not None:
+            return genesis_err
         from gateway.session import _is_path_unsafe
         if not session_id or re.search(r'[\r\n\x00]', session_id) or _is_path_unsafe(session_id):
             return _error_response("Invalid session ID", 400, code="invalid_session_id")
@@ -3083,22 +3034,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_get_session(self, request: "web.Request") -> "web.Response":
-        """GET /api/sessions/{session_id}."""
+        """GET /api/sessions/{session_id} — ordinary + reserved orchestration
+        lives in the topical sibling; this stays a thin delegate."""
         session_id = request.match_info["session_id"]
-        from gateway.platforms.api_server_b2b import guarded_session_id
-        _sid, guard_err = guarded_session_id(self, session_id)
-        if guard_err is None:
-            session, err = await self._get_existing_session_or_404(session_id)
-            if err:
-                return err
-            return web.json_response(
-                {"object": "hermes.session", "session": self._session_response(session)})
-        # Reserved b2b_ id: the ONE generic exception (exact GET of a demonstrably
-        # EMPTY, UNBOUND L2a genesis row) is orchestrated in the dedicated
-        # sibling — this facade stays a thin delegate.
-        from gateway.platforms.api_server_b2b_sessions import (
-            get_reserved_genesis_session)
-        return await get_reserved_genesis_session(self, session_id, guard_err)
+        from gateway.platforms.api_server_b2b_sessions import get_generic_session
+        return await get_generic_session(self, session_id)
 
     @_require_auth
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
@@ -3207,9 +3147,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
         if not fork_id or re.search(r'[\r\n\x00]', fork_id):
             return _error_response("Invalid session ID", 400, code="invalid_session_id")
-        from agent.b2b_execution import is_b2b_session_id
-        if is_b2b_session_id(fork_id):
-            return _error_response(f"Session not found: {fork_id}", 404, code="session_not_found")
+        from gateway.platforms.api_server_b2b_sessions import guard_fork_destination
+        fork_err = guard_fork_destination(self, fork_id)
+        if fork_err is not None:
+            return fork_err
         if await asyncio.to_thread(db.get_session, fork_id):
             return _error_response(f"Session already exists: {fork_id}", 409, code="session_exists")
 
@@ -4257,8 +4198,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         return await _api_runs._handle_runs(self, request, _api_server=sys.modules[__name__])
 
-    def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
-        return _api_runs._request_owns_run(self, request, run_id)
+    async def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
+        return await _api_runs._request_owns_run(self, request, run_id)
 
     def _release_run_owner_if_forgotten(self, run_id: str) -> None:
         _api_runs._release_run_owner_if_forgotten(self, run_id)
