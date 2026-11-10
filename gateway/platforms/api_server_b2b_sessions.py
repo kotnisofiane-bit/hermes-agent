@@ -3,7 +3,8 @@
 ``resolve_generic_session_id`` is the single validation seam every generic
 session-addressing route funnels through. ``list_b2b_filtered_sessions``
 back-fills ``GET /api/sessions`` rows on the enabled lane; both share the one
-``_protected_lineage`` ancestor walk.
+``_protected_lineage`` ancestor walk. ``get_reserved_genesis_session`` owns the
+single reserved-id GET exception — an empty, unbound L2a genesis row.
 """
 
 import asyncio
@@ -192,3 +193,34 @@ def list_b2b_filtered_sessions(db: Any, *, source, limit: int, offset: int,
     page = visible[offset:offset + limit] if limit else []
     seen = {s.get("id") for s in page}
     return page + [p for p in pins if p.get("id") not in seen]
+
+
+async def get_reserved_genesis_session(adapter: Any, session_id: Any, guard_err: Any):
+    """Reserved ``b2b_`` id: the ONE generic exception is an exact GET of a
+    demonstrably EMPTY, UNBOUND L2a genesis row (pre-binding only) under a REAL
+    native key and a durable store. Anything else — auth-disabled,
+    missing/durable-less store, bound row under ANY profile, non-empty session —
+    is the caller's plain 404 ``guard_err``. No writes. Called only after
+    ``guarded_session_id`` already denied the id."""
+    from aiohttp import web
+    from gateway.platforms.api_server import _api_request_profile
+    from gateway.platforms.api_server_b2b import _genesis_vs_native, _store_durable
+    if not adapter._expected_api_key():
+        return guard_err
+    db = await adapter._ensure_session_db_async()
+    if db is None:
+        return adapter._session_db_unavailable()
+    store = getattr(adapter, "_run_idempotency_store", None)
+    if not _store_durable(store):
+        return guard_err
+    session = await asyncio.to_thread(db.get_session, session_id)
+    if not _genesis_vs_native(session or {}, session_id,
+                              _api_request_profile.get() or "default"):
+        return guard_err
+    try:
+        if store.b2b_binding(session_id=session_id) is not None:
+            return guard_err
+    except Exception:
+        return guard_err  # fail closed on lookup error
+    return web.json_response(
+        {"object": "hermes.session", "session": adapter._session_response(session)})

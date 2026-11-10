@@ -3093,31 +3093,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return err
             return web.json_response(
                 {"object": "hermes.session", "session": self._session_response(session)})
-        # Reserved b2b_ id: the ONE generic exception is an exact GET of a demonstrably
-        # EMPTY, UNBOUND L2a genesis row (pre-binding only) under a REAL native key and a
-        # durable store. Anything else — auth-disabled, missing/durable-less store, bound
-        # row under ANY profile, non-empty session — is a plain 404. No writes.
-        from gateway.platforms.api_server_b2b import _genesis_vs_native, _store_durable
-        if not self._expected_api_key():
-            return guard_err
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return self._session_db_unavailable()
-        store = getattr(self, "_run_idempotency_store", None)
-        if not _store_durable(store):
-            return guard_err
-        from gateway.platforms.api_server import _api_request_profile
-        session = await asyncio.to_thread(db.get_session, session_id)
-        if not _genesis_vs_native(session or {}, session_id,
-                                  _api_request_profile.get() or "default"):
-            return guard_err
-        try:
-            if store.b2b_binding(session_id=session_id) is not None:
-                return guard_err
-        except Exception:
-            return guard_err  # fail closed on lookup error
-        return web.json_response(
-            {"object": "hermes.session", "session": self._session_response(session)})
+        # Reserved b2b_ id: the ONE generic exception (exact GET of a demonstrably
+        # EMPTY, UNBOUND L2a genesis row) is orchestrated in the dedicated
+        # sibling — this facade stays a thin delegate.
+        from gateway.platforms.api_server_b2b_sessions import (
+            get_reserved_genesis_session)
+        return await get_reserved_genesis_session(self, session_id, guard_err)
 
     @_require_auth
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
