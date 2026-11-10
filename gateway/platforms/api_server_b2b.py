@@ -903,10 +903,17 @@ class _AttemptSink:
         # reason in the exception string — classify on their prefix.
         status = _BLOCK_STATUS.get(reason.partition(":")[0], "failed")
         row = self._store.b2b_attempt(profile=self.profile, attempt_id=self.attempt_id)
-        if (row is not None and row["status"] == "dispatch_committed" and
-                self._store.b2b_artifact(attempt_id=self.attempt_id, kind="provider_result") is None
-                and status != "result_invalid"):
-            status = "indeterminate"
+        # A block() racing the provider outcome is indeterminate, never failed:
+        # committed-without-result may have reached the provider, and a durable
+        # provider_result is a paid answer that must not be degraded — only a
+        # proven-invalid result stays a KNOWN outcome.
+        if (row is not None and status != "result_invalid" and
+                row["status"] in ("dispatch_committed", "result_received")):
+            provider_result = self._store.b2b_artifact(
+                attempt_id=self.attempt_id, kind="provider_result")
+            if ((row["status"] == "dispatch_committed" and provider_result is None) or
+                    (row["status"] == "result_received" and provider_result is not None)):
+                status = "indeterminate"
         self._store.b2b_update_attempt(profile=self.profile, attempt_id=self.attempt_id, status=status)
 
     def resolve_before_provider(self) -> bool:

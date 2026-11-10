@@ -142,7 +142,12 @@ class _B2BNonStreamRequest(_NonStreamRequest):
             # post-CAS voluntary stop. Explicit interrupts and network
             # failures retain their existing behavior.
             self._arm_stale_window(float(self.api_kwargs["timeout"]))
-            response = client.chat.completions.create(**self.api_kwargs)
+            try:
+                response = client.chat.completions.create(**self.api_kwargs)
+            finally:
+                # The provider window ends on response or SDK error, before
+                # local validation, SQLite persistence and client cleanup.
+                self.wd.stale_timeout = float("inf")
             # Validate + persist the public result BEFORE the response is
             # visible to the loop/transcript -- a rejected shape never leaves the
             # worker as a "completed" response (tools/reasoning/private bytes ->

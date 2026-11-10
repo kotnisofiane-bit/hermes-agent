@@ -1379,3 +1379,292 @@ def test_b2b_post_cas_budget_overrun_still_sends_and_seals(
         agent.client.close()
         lane.store.close()
         provider.stop()
+
+
+# ---------------------------------------------------------------------------
+# Provider window ends AT the SDK return (correction 8): the stale watchdog
+# covers ONLY ``client.chat.completions.create`` -- it excludes the local
+# validation, durable persistence, error handling and cleanup that follow it
+# (SQLite bounds their lock waits, never all local work), and a ``block()``
+# racing a durable provider_result can never degrade it to ``failed``.
+#
+# Real ``req.run()`` (inherited poll loop + worker), real disk store/sink,
+# real SDK -> loopback double. Only ``agent.chat_completion_helpers.time`` is
+# a controllable _FakeClock; the post-provider sink entry point
+# (``commit_result`` / ``block``) is held on events while the clock is
+# advanced PAST the armed window.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("outcome", ["success", "sdk_error"])
+def test_b2b_provider_window_ends_at_sdk_return(tmp_path, monkeypatch, outcome):
+    """The provider window disarms the moment the SDK call returns. The real
+    response (or the real SDK exception) lands at send+4.5s -- inside the
+    default 5s policy -- then the post-provider sink work is HELD while the
+    clock advances to send+8s, 3s past the armed window.
+
+    ``success``: the held real ``commit_result`` must survive >=2 whole poll
+    iterations at that clock -- zero ``_stale_kill``, no TimeoutError, durable
+    provider_result / result_received, then the real seal path reaches
+    proposal_ready. ``sdk_error``: the held real
+    ``block('provider_result_unavailable')`` survives the same past-window
+    polling -- still the normalized B2BTerminalRefusal (never a TimeoutError),
+    durable ``indeterminate``, no provider_result."""
+    lane, provider, agent = _terminal_lane(
+        tmp_path, monkeypatch,
+        fail_body=None if outcome == "success" else '{"error": "boom"}')
+    request = driver = None
+    hold_release = threading.Event()
+    try:
+        clock = _FakeClock(time.time())
+        monkeypatch.setattr(h, "time", clock)
+
+        api_kwargs = copy.deepcopy(_api_kwargs(lane))
+        request = _B2BNonStreamRequest(
+            agent, api_kwargs, cap=lane.cap, receipt=lane.receipt,
+            request_digest=provider_request_digest(api_kwargs))
+
+        send_at = {}
+        orig_with_options = agent.client.with_options
+
+        def _with_options(**kwargs):
+            clone = orig_with_options(**kwargs)
+            orig_create = clone.chat.completions.create
+
+            def _create(**kw):
+                send_at["value"] = clock.time()
+                try:
+                    # Real SDK send against the loopback double -- the
+                    # fake clock does not move during the wire call.
+                    return orig_create(**kw)
+                finally:
+                    # The provider answer (or SDK exception) lands at
+                    # send+4.5s -- inside the default 5s policy window.
+                    clock.now = send_at["value"] + 4.5
+
+            clone.chat.completions.create = _create
+            return clone
+
+        agent.client.with_options = _with_options
+
+        handler_stale_timeout = {}
+        hold_entered = threading.Event()
+        survived = threading.Event()   # >=2 poll iterations past the window
+        killed = threading.Event()     # the REAL _stale_kill fired
+        stale_kill_calls = []
+
+        if outcome == "success":
+            orig_commit = lane.sink.commit_result
+
+            def commit_result_hold(**kw):
+                handler_stale_timeout["value"] = request.wd.stale_timeout
+                hold_entered.set()
+                # The local durable write is held PAST the armed window.
+                clock.now = send_at["value"] + 8.0
+                hold_release.wait(60.0)
+                return orig_commit(**kw)
+
+            monkeypatch.setattr(lane.sink, "commit_result", commit_result_hold)
+        else:
+            orig_block = lane.sink.block
+
+            def block_hold(reason):
+                if reason == "provider_result_unavailable":
+                    handler_stale_timeout["value"] = request.wd.stale_timeout
+                    hold_entered.set()
+                    clock.now = send_at["value"] + 8.0
+                    hold_release.wait(60.0)
+                return orig_block(reason)
+
+            monkeypatch.setattr(lane.sink, "block", block_hold)
+
+        original_kill = request._stale_kill
+
+        def kill_witness(elapsed):
+            # Record THEN invoke the real kill: a fired witness proves the
+            # poll's comparison ran (client abort + TimeoutError are real),
+            # never a pass-by-call-count.
+            stale_kill_calls.append(elapsed)
+            killed.set()
+            return original_kill(elapsed)
+
+        request._stale_kill = kill_witness
+
+        poll = {"thread": None, "past_window": 0}
+        original_emit = request._emit_wait_notice
+
+        def emit_witness(elapsed, heartbeat=True):
+            original_emit(elapsed, heartbeat=heartbeat)
+            # Counted on the poll thread only, PAST the armed provider
+            # window: a second entry proves the prior iteration's stale
+            # comparison completed without killing.
+            if (threading.current_thread() is poll["thread"]
+                    and send_at.get("value") is not None
+                    and clock.time() > send_at["value"] + 5.0):
+                poll["past_window"] += 1
+                if poll["past_window"] >= 2:
+                    survived.set()
+
+        request._emit_wait_notice = emit_witness
+
+        outcome_result = {}
+
+        def _drive():
+            poll["thread"] = threading.current_thread()
+            # The cap must be bound where run() spawns the worker -- the
+            # worker inherits THIS thread's ContextVars.
+            token = bind_execution(lane.cap)
+            try:
+                outcome_result["response"] = request.run()
+            except Exception as exc:  # noqa: BLE001 -- asserted below
+                outcome_result["error"] = exc
+            finally:
+                reset_execution(token)
+
+        driver = threading.Thread(target=_drive, daemon=True)
+        driver.start()
+
+        # The post-provider handler must actually be reached; it holds with
+        # the clock already inside the armed window (send+4.5s).
+        assert hold_entered.wait(15.0), "post-provider handler never entered"
+        # Event-based, never a sleep: the poll must OBSERVE the past-window
+        # clock while the handler is held -- either >=2 whole poll iterations
+        # survived it or the real stale kill fired.
+        deadline = time.monotonic() + 15.0
+        while not survived.is_set() and not killed.is_set():
+            assert time.monotonic() < deadline, (
+                "poll never evaluated the clock past the provider window")
+            killed.wait(0.05)
+        if killed.is_set():
+            # Let the real kill land fully (the TimeoutError lands after the
+            # 2s worker await) BEFORE releasing the held handler.
+            driver.join(timeout=10.0)
+        hold_release.set()
+        driver.join(timeout=10.0)
+        assert not driver.is_alive()
+        if request.thread is not None:
+            request.thread.join(timeout=10.0)
+            assert not request.thread.is_alive()
+
+        # Zero kills past the SDK return: the provider window is the ONLY
+        # thing the watchdog covered -- exactly one real POST either way.
+        assert stale_kill_calls == []
+        assert not killed.is_set()
+        assert len(provider.posts) == 1
+
+        # Independent disk read of the durable outcome.
+        reopened = RunIdempotencyStore(str(lane.db_path))
+        try:
+            row = reopened.b2b_attempt(
+                profile=lane.profile, attempt_id=lane.attempt_id)
+            result_row = reopened.b2b_artifact(
+                attempt_id=lane.attempt_id, kind="provider_result")
+        finally:
+            reopened.close()
+
+        if outcome == "success":
+            assert outcome_result.get("error") is None
+            response = outcome_result.get("response")
+            assert response is not None
+            assert request.result["error"] is None
+            assert request.result["response"] is not None
+            assert row["status"] == "result_received"
+            assert result_row is not None
+            assert response.choices[0].message.content == json.loads(
+                result_row["payload"])["text"]
+        else:
+            # The SDK exception stays the normalized safe refusal -- never a
+            # TimeoutError and never claimed as success.
+            error = outcome_result.get("error")
+            assert isinstance(error, B2BTerminalRefusal)
+            assert str(error) == "provider_result_unavailable"
+            assert request.result["response"] is None
+            assert row["status"] == "indeterminate"
+            assert result_row is None
+
+        # The provider window ended AT the SDK return: the post-provider
+        # handler entered on an infinite stale window, still infinite after
+        # the worker's cleanup.
+        assert handler_stale_timeout["value"] == float("inf")
+        assert request.wd.stale_timeout == float("inf")
+
+        if outcome == "success":
+            # The real finalize/seal path: attested result -> sealed proposal.
+            lane.adapter._profile_scope = (
+                lambda profile: contextlib.nullcontext())
+
+            async def _seal_resolve(*a, **k):
+                return lane.resolved, "ok"
+
+            monkeypatch.setattr(b2b, "_resolve_source_async", _seal_resolve)
+            text = response.choices[0].message.content
+            status, fields, extra = asyncio.run(bxe._b2b_finalize(
+                lane.cap, {"final_response": text}, "completed", {}))
+            assert status == "completed" and fields["completed"] is True
+            assert extra["b2b"]["state"] == "prepared"
+            assert lane.store.b2b_attempt(
+                profile=lane.profile, attempt_id=lane.attempt_id)[
+                    "status"] == "proposal_ready"
+            assert lane.store.b2b_artifact(
+                attempt_id=lane.attempt_id, kind="proposal") is not None
+    finally:
+        hold_release.set()
+        if driver is not None:
+            driver.join(timeout=10.0)
+        if request is not None and request.thread is not None:
+            request.thread.join(timeout=10.0)
+        if request is not None:
+            request.clients.close_once("provider_window_teardown")
+        agent.client.close()
+        lane.store.close()
+        provider.stop()
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [("b2b_run_failed", "indeterminate"),
+     ("result_invalid", "result_invalid")],
+    ids=["run_failed_is_indeterminate", "result_invalid_stays_known"])
+def test_block_received_durable_result_is_indeterminate(
+        tmp_path, monkeypatch, reason, expected):
+    """A paid, durable provider_result is never degraded to ``failed``: a
+    later ``block()`` on a ``result_received`` attempt lands ``indeterminate``
+    -- the same mechanism as the existing dispatch_committed arm -- while a
+    genuine ``result_invalid`` stays a KNOWN outcome. The result_received row
+    is produced by a real ``req.run()`` through ``execute_terminal`` -> real
+    SDK -> loopback double; nothing fabricates it."""
+    lane, provider, agent = _terminal_lane(tmp_path, monkeypatch)
+    try:
+        token = bind_execution(lane.cap)
+        try:
+            response = execute_terminal(
+                agent, _api_kwargs(lane), lane.cap, turn_id=lane.turn_id)
+        finally:
+            reset_execution(token)
+        assert response.choices[0].message.content
+        assert len(provider.posts) == 1
+        assert lane.store.b2b_attempt(
+            profile=lane.profile, attempt_id=lane.attempt_id)[
+                "status"] == "result_received"
+        payload_before = lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="provider_result")["payload"]
+
+        lane.sink.block(reason)
+
+        # Second disk connection: the durable status and the byte-identical
+        # paid payload, never an in-memory view of the store's connection.
+        reopened = RunIdempotencyStore(str(lane.db_path))
+        try:
+            row = reopened.b2b_attempt(
+                profile=lane.profile, attempt_id=lane.attempt_id)
+            result_row = reopened.b2b_artifact(
+                attempt_id=lane.attempt_id, kind="provider_result")
+        finally:
+            reopened.close()
+        assert row["status"] == expected
+        assert row["status"] != "failed"
+        assert result_row["payload"] == payload_before
+        assert len(provider.posts) == 1
+    finally:
+        agent.client.close()
+        lane.store.close()
+        provider.stop()
