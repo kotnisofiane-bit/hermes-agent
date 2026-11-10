@@ -1622,16 +1622,19 @@ def test_b2b_provider_window_ends_at_sdk_return(tmp_path, monkeypatch, outcome):
 @pytest.mark.parametrize(
     ("reason", "expected"),
     [("b2b_run_failed", "indeterminate"),
-     ("result_invalid", "result_invalid")],
-    ids=["run_failed_is_indeterminate", "result_invalid_stays_known"])
+     ("result_invalid", "result_invalid"),
+     ("source_window_closed", "source_denied")],
+    ids=["run_failed_is_indeterminate", "result_invalid_stays_known",
+         "source_denial_stays_known"])
 def test_block_received_durable_result_is_indeterminate(
         tmp_path, monkeypatch, reason, expected):
     """A paid, durable provider_result is never degraded to ``failed``: a
-    later ``block()`` on a ``result_received`` attempt lands ``indeterminate``
-    -- the same mechanism as the existing dispatch_committed arm -- while a
-    genuine ``result_invalid`` stays a KNOWN outcome. The result_received row
-    is produced by a real ``req.run()`` through ``execute_terminal`` -> real
-    SDK -> loopback double; nothing fabricates it."""
+    later ``block()`` on a ``result_received`` attempt with a failed-mapped
+    reason lands ``indeterminate`` -- the same mechanism as the existing
+    dispatch_committed arm -- while typed source/invalid refusals stay KNOWN
+    outcomes. The result_received row is produced by a real ``req.run()``
+    through ``execute_terminal`` -> real SDK -> loopback double; nothing
+    fabricates it."""
     lane, provider, agent = _terminal_lane(tmp_path, monkeypatch)
     try:
         token = bind_execution(lane.cap)
