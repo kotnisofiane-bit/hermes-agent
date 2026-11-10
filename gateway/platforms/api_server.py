@@ -2894,34 +2894,26 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return body, None
 
     async def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
-        from gateway.platforms.api_server_b2b import guarded_session_id
-        session_id, guard_err = guarded_session_id(self, session_id)
+        from gateway.platforms.api_server_b2b_sessions import resolve_generic_session_id
+        session_id, guard_err = await resolve_generic_session_id(self, session_id)
         if guard_err is not None:
             return None, guard_err
         db = await self._ensure_session_db_async()
         if db is None:
             return None, self._session_db_unavailable()
-        from gateway.platforms.api_server_b2b import guard_generic_lineage
-        session_id, guard_err = await guard_generic_lineage(self, db, session_id)
-        if guard_err is not None:
-            return None, guard_err
         session = await asyncio.to_thread(db.get_session, session_id)
         if not session:
             return None, _error_response(f"Session not found: {session_id}", 404, code="session_not_found")
         return session, None
 
     async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
-        from gateway.platforms.api_server_b2b import guarded_session_id
-        session_id, guard_err = guarded_session_id(self, session_id)
+        from gateway.platforms.api_server_b2b_sessions import resolve_generic_session_id
+        session_id, guard_err = await resolve_generic_session_id(self, session_id)
         if guard_err is not None:
             raise RuntimeError("protected B2B session history request refused")
         db = await self._ensure_session_db_async()
         if db is None:
             return []
-        from gateway.platforms.api_server_b2b import guard_generic_lineage
-        session_id, guard_err = await guard_generic_lineage(self, db, session_id)
-        if guard_err is not None:
-            raise RuntimeError("protected B2B session history request refused")
         try:
             return await asyncio.to_thread(db.get_messages_as_conversation, session_id)
         except Exception as exc:
@@ -3186,11 +3178,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if err:
             return err
         db = await self._ensure_session_db_async()
-        resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
-        # Second-resolution race: the tip computed here is a different id than the one
-        # guarded above — re-walk lineage on it before any read.
-        from gateway.platforms.api_server_b2b import guard_generic_lineage
-        resolved_id, guard_err = await guard_generic_lineage(self, db, resolved_id)
+        if db is None:
+            return self._session_db_unavailable()
+        # The seam also owns the lineage check on BOTH the requested id and the
+        # resolved tip; fail_open=False keeps the native /messages contract —
+        # a resolver error surfaces as a 500, never silently the original id.
+        from gateway.platforms.api_server_b2b_sessions import resolve_generic_session_id
+        resolved_id, guard_err = await resolve_generic_session_id(
+            self, session_id, db=db, resolve_tip=True, fail_open=False)
         if guard_err is not None:
             return guard_err
         raw_limit, raw_offset = request.query.get("limit"), request.query.get("offset", "0")

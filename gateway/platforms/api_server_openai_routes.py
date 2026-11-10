@@ -632,22 +632,20 @@ class OpenAICompatRoutesMixin:
                 return _invalid_request("Invalid session ID")
             if len(provided_session_id) > self._MAX_SESSION_HEADER_LEN:
                 return _invalid_request("Session ID too long")
-            from agent.b2b_execution import is_b2b_session_id
-            if is_b2b_session_id(provided_session_id):
-                return _invalid_request("Session not found")
-            session_id = provided_session_id
+            # #98619/#13437: a client-addressed id from before a compression rotation
+            # must adopt the live continuation tip — history loads from it, the turn and
+            # the wake target bind it, and a detached delegation delivery row persisted
+            # on the tip is what this continuation consumes. The central seam owns the
+            # tip resolution AND the lineage check on both ids; it runs BEFORE the broad
+            # history-load fallback so a refusal is never swallowed and run anyway.
+            from gateway.platforms.api_server_b2b_sessions import resolve_generic_session_id
+            session_id, guard_err = await resolve_generic_session_id(
+                self, provided_session_id, resolve_tip=True)
+            if guard_err is not None:
+                return _error_response("Session not found", 404, code="session_not_found")
             try:
                 db = await self._ensure_session_db_async()
                 if db is not None:
-                    # #98619/#13437: a client-addressed id from before a compression rotation
-                    # must adopt the live continuation tip — history loads from it, the turn and
-                    # the wake target bind it, and a detached delegation delivery row persisted
-                    # on the tip is what this continuation consumes. Same canonical resolution
-                    # the delivery writer (gateway/wake.py) and /v1/runs use; fails open.
-                    from gateway.platforms.api_server_runs import _resolve_live_session_id
-                    session_id = await _resolve_live_session_id(self, provided_session_id)
-                    if is_b2b_session_id(session_id):
-                        return _invalid_request("Session not found")
                     history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
@@ -1024,8 +1022,11 @@ class OpenAICompatRoutesMixin:
             if stored is None:
                 return _error_response(f"Previous response not found: {previous_response_id}", 404)
             stored_session_id = stored.get("session_id")
-            from agent.b2b_execution import is_b2b_session_id
-            if is_b2b_session_id(stored_session_id):
+            # Stored chain ancestry through the same central seam BEFORE the stored
+            # transcript is consumed.
+            from gateway.platforms.api_server_b2b_sessions import resolve_generic_session_id
+            _, guard_err = await resolve_generic_session_id(self, stored_session_id)
+            if guard_err is not None:
                 return _error_response("Session not found", 404)
             conversation_history = list(stored.get("conversation_history", []))
             if instructions is None:
@@ -1048,8 +1049,9 @@ class OpenAICompatRoutesMixin:
             or str(uuid.uuid4()))
         # Final selector: a declared-key resolution may legally yield a reserved id —
         # it must never be silently adopted before the run constructs history/agent.
-        from agent.b2b_execution import is_b2b_session_id
-        if is_b2b_session_id(session_id):
+        from gateway.platforms.api_server_b2b_sessions import resolve_generic_session_id
+        session_id, guard_err = await resolve_generic_session_id(self, session_id)
+        if guard_err is not None:
             return _error_response("Session not found", 404)
         stream = _coerce_request_bool(body.get("stream"), default=False)
         route, agent_overrides, selection_error = self._select_request_route(
@@ -1149,8 +1151,9 @@ class OpenAICompatRoutesMixin:
         stored = self._current_response_store().get(response_id)
         if stored is None:
             return _error_response(f"Response not found: {response_id}", 404)
-        from agent.b2b_execution import is_b2b_session_id
-        if is_b2b_session_id(stored.get("session_id")):
+        from gateway.platforms.api_server_b2b_sessions import resolve_generic_session_id
+        _, guard_err = await resolve_generic_session_id(self, stored.get("session_id"))
+        if guard_err is not None:
             return _error_response(f"Response not found: {response_id}", 404)
         return web.json_response(stored["response"])
 
@@ -1163,8 +1166,9 @@ class OpenAICompatRoutesMixin:
         response_id = request.match_info["response_id"]
         _stored = self._current_response_store().get(response_id)
         if _stored is not None:
-            from agent.b2b_execution import is_b2b_session_id
-            if is_b2b_session_id(_stored.get("session_id")):
+            from gateway.platforms.api_server_b2b_sessions import resolve_generic_session_id
+            _, guard_err = await resolve_generic_session_id(self, _stored.get("session_id"))
+            if guard_err is not None:
                 return _error_response(f"Response not found: {response_id}", 404)
         if not self._current_response_store().delete(response_id):
             return _error_response(f"Response not found: {response_id}", 404)
