@@ -2952,110 +2952,34 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         include_hidden = bool(title_filter) and _coerce_request_bool(
             request.query.get("include_hidden"), default=False)
 
-        # Reserved-namespace rows must be excluded BEFORE the visible offset/limit is
-        # counted — a post-limit filter produces missing/duplicated ordinary pages.
-        # Bounded scan: raw chunks (project_compression_tips=False, so the cursor counts
-        # RAW rows, not the projected window), native projection applied per chunk, then
-        # protected ids filtered. Stops at offset+limit visible or raw exhaustion.
-        # ``limit=0`` keeps native pin-only behavior — no scan at all.
-        _CHUNK = 200
-        _ancestor_cache: dict = {}
+        _b2b_state = getattr(self, "_b2b_state", None)
+        _b2b_listing = bool(
+            _b2b_state is not None and getattr(_b2b_state.config, "enabled", False))
 
-        def _is_protected_id(sid: Any) -> bool:
-            """True when sid itself is reserved OR any ancestor chain reaches a reserved
-            row (grandparent can be protected, not just the immediate parent). Whole-chain
-            verdicts cached per id; missing rows are ordinary; errors fail closed."""
-            from agent.b2b_execution import is_b2b_session_id
-            sid = str(sid or "")
-            verdict = _ancestor_cache.get(sid)
-            if verdict is not None:
-                return verdict
-            if is_b2b_session_id(sid):
-                _ancestor_cache[sid] = True
-                return True
-            current, seen = sid, set()
-            for _ in range(64):
-                if current in seen:
-                    verdict = True  # cycle in lineage — fail closed
-                    break
-                seen.add(current)
-                cached = _ancestor_cache.get(current)
-                if cached is not None:
-                    verdict = cached
-                    break
-                try:
-                    row = db.get_session(current)
-                except Exception:
-                    verdict = True  # lookup error — fail closed
-                    break
-                if not row:
-                    verdict = False  # missing ordinary ancestor
-                    break
-                parent = row.get("parent_session_id")
-                if not parent:
-                    verdict = False
-                    break
-                if is_b2b_session_id(parent):
-                    verdict = True
-                    break
-                current = str(parent)
+        async def _list() -> list:
+            if _b2b_listing:
+                # Reserved-namespace rows must be excluded BEFORE the visible
+                # offset/limit is counted — a post-limit filter produces
+                # missing/duplicated ordinary pages. The scan lives in a
+                # dedicated sibling; the enabled lane only.
+                from gateway.platforms.api_server_b2b_sessions import (
+                    list_b2b_filtered_sessions)
+                rows = await asyncio.to_thread(
+                    list_b2b_filtered_sessions, db, source=source, limit=limit,
+                    offset=offset, include_children=include_children,
+                    title_filter=title_filter, include_hidden=include_hidden)
             else:
-                verdict = True  # >64 ancestors — fail closed
-            for cached_id in seen:
-                _ancestor_cache[cached_id] = verdict
-            _ancestor_cache[sid] = verdict
-            return verdict
-
-        def _row_protected(row: dict) -> bool:
-            if _is_protected_id(row.get("id")):
-                return True
-            lineage = row.get("_lineage_ids") or ()
-            return any(_is_protected_id(x) for x in lineage)
-
-        def _raw_scan() -> tuple:
-            """(visible, pins, has_more) — all work in one worker thread."""
-            visible: list = []
-            has_more = False
-            if limit > 0:
-                cursor = 0
-                while len(visible) < offset + limit:
-                    chunk = db.list_sessions_rich(
-                        source=source, limit=_CHUNK, offset=cursor,
-                        include_children=include_children, order_by_last_active=True,
-                        include_pinned=False, search_query=title_filter,
-                        include_hidden=include_hidden,
-                        project_compression_tips=False)
-                    if not chunk:
-                        break
-                    cursor += len(chunk)  # RAW row count — never the projected window
-                    projected = (db._project_compression_tips(chunk, False)
-                                 if not include_children else chunk)
-                    visible.extend(s for s in projected if not _row_protected(s))
-                    if len(chunk) < _CHUNK:
-                        break
-                else:
-                    has_more = True
-            # Pin backfill rides its own native call (include_pinned=True); protected
-            # pins are dropped, native pin order preserved.
-            pins = db.list_sessions_rich(
-                source=source, limit=0, offset=0, include_children=include_children,
-                order_by_last_active=True, include_pinned=True,
-                search_query=title_filter, include_hidden=include_hidden)
-            pins = [p for p in pins if p.get("pinned") and not _row_protected(p)]
-            return visible, pins, has_more
-
-        async def _list() -> tuple:
-            visible, pins, has_more = await asyncio.to_thread(_raw_scan)
-            page = visible[offset:offset + limit] if limit else []
-            seen = {s.get("id") for s in page}
-            page = page + [p for p in pins if p.get("id") not in seen]
-            # Exact-title filter at the SAME final stage as before: page + pins merged,
-            # then exact match (SQL substring narrowing alone may include near-matches).
+                # include_pinned back-fills pins past the recency window; search_query pushes the
+                # title needle into SQL (substring) so a hidden/old row is found, exact match below.
+                rows = await asyncio.to_thread(
+                    db.list_sessions_rich, source=source, limit=limit, offset=offset,
+                    include_children=include_children, order_by_last_active=True, include_pinned=True,
+                    search_query=title_filter, include_hidden=include_hidden)
             if title_filter:
-                page = [s for s in page if (s.get("title") or "").strip() == title_filter]
-            return page, has_more
+                rows = [s for s in rows if (s.get("title") or "").strip() == title_filter]
+            return rows
 
-        sessions, has_more = await _list()
+        sessions = await _list()
         if title_filter and not sessions:
             # A canonical Bot Chat auto-archived by the orphan reaper would make `hermes peer dm`
             # mint transient sessions: resurrect and re-list; deliberate archives stay put.
@@ -3073,16 +2997,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     return bool(stale and stale.get("archived") and db.unarchive_recoverable_session(stale["id"]))
 
                 if title_filter == BOT_CHAT_TITLE and await asyncio.to_thread(_resurrect):
-                    sessions, _ = await _list()
+                    sessions = await _list()
             except Exception:
                 pass  # resolution degrades to today's no-row behavior
-        # has_more keeps the ORIGINAL semantics: non-pinned rows returned this page
-        # reached the requested limit (scan filled the window without raw exhaustion).
+        # Back-filled pins arrive PAST the limit, so counting them would report
+        # another page that doesn't exist. Only the recency window decides.
         windowed = sum(1 for s in sessions if not s.get("pinned"))
         return web.json_response({
             "object": "list", "data": [self._session_response(s) for s in sessions],
-            "limit": limit, "offset": offset,
-            "has_more": bool(limit) and windowed >= limit})
+            "limit": limit, "offset": offset, "has_more": windowed >= limit})
 
     @_require_auth
     async def _handle_create_session(self, request: "web.Request") -> "web.Response":

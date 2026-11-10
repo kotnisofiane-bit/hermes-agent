@@ -836,9 +836,8 @@ def execute_terminal(agent: Any, api_kwargs: Any, cap: BoundExecution,
         raise B2BTerminalRefusal("context_too_large")
     if not sink.resolve_before_provider():
         raise B2BTerminalRefusal("source_before_provider_denied")
-    from agent.chat_completion_nonstream import _NonStreamRequest
-    req = _NonStreamRequest(agent, kwargs)
-    setattr(req, "_b2b_execution", cap)
-    setattr(req, "_b2b_receipt", receipt)
-    setattr(req, "_b2b_request_digest", provider_request_digest(kwargs))
+    from agent.b2b_nonstream import _B2BNonStreamRequest
+    req = _B2BNonStreamRequest(
+        agent, kwargs, cap=cap, receipt=receipt,
+        request_digest=provider_request_digest(kwargs))
     return req.run()
