@@ -902,23 +902,6 @@ class _AttemptSink:
         # ``result_invalid:<validator detail>`` raises embed the validator
         # reason in the exception string — classify on their prefix.
         status = _BLOCK_STATUS.get(reason.partition(":")[0], "failed")
-        row = self._store.b2b_attempt(profile=self.profile, attempt_id=self.attempt_id)
-        # Two distinct guards share one artifact read:
-        # - dispatch_committed with NO durable result: the dispatch may have
-        #   reached the provider, so the outcome is unknown -> indeterminate
-        #   (never the known-invalid result_invalid).
-        # - result_received WITH a durable provider_result: a paid answer must
-        #   not be degraded to "failed" by a racing failure-mapped block ->
-        #   indeterminate. Typed source/context/policy/invalid outcomes stay
-        #   exactly as classified — the guard is failed-only.
-        if (row is not None and
-                ((row["status"] == "dispatch_committed" and status != "result_invalid") or
-                 (row["status"] == "result_received" and status == "failed"))):
-            provider_result = self._store.b2b_artifact(
-                attempt_id=self.attempt_id, kind="provider_result")
-            if ((row["status"] == "dispatch_committed" and provider_result is None) or
-                    (row["status"] == "result_received" and provider_result is not None)):
-                status = "indeterminate"
         self._store.b2b_update_attempt(profile=self.profile, attempt_id=self.attempt_id, status=status)
 
     def resolve_before_provider(self) -> bool:

@@ -1671,3 +1671,65 @@ def test_block_received_durable_result_is_indeterminate(
         agent.client.close()
         lane.store.close()
         provider.stop()
+
+
+# ---------------------------------------------------------------------------
+# _AttemptSink.block -- commit_result race
+# ---------------------------------------------------------------------------
+
+def _commit_durable_provider_result(lane):
+    """Insert provider_result + move to result_received in ONE transaction."""
+    marker = lane.store.b2b_artifact(
+        attempt_id=lane.attempt_id, kind="provider_dispatch")
+    dispatch = json.loads(marker["payload"])
+    text = _proposal_text()
+    payload = json_utf8({
+        "format": "dubsar.b2b-provider-result/1",
+        "attempt_id": lane.attempt_id, "binding_digest": lane.binding,
+        "run_id": lane.run_id, "request_digest": dispatch["request_digest"],
+        "context_digest": lane.sink.context_receipt.digest,
+        "text": text, "proposal": json.loads(text)})
+    assert lane.store.b2b_commit_result(
+        profile=lane.profile, attempt_id=lane.attempt_id, payload=payload)
+
+
+def test_block_racing_commit_result_never_degrades_paid_result(
+        b2b_dispatch_lane, monkeypatch):
+    """Commit a paid result AFTER block() has classified but BEFORE it writes:
+    the durable status must never become ``failed``. The race is injected at
+    the store boundary -- on the provider_result read the pre-fix block()
+    performs, and on the update itself once the read/write pair is one
+    transaction -- so the same test exercises both shapes deterministically."""
+    lane = b2b_dispatch_lane
+    _commit_dispatch(lane)
+    fired = {"done": False}
+    real_artifact = lane.store.b2b_artifact
+    real_update = lane.store.b2b_update_attempt
+
+    def commit_now():
+        if fired["done"]:
+            return
+        fired["done"] = True
+        _commit_durable_provider_result(lane)
+
+    def racing_artifact(*, attempt_id, kind):
+        if kind == "provider_result":
+            commit_now()
+        return real_artifact(attempt_id=attempt_id, kind=kind)
+
+    def racing_update(*, profile, attempt_id, **fields):
+        commit_now()
+        return real_update(profile=profile, attempt_id=attempt_id, **fields)
+
+    monkeypatch.setattr(lane.store, "b2b_artifact", racing_artifact)
+    monkeypatch.setattr(lane.store, "b2b_update_attempt", racing_update)
+
+    lane.sink.block("b2b_run_failed")
+
+    assert fired["done"]
+    row = lane.store.b2b_attempt(profile=lane.profile, attempt_id=lane.attempt_id)
+    result = lane.store.b2b_artifact(
+        attempt_id=lane.attempt_id, kind="provider_result")
+    assert result is not None
+    assert row["status"] != "failed"
+    assert row["status"] == "indeterminate"
