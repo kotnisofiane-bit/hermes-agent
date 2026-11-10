@@ -756,7 +756,10 @@ def _genesis_vs_native(session: Mapping[str, Any], session_id: str, profile: str
 # Durable terminal classification for _AttemptSink.block: explicit reason ->
 # status entries; anything unlisted defaults to "failed". Exception text is
 # never mined for substrings — a reason not in this table is a bug or an
-# untyped failure, and both are "failed".
+# untyped failure, and both are "failed". The emitted refusal universe is
+# enumerated in agent.b2b_execution.BLOCK_REASONS; every member MUST have an
+# explicit entry below — the classification tests walk that constant against
+# this table, so a new raise site or block() call extends BOTH in one change.
 _BLOCK_CONTEXT_STALE_REASONS = frozenset({
     "context_schema_invalid", "context_contract_unavailable",
     "context_digest_invalid", "context_identity_source",
@@ -766,8 +769,17 @@ _BLOCK_CONTEXT_STALE_REASONS = frozenset({
     "context_my_work_mismatch", "context_my_work_authority",
     "context_memory_unqualified", "context_memory_namespace",
     "context_memory_provenance", "context_memory_mission",
+    "context_memory_malformed_globals", "context_memory_malformed",
+    "context_memory_malformed_api", "context_memory_malformed_source_contract",
+    "context_memory_malformed_v1_fallback",
+    "context_memory_malformed_truncated", "context_memory_malformed_limits",
+    "context_memory_missing",
     "context_contradictions", "context_oc_malformed", "context_oc_mismatch",
-    "context_oc_unavailable", "context_accepted_unavailable",
+    "context_oc_unavailable", "context_oc_read_metadata",
+    "context_oc_unqualified", "context_oc_projection",
+    "context_oc_source_stale", "context_oc_read_replayed",
+    "context_proof_missing", "context_proof_invalid",
+    "context_accepted_unavailable",
     "context_accepted_malformed", "context_accepted_unqualified",
     "context_support_unqualified", "context_relation_bounds",
     "context_view_bounds", "context_view_not_object",
@@ -786,7 +798,7 @@ _BLOCK_POLICY_CHANGED_REASONS = frozenset({
     "b2b_model_mismatch", "b2b_alternate_provider", "b2b_alternate_api_call",
     "b2b_sdk_override", "b2b_sdk_headers", "b2b_client_policy",
     "b2b_retries_not_disabled", "b2b_request_client_not_isolated",
-    "terminal_guard_required", "kwargs_not_permitted",
+    "b2b_timeout_policy", "terminal_guard_required", "kwargs_not_permitted",
 })
 _BLOCK_SOURCE_DENIED_REASONS = frozenset({
     "source_before_provider_denied", "source_before_seal_denied",
@@ -795,15 +807,40 @@ _BLOCK_SOURCE_DENIED_REASONS = frozenset({
 _BLOCK_RESULT_INVALID_REASONS = frozenset({
     "result_invalid", "proposal_invalid", "response_not_public",
 })
+# Emitted refusal reasons whose classified status IS "failed": serializer
+# invariant failures (host-side data defects — the same json_* guards run on
+# non-context payloads), missing capability plumbing, no-receipt/commit-
+# integrity conditions and untyped run exits. Explicit membership makes the
+# durable "failed" deliberate; genuinely untyped exception text re-fed by
+# block_failed_run still lands on the generic default below.
+_BLOCK_FAILED_REASONS = frozenset({
+    "json_depth", "json_key", "json_scalar",
+    "sink_missing", "context_sink_missing",
+    "dispatch_already_committed", "request_changed_before_sdk",
+    "provider_result_unavailable", "result_unattested",
+    "middleware_response_unattested",
+    "result_commit_failed", "context_commit_failed", "seal_commit_failed",
+    "seal_unattested", "launch_failed", "native_run_interrupted",
+    "b2b_run_failed", "policy_provider_unavailable",
+})
+# Terminal durable statuses re-fed to block() by _b2b_finalize's already-
+# blocked fast path are known values, not untyped text — self-mapping.
+_BLOCK_TERMINAL_STATUSES = frozenset({
+    "context_unavailable", "context_stale", "policy_changed",
+    "source_denied", "result_invalid", "indeterminate", "failed",
+    "interrupted",
+})
 _BLOCK_STATUS = {
     "context_unavailable": "context_unavailable",
     **{r: "context_stale" for r in _BLOCK_CONTEXT_STALE_REASONS},
     **{r: "policy_changed" for r in _BLOCK_POLICY_CHANGED_REASONS},
     **{r: "source_denied" for r in _BLOCK_SOURCE_DENIED_REASONS},
     **{r: "result_invalid" for r in _BLOCK_RESULT_INVALID_REASONS},
+    **{r: "failed" for r in _BLOCK_FAILED_REASONS},
+    **{s: s for s in _BLOCK_TERMINAL_STATUSES},
 }
 # NO-RECEIPT conditions (provider_result_unavailable, result_unattested,
-# middleware_response_unattested) intentionally default to "failed" here: the
+# middleware_response_unattested) intentionally classify "failed" here: the
 # dispatch may or may not have reached the provider, so the post-CAS override
 # below turns them "indeterminate" once a committed marker exists with no
 # durable result — never the known-invalid result_invalid.
@@ -862,7 +899,9 @@ class _AttemptSink:
     def block(self, reason: str) -> None:
         # Durable classification comes from the explicit reason -> status table:
         # arbitrary exception text is NEVER mined for substrings.
-        status = _BLOCK_STATUS.get(reason, "failed")
+        # ``result_invalid:<validator detail>`` raises embed the validator
+        # reason in the exception string — classify on their prefix.
+        status = _BLOCK_STATUS.get(reason.partition(":")[0], "failed")
         row = self._store.b2b_attempt(profile=self.profile, attempt_id=self.attempt_id)
         if (row is not None and row["status"] == "dispatch_committed" and
                 self._store.b2b_artifact(attempt_id=self.attempt_id, kind="provider_result") is None
@@ -898,6 +937,14 @@ class _AttemptSink:
         budget = max(
             0.0, remaining - (_SOURCE_DEADLINE_S + _CONTEXT_RECHECK_SAFETY_S))
         return time.monotonic() + budget
+
+    def seal_recheck_deadline(self) -> float:
+        """Monotonic deadline for the SEAL-time bounded C1 recheck: the
+        ``before_seal`` exchange is only issued AFTER this read returns, so
+        the prospective ``_REQUEST_TTL_S`` window applies — never the
+        already-spent ``before_provider`` budget."""
+        return time.monotonic() + max(
+            0.0, _REQUEST_TTL_S - (_SOURCE_DEADLINE_S + _CONTEXT_RECHECK_SAFETY_S))
 
     def _qualify_context(self, view: Mapping[str, Any]) -> Dict[str, Any]:
         # Validate against the sink's frozen policy, without minting a capability.

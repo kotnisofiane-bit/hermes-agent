@@ -380,6 +380,74 @@ class B2BTerminalRefusal(RuntimeError):
     """Raised when a B2B turn reaches the terminal without satisfying an invariant."""
 
 
+# The closed reason vocabulary a bound lane may emit: every reason raised as a
+# ``B2BTerminalRefusal`` here and in ``agent/b2b_nonstream.py``, plus the
+# reason literals the gateway sink and run executor hand to ``sink.block()``.
+# ``_BLOCK_STATUS`` in ``gateway/platforms/api_server_b2b.py`` maps EVERY
+# member to an explicit durable status — an unlisted emitted reason silently
+# records ``failed`` — so a new raise site or block() call extends this set
+# AND the classification table in the same change. ``result_invalid:<detail>``
+# raises classify on their prefix; durable statuses re-fed to block() are not
+# reasons and stay outside this set.
+BLOCK_REASONS = frozenset({
+    # context qualification / proof / OC-history refusals — context_stale
+    "context_absent_from_kwargs", "context_accepted_malformed",
+    "context_accepted_unavailable", "context_accepted_unqualified",
+    "context_authority_mismatch", "context_catalogue_mismatch",
+    "context_changed_before_sdk", "context_contract_unavailable",
+    "context_contradictions", "context_digest_invalid",
+    "context_identity_mismatch", "context_identity_source",
+    "context_memory_malformed", "context_memory_malformed_api",
+    "context_memory_malformed_globals", "context_memory_malformed_limits",
+    "context_memory_malformed_source_contract",
+    "context_memory_malformed_truncated",
+    "context_memory_malformed_v1_fallback", "context_memory_mission",
+    "context_memory_missing", "context_memory_namespace",
+    "context_memory_provenance", "context_memory_unqualified",
+    "context_my_work_authority", "context_my_work_mismatch",
+    "context_namespaces", "context_oc_malformed", "context_oc_mismatch",
+    "context_oc_projection", "context_oc_read_metadata",
+    "context_oc_read_replayed", "context_oc_source_stale",
+    "context_oc_unavailable", "context_oc_unqualified",
+    "context_proof_invalid", "context_proof_missing",
+    "context_publication_conflict", "context_recheck_already_registered",
+    "context_recheck_unavailable", "context_relation_bounds",
+    "context_render_bounds", "context_rendered_encoding",
+    "context_rendered_type", "context_schema_invalid",
+    "context_selection_mismatch", "context_source_stale",
+    "context_source_unavailable", "context_stale",
+    "context_support_unqualified", "context_too_large", "context_turn_id",
+    "context_turn_mismatch", "context_view_bounds", "context_view_not_object",
+    # capability / policy refusals — policy_changed
+    "b2b_agent_binding_mismatch", "b2b_agent_binding_missing",
+    "b2b_alternate_api_call", "b2b_capability_mismatch",
+    "b2b_capability_missing", "b2b_client_policy",
+    "b2b_destination_mismatch", "b2b_model_mismatch", "b2b_policy_changed",
+    "b2b_policy_override", "b2b_profile_mismatch",
+    "b2b_request_client_not_isolated", "b2b_retries_not_disabled",
+    "b2b_runtime_mismatch", "b2b_runtime_policy", "b2b_sdk_headers",
+    "b2b_sdk_override", "b2b_timeout_policy", "kwargs_not_permitted",
+    "terminal_guard_required",
+    # signed source exchange denials — source_denied
+    "source_before_provider_denied", "source_before_seal_denied",
+    "source_window_closed",
+    # attested-result validation refusals — result_invalid
+    "result_invalid", "proposal_invalid",
+    # accepted context withdrawn before the turn runs — context_unavailable
+    "context_unavailable",
+    # serializer guards, missing plumbing, no-receipt/commit-integrity and
+    # untyped run exits — explicit "failed"
+    "json_depth", "json_key", "json_scalar",
+    "sink_missing", "context_sink_missing",
+    "dispatch_already_committed", "request_changed_before_sdk",
+    "provider_result_unavailable", "result_unattested",
+    "middleware_response_unattested",
+    "result_commit_failed", "context_commit_failed", "seal_commit_failed",
+    "seal_unattested", "launch_failed", "native_run_interrupted",
+    "b2b_run_failed", "policy_provider_unavailable",
+})
+
+
 @dataclasses.dataclass(frozen=True)
 class ContextReceipt:
     """Frozen accepted-context artifact descriptor; ``view`` stays a recursively

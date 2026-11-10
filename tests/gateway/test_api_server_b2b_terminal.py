@@ -17,6 +17,8 @@ design (see tests/gateway/test_api_server_b2b_runtime.py).
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import copy
 import http.server
 import json
@@ -31,12 +33,13 @@ import openai
 import pytest
 
 from agent.b2b_execution import (
-    B2BTerminalRefusal, bind_execution, current_execution, execute_terminal,
-    extract_allowed_refs, install_bounded_agent_policy, json_utf8,
-    mission_prompt, provider_request_digest, recheck_context, reset_execution,
-    validate_proposal, validate_terminal_result,
+    BLOCK_REASONS, B2BTerminalRefusal, bind_execution, current_execution,
+    execute_terminal, extract_allowed_refs, install_bounded_agent_policy,
+    json_utf8, mission_prompt, provider_request_digest, recheck_context,
+    reset_execution, validate_proposal, validate_terminal_result,
 )
 from gateway.platforms import api_server_b2b as b2b
+from gateway.platforms import api_server_b2b_execution as bxe
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from tests.gateway import b2b_unit_fixtures
 from tests.gateway.b2b_process_harness import (
@@ -54,77 +57,80 @@ def b2b_dispatch_lane(tmp_path):
 
 # ---------------------------------------------------------------------------
 # _AttemptSink.block -- explicit reason -> durable status table
+#
+# The emitted reason universe is agent.b2b_execution.BLOCK_REASONS -- the
+# shared production enumeration (raise sites + block() literals across the
+# lane). The durable invariants below walk THAT constant, so a new emitted
+# reason with no explicit _BLOCK_STATUS entry fails the suite instead of
+# silently recording "failed".
 # ---------------------------------------------------------------------------
 
-_CONTEXT_STALE_REASONS = [
-    "context_schema_invalid", "context_contract_unavailable",
-    "context_digest_invalid", "context_identity_source",
-    "context_identity_mismatch", "context_catalogue_mismatch",
-    "context_authority_mismatch", "context_selection_mismatch",
-    "context_namespaces", "context_source_unavailable", "context_source_stale",
-    "context_my_work_mismatch", "context_my_work_authority",
-    "context_memory_unqualified", "context_memory_namespace",
-    "context_memory_provenance", "context_memory_mission",
-    "context_contradictions", "context_oc_malformed", "context_oc_mismatch",
-    "context_oc_unavailable", "context_accepted_unavailable",
-    "context_accepted_malformed", "context_accepted_unqualified",
-    "context_support_unqualified", "context_relation_bounds",
-    "context_view_bounds", "context_view_not_object",
-    "context_recheck_unavailable", "context_recheck_already_registered",
-    "context_render_bounds", "context_rendered_type",
-    "context_rendered_encoding", "context_too_large", "context_turn_id",
-    "context_turn_mismatch", "context_publication_conflict",
-    "context_absent_from_kwargs", "context_changed_before_sdk",
-    "context_stale",
-]
-
-_POLICY_CHANGED_REASONS = [
-    "b2b_capability_mismatch", "b2b_capability_missing",
-    "b2b_agent_binding_missing", "b2b_agent_binding_mismatch",
-    "b2b_profile_mismatch", "b2b_policy_override", "b2b_policy_changed",
-    "b2b_runtime_mismatch", "b2b_runtime_policy", "b2b_destination_mismatch",
-    "b2b_model_mismatch", "b2b_alternate_provider", "b2b_alternate_api_call",
-    "b2b_sdk_override", "b2b_sdk_headers", "b2b_client_policy",
-    "b2b_retries_not_disabled", "b2b_request_client_not_isolated",
-    "terminal_guard_required", "kwargs_not_permitted",
-]
-
-_SOURCE_DENIED_REASONS = [
-    "source_before_provider_denied", "source_before_seal_denied",
-    "source_window_closed",
-]
-
-_RESULT_INVALID_REASONS = ["result_invalid", "proposal_invalid",
-                           "response_not_public"]
-
-_FAILED_REASONS = [
-    # policy_provider_unavailable once classified as policy_changed purely
-    # because its name contains "policy".
-    "policy_provider_unavailable",
-    # NO-RECEIPT conditions default failed pre-CAS (post-CAS -> indeterminate).
-    "result_unattested", "middleware_response_unattested",
-    "provider_result_unavailable",
-    # Commit/seal storage failures and launch/run failures.
-    "result_commit_failed", "context_commit_failed", "seal_commit_failed",
-    "seal_unattested", "launch_failed", "native_run_interrupted",
-    "b2b_run_failed", "sink_missing", "dispatch_already_committed",
-    "request_changed_before_sdk",
-    # Arbitrary exception text must never be mined for a classification.
+# Arbitrary exception text must never be mined for a classification.
+_UNTYPED_REASON_TEXT = [
     "sqlite3.OperationalError: no such context table",
     "RuntimeError: policy file missing",
     "TimeoutError: source read exceeded deadline",
     "ValueError: result could not decode",
 ]
 
+# Table-only entries with no current emitter still classify explicitly
+# (pre-declared families + the durable status passthrough).
+_TABLE_ONLY_PAIRS = (
+    [("b2b_alternate_provider", "policy_changed"),
+     ("response_not_public", "result_invalid")]
+    + [(s, s) for s in sorted(b2b._BLOCK_TERMINAL_STATUSES)])
+
+
+@pytest.mark.parametrize("reason", sorted(BLOCK_REASONS))
+def test_block_every_emitted_reason_classifies_explicitly(
+        b2b_dispatch_lane, reason):
+    """Every refusal reason the lane can emit has an EXPLICIT durable status:
+    ``_BLOCK_STATUS`` must contain it (a ``.get`` fallback is not a
+    classification) and ``block()`` must persist exactly the mapped status."""
+    lane = b2b_dispatch_lane
+    expected = b2b._BLOCK_STATUS[reason]  # KeyError: emitted reason unclassified
+    lane.sink.block(reason)
+    assert lane.store.b2b_attempt(
+        profile=lane.profile, attempt_id=lane.attempt_id)["status"] == expected
+
+
+def test_emitted_reason_families_match_review_semantics():
+    """The classification contract stated INDEPENDENTLY of the table: every
+    context-qualification/proof refusal is ``context_stale``
+    (``context_unavailable`` is the withdrawn-context refusal and
+    ``context_sink_missing`` is missing plumbing, not staleness); every
+    ``b2b_*`` capability/policy refusal is ``policy_changed``; signed-source
+    denials are ``source_denied``; public-result refusals are
+    ``result_invalid``. The remaining known reasons -- ``json_*`` serializer
+    guards (they also fire on non-context payloads), missing plumbing,
+    no-receipt conditions, commit integrity and untyped run exits -- are
+    explicitly ``failed``."""
+    expected = {}
+    for reason in BLOCK_REASONS:
+        if reason == "context_unavailable":
+            expected[reason] = "context_unavailable"
+        elif (reason.startswith("context_")
+                and reason != "context_sink_missing"
+                and not reason.endswith(("_failed", "_unattested"))):
+            expected[reason] = "context_stale"
+        elif reason.startswith("source_"):
+            expected[reason] = "source_denied"
+        elif (reason.startswith("b2b_")
+                and not reason.endswith(("_failed", "_unavailable"))
+                or reason in {"kwargs_not_permitted", "terminal_guard_required"}):
+            expected[reason] = "policy_changed"
+        elif reason in {"result_invalid", "proposal_invalid"}:
+            expected[reason] = "result_invalid"
+        else:
+            expected[reason] = "failed"
+    wrong = {r: (expected[r], b2b._BLOCK_STATUS.get(r)) for r in expected
+             if b2b._BLOCK_STATUS.get(r) != expected[r]}
+    assert not wrong, wrong
+
 
 @pytest.mark.parametrize(
     ("reason", "expected"),
-    ([(r, "context_stale") for r in _CONTEXT_STALE_REASONS]
-     + [(r, "policy_changed") for r in _POLICY_CHANGED_REASONS]
-     + [(r, "source_denied") for r in _SOURCE_DENIED_REASONS]
-     + [(r, "result_invalid") for r in _RESULT_INVALID_REASONS]
-     + [(r, "failed") for r in _FAILED_REASONS]
-     + [("context_unavailable", "context_unavailable")]))
+    _TABLE_ONLY_PAIRS + [(r, "failed") for r in _UNTYPED_REASON_TEXT])
 def test_block_maps_reason_to_explicit_status(b2b_dispatch_lane, reason, expected):
     lane = b2b_dispatch_lane
     lane.sink.block(reason)
@@ -142,9 +148,8 @@ def _commit_dispatch(lane):
             "status"] == "dispatch_committed"
 
 
-@pytest.mark.parametrize("reason", _FAILED_REASONS + _CONTEXT_STALE_REASONS[:6]
-                         + _POLICY_CHANGED_REASONS[:6] + _SOURCE_DENIED_REASONS
-                         + ["context_unavailable"])
+@pytest.mark.parametrize("reason", sorted(
+    r for r in BLOCK_REASONS if b2b._BLOCK_STATUS[r] != "result_invalid"))
 def test_block_after_committed_dispatch_is_indeterminate(b2b_dispatch_lane, reason):
     """CAS committed + NO durable provider result => indeterminate, whatever the
     reason -- the dispatch may have reached the provider."""
@@ -155,12 +160,18 @@ def test_block_after_committed_dispatch_is_indeterminate(b2b_dispatch_lane, reas
         profile=lane.profile, attempt_id=lane.attempt_id)["status"] == "indeterminate"
 
 
-def test_block_after_committed_dispatch_keeps_result_invalid(b2b_dispatch_lane):
+@pytest.mark.parametrize(
+    "reason", sorted(b2b._BLOCK_RESULT_INVALID_REASONS)
+    + ["result_invalid:summary_bounds;steps[0]_bounds"])
+def test_block_after_committed_dispatch_keeps_result_invalid(
+        b2b_dispatch_lane, reason):
     """A proven-invalid result is a KNOWN outcome, not an unknown one: the
-    indeterminate override never applies to result_invalid."""
+    indeterminate override never applies to result_invalid -- including the
+    ``result_invalid:<validator detail>`` raises that embed the validator
+    reason in the exception string."""
     lane = b2b_dispatch_lane
     _commit_dispatch(lane)
-    lane.sink.block("result_invalid")
+    lane.sink.block(reason)
     assert lane.store.b2b_attempt(
         profile=lane.profile, attempt_id=lane.attempt_id)["status"] == "result_invalid"
 
@@ -984,3 +995,123 @@ def test_execute_terminal_expired_renewal_at_cas_is_source_window_closed(
         agent.client.close()
         lane.store.close()
         provider.stop()
+
+
+# ---------------------------------------------------------------------------
+# Seal-time C1 -- the sealing seam bounds its context recheck on the same
+# prospective signed window the provider-boundary checkpoints use; a blocking
+# callback can never hang finalization.
+# ---------------------------------------------------------------------------
+
+def test_seal_recheck_deadline_is_prospective(b2b_dispatch_lane):
+    """The seal-time C1 must fit inside the PROSPECTIVE ``before_seal``
+    exchange -- never the already-spent ``before_provider`` window: with an
+    EXPIRED provider exchange on the sink the seal deadline stays a full
+    prospective budget where ``context_recheck_deadline`` collapses."""
+    lane = b2b_dispatch_lane
+    lane.sink._before_provider = _resolved_with_window(lane, -5.0)
+    seal_budget = lane.sink.seal_recheck_deadline() - time.monotonic()
+    provider_budget = lane.sink.context_recheck_deadline() - time.monotonic()
+    prospective = (b2b._REQUEST_TTL_S
+                   - (b2b._SOURCE_DEADLINE_S + b2b._CONTEXT_RECHECK_SAFETY_S))
+    assert provider_budget <= 0 < seal_budget <= prospective + 0.5
+
+
+def test_seal_recheck_stalled_c1_refuses_source_window_closed(
+        b2b_dispatch_lane, monkeypatch):
+    """A producer callback that outlives the seal-time prospective window
+    refuses ``source_window_closed`` BEFORE it returns -- durable
+    ``source_denied``, the late result discarded, the lock reusable, the cap
+    refusing every later recheck on either seam."""
+    lane = b2b_dispatch_lane
+    monkeypatch.setattr(b2b, "_REQUEST_TTL_S", 1.5)
+    entered, release, finished = (threading.Event() for _ in range(3))
+
+    def _stalled(_cap):
+        entered.set()
+        try:
+            release.wait(30)
+            return copy.deepcopy(lane.view)
+        finally:
+            finished.set()
+
+    lane.cap.register_context_recheck(_stalled)
+    last_read = lane.cap._last_context_read
+    outcome = {}
+
+    def _drive():
+        try:
+            outcome["view"] = recheck_context(
+                lane.cap, lane.receipt,
+                deadline=lane.cap.sink.seal_recheck_deadline())
+        except Exception as exc:  # noqa: BLE001 -- asserted below
+            outcome["error"] = exc
+
+    driver = threading.Thread(target=_drive, daemon=True)
+    driver.start()
+    try:
+        assert entered.wait(5.0), "the C1 callback never started"
+        driver.join(timeout=5.0)    # outer guard: refusal << 30 s stall
+        assert not driver.is_alive(), (
+            "seal recheck did not refuse before the stalled callback returned")
+    finally:
+        release.set()
+        driver.join(timeout=10.0)
+    # The late callback ran to completion AFTER the refusal.
+    assert finished.wait(5.0)
+    assert str(outcome["error"]) == "source_window_closed"
+    assert lane.store.b2b_attempt(
+        profile=lane.profile, attempt_id=lane.attempt_id)[
+            "status"] == "source_denied"
+    # The timed-out cap refuses every later boundary callback on EITHER seam.
+    assert getattr(lane.cap, "_context_recheck_timed_out", False) is True
+    with pytest.raises(B2BTerminalRefusal) as retry_exc:
+        recheck_context(lane.cap, lane.receipt,
+                        deadline=time.monotonic() + 5.0)
+    assert str(retry_exc.value) == "source_window_closed"
+    with pytest.raises(B2BTerminalRefusal) as retry_exc:
+        recheck_context(lane.cap, lane.receipt)
+    assert str(retry_exc.value) == "source_window_closed"
+    assert lane.cap._last_context_read is last_read
+    assert lane.cap._context_lock.acquire(timeout=1.0)
+    lane.cap._context_lock.release()
+
+
+@pytest.mark.asyncio
+async def test_b2b_finalize_seal_recheck_is_bounded(
+        b2b_dispatch_lane, monkeypatch):
+    """``_b2b_finalize`` hands the seal-time C1 the sink's prospective
+    deadline: a stalled producer ends the run ``failed`` with durable
+    ``source_denied`` -- the sealing path can never hang on a C1 callback."""
+    lane = b2b_dispatch_lane
+    _commit_dispatch(lane)
+    text = _proposal_text()
+    parsed, reason = validate_proposal(
+        text, extract_allowed_refs(lane.receipt.view))
+    assert parsed is not None, reason
+    lane.sink.commit_result(text=text, parsed=parsed, reason=reason)
+    # The fixture adapter only carries ``_b2b_state``; the profile scope the
+    # finalize path enters is a no-op here.
+    lane.adapter._profile_scope = lambda profile: contextlib.nullcontext()
+    monkeypatch.setattr(b2b, "_REQUEST_TTL_S", 1.5)
+    entered, release = threading.Event(), threading.Event()
+
+    def _stalled(_cap):
+        entered.set()
+        release.wait(30)
+        return copy.deepcopy(lane.view)
+
+    lane.cap.register_context_recheck(_stalled)
+    try:
+        status, fields, extra = await asyncio.wait_for(
+            bxe._b2b_finalize(
+                lane.cap, {"final_response": text}, "completed", {}),
+            timeout=10.0)
+        assert entered.is_set(), "the C1 callback never started"
+        assert status == "failed" and fields["error"] == "source_window_closed"
+        assert extra is None
+        assert lane.store.b2b_attempt(
+            profile=lane.profile, attempt_id=lane.attempt_id)[
+                "status"] == "source_denied"
+    finally:
+        release.set()
