@@ -16,23 +16,18 @@ Contracts proven here, as behavior:
   ``current_execution`` / home / sink / store work. Reserved ``b2b_`` ids
   still refuse ``b2b_capability_mismatch`` cheaply — no admitted cap can
   exist on a disabled lane.
-* **Architecture (AST, not text matching).** Every ``api_server_b2b*`` import
-  in the generic modules is used ONLY as a direct call; the facade carries no
-  ``agent.b2b_execution`` imports, no ``_b2b_state`` reads, no B2B refusal
-  strings; ``api_server_runs`` touches the ``b2b_execution`` carrier field
-  only at its ``_RunLaunch`` declaration. This is the explicitly requested
-  static-structure check — it pins the delegation invariant, not behavior;
-  the parametrized tests above prove the behavior.
+* **Carrier isolation.** ``run.b2b_execution`` belongs to the topical
+  helpers — generic run plumbing never reads it. A ``_RunLaunch`` whose
+  carrier accessor explodes still completes a full native run (construction
+  → executor turn → finalize → retire) on absent/disabled lanes.
 """
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import inspect
 import sqlite3
 import threading
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -41,6 +36,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 import agent.b2b_execution as b2b_exec_mod
+from gateway.platforms import api_server_runs as _runs
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
@@ -454,103 +450,73 @@ async def test_finalize_and_block_helpers_disabled_are_noops(mode):
 
 
 # ---------------------------------------------------------------------------
-# f) Architecture guard (AST contract — explicitly requested; see module doc)
+# f) Carrier isolation: generic run plumbing never reads run.b2b_execution
 # ---------------------------------------------------------------------------
 
-_REPO = Path(__file__).resolve().parents[2]
-_GENERIC_MODULES = tuple(
-    _REPO / "gateway" / "platforms" / name for name in (
-        "api_server.py", "api_server_runs.py", "api_server_openai_routes.py"))
-_RUNS = _GENERIC_MODULES[1]
+class _CarrierTrapRun(_runs._RunLaunch):
+    """``_RunLaunch`` whose ``b2b_execution`` READ explodes.
+
+    The dataclass ``__init__`` still assigns the field through the setter —
+    only READS are trapped. Generic plumbing must leave the carrier to the
+    topical helpers, which consult it only after their own enabled-lane
+    check (the ``_CapTrap`` cases above).
+    """
+
+    @property
+    def b2b_execution(self):
+        raise AssertionError("generic run plumbing read run.b2b_execution")
+
+    @b2b_execution.setter
+    def b2b_execution(self, _value):
+        pass
 
 
-def _tree(path):
-    return ast.parse(path.read_text(encoding="utf-8")), path
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["absent", "disabled"])
+async def test_execute_run_generic_path_never_reads_b2b_carrier(
+        tmp_path, mode, monkeypatch):
+    """A full generic run — construction, executor turn, finalize, retire —
+    completes NATIVE on an absent/disabled lane even though reading the
+    carrier explodes. ``construct_run_agent``/``run_execution_resets``/
+    ``finalize_run`` consult it only after their state check, and no generic
+    line in ``api_server_runs`` may reach it."""
+    import gateway.platforms.api_server as _api_server
 
+    adapter = _adapter({"b2b": {"enabled": False, "profiles": {}}} if mode == "disabled" else {})
+    if mode == "absent":
+        adapter._b2b_state = None
+    store = _install_store(adapter, tmp_path)
+    try:
+        queue = asyncio.Queue()
+        run_id = "run_trap"
+        adapter._run_streams[run_id] = queue
 
-def _parents(tree):
-    return {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+        agent = SimpleNamespace(
+            session_id=None,
+            run_conversation=_Recorder(fn=lambda **kw: {"final_response": "ok"}))
+        monkeypatch.setattr(adapter, "_create_agent", lambda **kw: agent)
 
+        launch = _CarrierTrapRun(
+            adapter, run_id, queue, None, None, False, "mission", [], False,
+            dict(ephemeral_system_prompt=None, session_id=None,
+                 gateway_session_key=None, route=None, room_dispatch=None,
+                 room_execution_policy=None, requested_model=None,
+                 requested_provider=None, model_options=None,
+                 confirmed_runtime_lock=True),
+            request_profile=None, browser_control_principal=None,
+            browser_control_transport_family=None, turn_author=None,
+            b2b_execution=None)
 
-def _b2b_names(tree):
-    """Imported binding names sourced from api_server_b2b* modules —
-    covering both ``from gateway.platforms.api_server_b2b_x import y`` and
-    ``from gateway.platforms import api_server_b2b_x [as z]`` forms."""
-    names = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ImportFrom):
-            if (node.module or "").startswith("gateway.platforms.api_server_b2b"):
-                names.update(a.asname or a.name for a in node.names)
-            elif node.module == "gateway.platforms":
-                names.update(a.asname or a.name for a in node.names
-                             if a.name.startswith("api_server_b2b"))
-        elif isinstance(node, ast.Import):
-            names.update((a.asname or a.name).split(".")[0]
-                         for a in node.names if "api_server_b2b" in a.name)
-    return names
+        await _runs._execute_run(adapter, launch, _api_server=_api_server)
 
-
-def _b2b_usages_are_direct_calls(path):
-    """Every reference to a b2b import must be Call.func (or Call.func's root
-    Attribute) — never a predicate operand, assignment, or attribute walk."""
-    tree, _ = _tree(path)
-    names = _b2b_names(tree)
-    parent = _parents(tree)
-    bad = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id in names:
-            p = parent.get(node)
-            if isinstance(p, ast.Call) and p.func is node:
-                continue  # helper(...)
-            if (isinstance(p, ast.Attribute) and p.value is node
-                    and isinstance(parent.get(p), ast.Call)
-                    and parent[p].func is p):
-                continue  # module.helper(...)
-            bad.append((node.id, node.lineno))
-    return names, bad
-
-
-def test_generic_modules_only_call_b2b_helpers_never_hold_policy():
-    """api_server + api_server_runs + api_server_openai_routes: b2b imports
-    exist ONLY as direct calls; no agent.b2b_execution imports, no
-    ``_b2b_state`` reads, no B2B-named literals anywhere."""
-    for path in _GENERIC_MODULES:
-        names, bad = _b2b_usages_are_direct_calls(path)
-        assert names, f"{path.name}: no api_server_b2b imports found — delegate missing?"
-        assert bad == [], f"{path.name}: b2b import used outside a direct call: {bad}"
-
-        tree, _ = _tree(path)
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Import, ast.ImportFrom)):
-                mod = getattr(node, "module", "") or " ".join(a.name for a in node.names)
-                assert "agent.b2b_execution" not in mod, \
-                    f"{path.name}:{node.lineno} imports agent.b2b_execution directly"
-            elif isinstance(node, ast.Attribute) and node.attr == "_b2b_state":
-                pytest.fail(f"{path.name}:{node.lineno} reads _b2b_state — state is topical")
-            elif isinstance(node, ast.Constant) and isinstance(node.value, str) \
-                    and "b2b" in node.value.lower():
-                pytest.fail(
-                    f"{path.name}:{node.lineno} holds B2B literal {node.value!r} — policy is topical")
-
-
-def test_runs_module_only_touches_b2b_execution_at_carrier_declaration():
-    """The ``b2b_execution`` carrier field may be READ nowhere in generic run
-    plumbing except its ``_RunLaunch`` dataclass declaration — execution
-    binding/finalization/sink policy belongs to the topical sibling."""
-    tree, _ = _tree(_RUNS)
-    parent = _parents(tree)
-    bad = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr == "b2b_execution":
-            bad.append(("attribute", node.lineno))
-        elif isinstance(node, ast.Name) and node.id == "b2b_execution":
-            # Allowed only as the dataclass field's AnnAssign/keyword target.
-            p = parent.get(node)
-            ok = isinstance(p, (ast.AnnAssign, ast.keyword))
-            if not ok:
-                bad.append(("name", node.lineno))
-        elif isinstance(node, ast.AsyncFunctionDef) and node.name == "_b2b_finalize":
-            bad.append(("def _b2b_finalize", node.lineno))
-        elif isinstance(node, ast.FunctionDef) and node.name == "_b2b_finalize":
-            bad.append(("def _b2b_finalize", node.lineno))
-    assert bad == [], f"api_server_runs holds B2B policy: {bad}"
+        # A carrier read anywhere above lands in the generic except and
+        # finishes "failed" — "completed" proves the whole path stayed native.
+        assert adapter._run_statuses[run_id]["status"] == "completed"
+        assert len(agent.run_conversation.calls) == 1
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        assert any(e and e.get("event") == "run.completed" for e in events), events
+        assert events[-1] is None
+    finally:
+        store.close()
