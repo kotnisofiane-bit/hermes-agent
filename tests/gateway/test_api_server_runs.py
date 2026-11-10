@@ -2555,3 +2555,84 @@ def test_b2b_seal_store_rejects_invalid_context(b2b_seal_lane, fault):
             artifacts={"source_before_seal": b2b._source_record(lane.resolved),
                        "context_recheck": json_utf8(recheck), "proposal": proposal})
     _assert_seal_rollback(lane, before)
+
+
+# ---------------------------------------------------------------------------
+# sink.block failure isolation — a durable-sink error inside _execute_run's
+# error branches must not replace the original outcome or skip _finish.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["generic", "auth", "cancelled"])
+async def test_b2b_sink_block_failure_keeps_native_terminal(adapter, tmp_path,
+                                                            monkeypatch, fault):
+    """``sink.block`` raising (store locked/integrity) inside the three except
+    branches still lands the NATIVE terminal status/event, retires live state,
+    and -- for cancellation -- re-raises the original CancelledError."""
+    import sqlite3 as _sqlite3
+
+    import gateway.platforms.api_server as _api_server
+    from gateway.platforms import api_server_runs as _runs
+
+    lane = b2b_unit_fixtures.build_b2b_dispatch_lane(tmp_path)
+    try:
+        store = adapter._run_idempotency_store
+        run_id = lane.run_id
+        store.reserve(scope="b2b:" + lane.attempt_id, key=lane.attempt_id,
+                      fingerprint="fp", run_id=run_id,
+                      status={"status": "running", "session_id": lane.session_id})
+        adapter._run_idempotency_ids.add(run_id)
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+
+        def _exploding_block(reason):
+            raise _sqlite3.OperationalError("b2b attempts store locked")
+        monkeypatch.setattr(lane.sink, "block", _exploding_block)
+
+        if fault == "generic":
+            boom = ValueError("unit constructor failure")
+        elif fault == "auth":
+            boom = _api_server._ProviderAuthResolutionError("provider auth down")
+        else:
+            boom = asyncio.CancelledError()
+
+        def _raise_create_agent(**kwargs):
+            raise boom
+        monkeypatch.setattr(adapter, "_create_agent", _raise_create_agent)
+
+        launch = _runs._RunLaunch(
+            adapter, run_id, queue, lane.session_id, None, False, "mission", [],
+            False,
+            dict(ephemeral_system_prompt=None, session_id=lane.session_id,
+                 gateway_session_key=None, route=None, room_dispatch=None,
+                 room_execution_policy=None, requested_model=None,
+                 requested_provider=None, model_options=None,
+                 confirmed_runtime_lock=True),
+            request_profile=None, browser_control_principal=None,
+            browser_control_transport_family=None, turn_author=None,
+            b2b_execution=lane.cap)
+
+        expected = "cancelled" if fault == "cancelled" else "failed"
+        if fault == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await _runs._execute_run(adapter, launch, _api_server=_api_server)
+        else:
+            await _runs._execute_run(adapter, launch, _api_server=_api_server)
+
+        # Native in-memory terminal status + terminal SSE event + sentinel.
+        assert adapter._run_statuses[run_id]["status"] == expected
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        assert any(e and e.get("event") == f"run.{expected}" for e in events), events
+        assert events[-1] is None
+        # Live run state fully retired.
+        for table in (adapter._active_run_agents, adapter._active_run_tasks,
+                      adapter._run_approval_sessions, adapter._stopping_run_ids,
+                      adapter._shutdown_interrupted_run_ids):
+            assert run_id not in table
+        # Durable terminal status on the real store.
+        stored = store.status_for_run(scope="b2b:" + lane.attempt_id, run_id=run_id)
+        assert stored["status"]["status"] == expected
+    finally:
+        lane.store.close()

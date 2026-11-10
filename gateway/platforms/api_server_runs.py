@@ -987,19 +987,24 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
             _finish(status, fields, output=result.get("final_response", ""), usage=usage, runtime=served_runtime)
     except asyncio.CancelledError:
         if run.b2b_execution is not None:
-            run.b2b_execution.sink.block("native_run_interrupted")
+            # The durable block is best-effort here: a failing sink must never
+            # replace the original CancelledError or skip the terminal finish.
+            with suppress(Exception):
+                run.b2b_execution.sink.block("native_run_interrupted")
         _finish("cancelled")
         raise
     except _api_server._ProviderAuthResolutionError as exc:
         # Same controlled provider-auth message the _run_agent() endpoints give.
         logger.warning("Provider resolution failed for run=%s: %s", run_id, exc)
         if run.b2b_execution is not None:
-            run.b2b_execution.sink.block("policy_provider_unavailable")
+            with suppress(Exception):
+                run.b2b_execution.sink.block("policy_provider_unavailable")
         _finish("failed", error=exc.user_text())
     except Exception as exc:
         logger.exception("[api_server] run %s failed", run_id)
         if run.b2b_execution is not None:
-            run.b2b_execution.sink.block(str(exc))
+            with suppress(Exception):
+                run.b2b_execution.sink.block(str(exc))
         _finish("failed", error=_redact_api_error_text(exc))
     finally:
         # On cancellation (/stop) the executor thread may still block on an approval

@@ -189,13 +189,18 @@ def _attempt_id_for(binding_digest: str) -> str:
 
 
 def _request_profile(request: Any) -> Optional[str]:
-    """Only the explicit, natively resolved /p/<profile>/ typed surface is admitted."""
+    """Only the explicit, natively resolved /p/<profile>/ typed surface is admitted.
+    The selector-less scope (single-profile gateway serving a named home) resolves
+    the real home owner, never a literal ``"default"``; unknown/foreign still refuse."""
     from gateway.platforms.api_server import _api_request_profile
     declared = request.match_info.get("profile")
     if not isinstance(declared, str) or not _PROFILE_NAME.fullmatch(declared):
         return None
     active = _api_request_profile.get()
-    if declared != (active or "default"):
+    if active is None:
+        from hermes_cli.profiles import get_active_profile_name
+        active = get_active_profile_name()
+    if declared != active:
         return None
     return declared
 
@@ -1173,23 +1178,11 @@ async def _handle_b2b_proposal_post(adapter: Any, request: Any):
         return _deny(400, "invalid_attempt_id")
     if (request.headers.get("Idempotency-Key") or "").strip() != attempt_id:
         return _deny(400, "idempotency_key_mismatch")
-    db = await adapter._ensure_session_db_async()
-    if db is None:
-        return _deny(503, "store_unavailable")
-    store = adapter._run_idempotency_store
-    if not _store_durable(store):
-        return _deny(503, "store_unavailable")
-    resolved, reason = await _resolve_source_async(
-        entry, keys, "bind", attempt_id=attempt_id, profile=profile, session_id=session_id)
-    if resolved is None:
-        # Any signed-source invalidity collapses to one refusal shape — the
-        # specific check is journal-side, never leaked to the caller.
-        return _deny(503 if reason == "source_unavailable" else 403,
-                     "source_unavailable" if reason == "source_unavailable" else "source_denied")
-    return await _launch_b2b_run(
-        adapter, request, profile=profile, entry=entry, keys=keys,
-        session_id=session_id, binding_digest=binding_digest, attempt_id=attempt_id,
-        resolved=resolved, store=store, db=db)
+    # H1: the execution runtime is withdrawn, so admission never consumes the
+    # binding's single attempt — refuse BEFORE the session DB, the durable
+    # store, source I/O, admit/title/spawn. A repeated POST stays
+    # non-consuming; signed GETs on previously existing attempts still read.
+    return _deny(503, "execution_unavailable")
 
 
 async def _b2b_get(adapter: Any, request: Any, *, want_context: bool):

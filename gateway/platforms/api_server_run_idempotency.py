@@ -142,6 +142,11 @@ class RunIdempotencyStore:
         self._conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS b2b_attempts_session "
             "ON b2b_attempts(profile, session_id)")
+        # The terminal-row prune excludes B2B-linked runs through a correlated
+        # ``b2b_attempts a WHERE a.run_id = r.run_id`` lookup per candidate row —
+        # without this index that lookup is a full attempts scan each time.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS b2b_attempts_run_id ON b2b_attempts(run_id)")
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS b2b_artifacts (
                 attempt_id TEXT NOT NULL,
