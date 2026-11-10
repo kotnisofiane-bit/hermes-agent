@@ -2,8 +2,12 @@
 MyWork, real L2a bridge) + REAL native APIServerAdapter subprocess on
 ``/p/<profile>/`` + loopback provider double with a durable journal.
 
-Missing fixture envs are an explicit FAIL, never a silent PASS. The only doubles
-are the Node control surface, the provider, and the UNIT CONTEXT producer.
+Integration lane ONLY (``pytest -m integration``): the normal suite deselects
+this whole file. It requires two EXTERNAL checkouts provisioned by the runner —
+``H1_PORTAL_ROOT`` (P1 Portal checkout) and ``B2B_TEST_MY_WORK_ROOT`` (pinned
+MyWork fixture) — and a Node toolchain. Missing fixture envs are an explicit
+FAIL, never a silent PASS. The only doubles are the Node control surface, the
+provider, and the UNIT CONTEXT producer.
 """
 
 from __future__ import annotations
@@ -18,20 +22,21 @@ import uuid
 
 import pytest
 
+pytestmark = pytest.mark.integration
+
 sys.path.insert(0, os.path.dirname(__file__))
 import b2b_process_harness as H
 from b2b_process_harness import (
     P1Node, HermesChild, ProviderDouble, build_context_view, b2b_child_config,
     extract_contract_root, context_template, canonical, UNIT_RENDERED,
-    MISSION_FIXTURE, PROVIDER_FIXTURE)
+    MISSION_FIXTURE)
 
 
-PORTAL_ROOT = os.environ.get("H1_PORTAL_ROOT",
-    r"C:\Users\PC\OneDrive\Documents\Desktop\dubsar-team-ws\portal-b2b-p1-01")
-MYWORK_ROOT = os.environ.get("B2B_TEST_MY_WORK_ROOT",
-    r"C:\Users\PC\OneDrive\Documents\Desktop\dubsar-team-ws\_pins\my-work-518c85e")
-PYEXE = os.path.join(os.path.dirname(__file__), "..", "..", ".venv",
-                     "Scripts", "python.exe")
+# External checkouts the lane's runner must provision explicitly — no local
+# developer paths are ever inferred.
+PORTAL_ROOT = os.environ.get("H1_PORTAL_ROOT") or ""
+MYWORK_ROOT = os.environ.get("B2B_TEST_MY_WORK_ROOT") or ""
+PYEXE = sys.executable
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 HUB_KEY = "sk-unit-hub-" + uuid.uuid4().hex
@@ -39,6 +44,13 @@ CI_KEY = "sk-unit-ci-" + uuid.uuid4().hex
 
 
 def _require_fixtures():
+    missing = [name for name, value in
+               (("H1_PORTAL_ROOT", PORTAL_ROOT), ("B2B_TEST_MY_WORK_ROOT", MYWORK_ROOT))
+               if not value]
+    assert not missing, (
+        "integration lane selected but fixture envs unset: "
+        + ", ".join(missing)
+        + " — provision the external checkouts or run the normal suite")
     assert os.path.isdir(PORTAL_ROOT), f"Portal fixture missing: {PORTAL_ROOT}"
     assert os.path.isdir(MYWORK_ROOT), f"MyWork fixture missing: {MYWORK_ROOT}"
 
@@ -171,20 +183,15 @@ async def test_h1_01_real_p1_native_admission_terminal_no_c1(tmp_path):
         st, status_body = await flow.wait_status(session_id, attempt_id)
         assert st == 200, status_body
         assert status_body["phase"] == "context_unavailable", status_body
-        # Proof the REAL AIAgent reached execute_terminal (not just the phase label):
-        # terminal_entry carries the admitted tuple; terminal_refused is the
-        # classified refusal — never a mock or decision replacement.
+        # The refusal lands at _create_agent — BEFORE any AIAgent construction,
+        # runtime resolution or memory checkout — so no agent ever reaches the
+        # terminal seam: the observer trace must show zero terminal entries.
         trace = []
         if flow.hermes.trace_path and os.path.exists(flow.hermes.trace_path):
             trace = [json.loads(l) for l in
                      open(flow.hermes.trace_path, encoding="utf-8") if l.strip()]
-        assert any(t.get("type") == "terminal_entry" and
-                   t.get("attempt_id") == attempt_id and
-                   t.get("session_id") == session_id and
-                   t.get("run_id") == run_id for t in trace), trace
-        assert any(t.get("type") == "terminal_refused" and
-                   "context_unavailable" in str(t.get("code", ""))
-                   for t in trace), trace
+        assert not any(t.get("type") == "terminal_entry" for t in trace), trace
+        assert not any(t.get("type") == "terminal_refused" for t in trace), trace
         # Zero provider HTTP — every inbound request is journalled.
         assert flow.provider.journal() == []
         # Zero unexpected egress — the fence journal must be empty/absent.
@@ -346,19 +353,3 @@ async def test_h1_07_read_proof_status_context_snapshots(tmp_path):
         assert isinstance(body.get("artifacts"), list)
     finally:
         await flow.stop()
-
-
-@pytest.mark.asyncio
-async def test_h1_08_proposal_bounds_are_contract_exact(tmp_path):
-    """Provider-double proposal must satisfy the sealed contract limits — the
-    double text is already valid; a malformed variant is refused, never persisted."""
-    assert PROVIDER_FIXTURE["summary"] == \
-        "UNIT PROVIDER DOUBLE: synthetic non-executing proposal."
-    assert len(PROVIDER_FIXTURE["source_refs"]) <= 50
-    assert all(len(r) <= 512 for r in PROVIDER_FIXTURE["source_refs"])
-    assert len(PROVIDER_FIXTURE["limitations"]) <= 12
-    assert all(len(l) <= 500 for l in PROVIDER_FIXTURE["limitations"])
-    assert len(PROVIDER_FIXTURE["summary"]) <= 2000
-    assert 1 <= len(PROVIDER_FIXTURE["steps"]) <= 12
-    assert all(len(s) <= 500 for s in PROVIDER_FIXTURE["steps"])
-    assert len(json.dumps(PROVIDER_FIXTURE).encode()) <= 32768

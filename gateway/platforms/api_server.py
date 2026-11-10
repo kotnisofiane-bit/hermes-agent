@@ -2212,9 +2212,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
         session ``/model`` override, disables the fallback chain and fails closed."""
         from agent.b2b_execution import (
-            B2BTerminalRefusal, is_b2b_session_id, current_execution, install_bounded_agent_policy)
+            B2BTerminalRefusal, is_b2b_session_id, current_execution)
         _b2b_lane = bool(session_id) and is_b2b_session_id(str(session_id))
-        cap = None
         if not _b2b_lane and current_execution() is not None:
             raise B2BTerminalRefusal("b2b_capability_mismatch")
         if _b2b_lane:
@@ -2235,7 +2234,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     requested_model not in (None, project["model"]) or
                     requested_provider not in (None, project["provider"])):
                 raise B2BTerminalRefusal("b2b_policy_override")
-            confirmed_runtime_lock = True
+            # H1: B2B runtime construction is WITHDRAWN. AIAgent.__init__ can reach
+            # the provider before any bounded policy could be installed (lazy
+            # context_length metadata probes), so the admitted attempt refuses
+            # durably here — before run_agent import, runtime/credential/tool
+            # resolution or memory checkout. A governed construction path returns
+            # with C1's context producer.
+            cap.sink.block("context_unavailable")
+            raise B2BTerminalRefusal("context_unavailable")
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
@@ -2243,39 +2249,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         from hermes_cli.tools_config import _get_platform_tools
         # RuntimeError is caught ONLY here (sole provider-auth raiser); the typed subclass keeps
         # run_conversation() errors distinct.
-        if _b2b_lane:
-            # Resolve ONLY the operator catalogue's explicit provider, never bootstrap global defaults.
-            try:
-                runtime_kwargs = _resolve_request_runtime_agent_kwargs(
-                    project["provider"], target_model=project["model"])
-            except RuntimeError as exc:
-                raise _ProviderAuthResolutionError(str(exc)) from exc
-            if (runtime_kwargs.get("provider") != project["provider"] or
-                    runtime_kwargs.get("api_mode") not in (None, "chat_completions") or
-                    runtime_kwargs.get("provider") in {"moa", "bedrock", "anthropic"} or
-                    runtime_kwargs.get("command") or runtime_kwargs.get("args")):
-                raise B2BTerminalRefusal("b2b_alternate_provider")
-            runtime_kwargs.update(base_url=project["base_url"], api_mode=project["api_mode"],
-                                  credential_pool=None)
-            runtime_kwargs.pop("model", None)
-            model, session_override = project["model"], None
-            request_model, request_provider = project["model"], project["provider"]
-        else:
-            try:
-                runtime_kwargs = _resolve_runtime_agent_kwargs()
-            except RuntimeError as exc:
-                raise _ProviderAuthResolutionError(str(exc)) from exc
-            # A fallback-provider runtime carries its own model, not a second constructor argument.
-            model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
-            runtime_kwargs.pop("_fallback_notice", None)
+        try:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        except RuntimeError as exc:
+            raise _ProviderAuthResolutionError(str(exc)) from exc
+        # A fallback-provider runtime carries its own model, not a second constructor argument.
+        model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
+        runtime_kwargs.pop("_fallback_notice", None)
         request_reasoning_config = _request_reasoning_config(model_options)
         request_service_tier = _request_service_tier(model_options)
-        if not _b2b_lane:
-            model, session_override, request_model, request_provider = self._select_agent_runtime(
-                runtime_kwargs, model,
-                requested_model=requested_model, requested_provider=requested_provider, route=route,
-                session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
-                gateway_session_key=gateway_session_key, session_id=session_id)
+        model, session_override, request_model, request_provider = self._select_agent_runtime(
+            runtime_kwargs, model,
+            requested_model=requested_model, requested_provider=requested_provider, route=route,
+            session_model=session_model, confirmed_runtime_lock=confirmed_runtime_lock,
+            gateway_session_key=gateway_session_key, session_id=session_id)
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
         # Same gate the messaging gateway and TUI apply: ``display.interim_assistant_messages``
@@ -2311,22 +2298,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "reasoning_config": request_reasoning_config,
             "gateway_session_key": gateway_session_key,
             # The session's provider from the previous request, so its queued recall reaches this turn
-            # (#120116); checked back in by the turn's finally. B2B lanes never checkout —
-            # memory recall is not a governed read in H1.
-            "memory_manager": None if _b2b_lane else self._memory_sessions.checkout(session_id)}
+            # (#120116); checked back in by the turn's finally.
+            "memory_manager": self._memory_sessions.checkout(session_id)}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
-        if _b2b_lane:
-            # Bound B2B lane: frozen single-iteration surface — no tools, no memory checkout,
-            # no compression/idle/auto-recovery, no credential pool or fallback.
-            agent_kwargs.update({
-                "max_iterations": 1, "enabled_toolsets": [], "disabled_toolsets": ["all"],
-                "skip_memory": True, "skip_context_files": True,
-                "skip_background_review": True, "save_trajectories": False,
-                "fallback_model": None, "credential_pool": None})
         agent = AIAgent(**agent_kwargs)
-        if _b2b_lane:
-            install_bounded_agent_policy(agent, cap)
         route_source = (
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override

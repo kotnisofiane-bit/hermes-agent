@@ -721,6 +721,62 @@ def _genesis_vs_native(session: Mapping[str, Any], session_id: str, profile: str
     return True
 
 
+# Durable terminal classification for _AttemptSink.block: explicit reason ->
+# status entries; anything unlisted defaults to "failed". Exception text is
+# never mined for substrings — a reason not in this table is a bug or an
+# untyped failure, and both are "failed".
+_BLOCK_CONTEXT_STALE_REASONS = frozenset({
+    "context_schema_invalid", "context_contract_unavailable",
+    "context_digest_invalid", "context_identity_source",
+    "context_identity_mismatch", "context_catalogue_mismatch",
+    "context_authority_mismatch", "context_selection_mismatch",
+    "context_namespaces", "context_source_unavailable", "context_source_stale",
+    "context_my_work_mismatch", "context_my_work_authority",
+    "context_memory_unqualified", "context_memory_namespace",
+    "context_memory_provenance", "context_memory_mission",
+    "context_contradictions", "context_oc_malformed", "context_oc_mismatch",
+    "context_oc_unavailable", "context_accepted_unavailable",
+    "context_accepted_malformed", "context_accepted_unqualified",
+    "context_support_unqualified", "context_relation_bounds",
+    "context_view_bounds", "context_view_not_object",
+    "context_recheck_unavailable", "context_recheck_already_registered",
+    "context_render_bounds", "context_rendered_type",
+    "context_rendered_encoding", "context_too_large", "context_turn_id",
+    "context_turn_mismatch", "context_publication_conflict",
+    "context_absent_from_kwargs", "context_changed_before_sdk",
+    "context_stale",
+})
+_BLOCK_POLICY_CHANGED_REASONS = frozenset({
+    "b2b_capability_mismatch", "b2b_capability_missing",
+    "b2b_agent_binding_missing", "b2b_agent_binding_mismatch",
+    "b2b_profile_mismatch", "b2b_policy_override", "b2b_policy_changed",
+    "b2b_runtime_mismatch", "b2b_runtime_policy", "b2b_destination_mismatch",
+    "b2b_model_mismatch", "b2b_alternate_provider", "b2b_alternate_api_call",
+    "b2b_sdk_override", "b2b_sdk_headers", "b2b_client_policy",
+    "b2b_retries_not_disabled", "b2b_request_client_not_isolated",
+    "terminal_guard_required", "kwargs_not_permitted",
+})
+_BLOCK_SOURCE_DENIED_REASONS = frozenset({
+    "source_before_provider_denied", "source_before_seal_denied",
+    "source_window_closed",
+})
+_BLOCK_RESULT_INVALID_REASONS = frozenset({
+    "result_invalid", "proposal_invalid", "response_not_public",
+})
+_BLOCK_STATUS = {
+    "context_unavailable": "context_unavailable",
+    **{r: "context_stale" for r in _BLOCK_CONTEXT_STALE_REASONS},
+    **{r: "policy_changed" for r in _BLOCK_POLICY_CHANGED_REASONS},
+    **{r: "source_denied" for r in _BLOCK_SOURCE_DENIED_REASONS},
+    **{r: "result_invalid" for r in _BLOCK_RESULT_INVALID_REASONS},
+}
+# NO-RECEIPT conditions (provider_result_unavailable, result_unattested,
+# middleware_response_unattested) intentionally default to "failed" here: the
+# dispatch may or may not have reached the provider, so the post-CAS override
+# below turns them "indeterminate" once a committed marker exists with no
+# durable result — never the known-invalid result_invalid.
+
+
 class _AttemptSink:
     """Durable sink bound to one admitted attempt: source artifacts, dispatch CAS,
     context receipt, result commit. All mutations are single logical transactions."""
@@ -772,24 +828,9 @@ class _AttemptSink:
                 receipt.view["my_work"]["mission"]["source_digest"])
 
     def block(self, reason: str) -> None:
-        if reason == "context_unavailable":
-            status = "context_unavailable"
-        elif "context" in reason:
-            status = "context_stale"
-        elif "policy" in reason or "capability" in reason:
-            status = "policy_changed"
-        elif "source" in reason:
-            status = "source_denied"
-        elif reason in ("provider_result_unavailable", "result_unattested",
-                        "middleware_response_unattested"):
-            # NO-RECEIPT conditions: the dispatch may or may not have reached the
-            # provider — committed marker + absent durable result => indeterminate,
-            # never the known-invalid result_invalid.
-            status = "failed"
-        elif "result" in reason or "response" in reason:
-            status = "result_invalid"
-        else:
-            status = "failed"
+        # Durable classification comes from the explicit reason -> status table:
+        # arbitrary exception text is NEVER mined for substrings.
+        status = _BLOCK_STATUS.get(reason, "failed")
         row = self._store.b2b_attempt(profile=self.profile, attempt_id=self.attempt_id)
         if (row is not None and row["status"] == "dispatch_committed" and
                 self._store.b2b_artifact(attempt_id=self.attempt_id, kind="provider_result") is None

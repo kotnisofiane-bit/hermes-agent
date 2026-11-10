@@ -7,16 +7,18 @@ AgentContext/C1 builder — H1's context seam is a placeholder contract.
 
 from __future__ import annotations
 
+import copy
 import tempfile
-import weakref
 
 import pytest
 
 from agent.b2b_execution import (
     BoundExecution, B2BTerminalRefusal, ContextReceipt, _deep_freeze,
     _public_text, bind_execution, canonical_json, current_execution,
-    execute_terminal, extract_allowed_refs, is_b2b_attempt_id, is_b2b_session_id,
-    publish_context, require_execution, reset_execution, validate_proposal)
+    execute_terminal, extract_allowed_refs, install_bounded_agent_policy,
+    is_b2b_attempt_id, is_b2b_session_id, json_utf8, mission_prompt,
+    native_context_digest, publish_context, require_execution,
+    reset_execution, validate_proposal)
 from hermes_constants import get_hermes_home
 from tests.gateway.b2b_process_harness import (
     UNIT_RENDERED, build_context_view, extract_contract_root)
@@ -230,14 +232,28 @@ def _cap(**over):
 
 
 def _bound_agent(cap, *, turn_id="t1"):
-    """Attach a minimal agent stand-in through the real binding fields the host
-    sets (capability tag + weakref), carrying the current turn id."""
+    """Attach an agent stand-in through the real bounded policy install: the
+    catalogue's model/provider/api_mode/base_url and every bounded runtime
+    field assert_terminal_runtime verifies — never a bare namespace that a
+    weakened guard could trip over for the wrong reason."""
     class A:
-        session_id = cap.session_id
+        pass
     agent = A()
-    agent._b2b_execution = cap  # instance attr -- require_execution reads vars(agent)
+    agent.session_id = cap.session_id
     agent._current_turn_id = turn_id
-    object.__setattr__(cap, "_agent_ref", weakref.ref(agent))
+    project = cap.policy.get("project") or {}
+    agent.model = project.get("model")
+    agent.provider = project.get("provider")
+    agent.api_mode = project.get("api_mode")
+    agent.base_url = project.get("base_url")
+    agent.max_iterations = 1
+    agent.credential_pool = None
+    agent._credential_pool = None
+    token = bind_execution(cap)
+    try:
+        install_bounded_agent_policy(agent, cap)
+    finally:
+        reset_execution(token)
     return agent
 
 
@@ -257,9 +273,33 @@ def test_register_context_recheck_single():
 
 def test_publish_context_requires_structured_accepted():
     cap = _cap()
-    with pytest.raises(B2BTerminalRefusal):
-        cap.publish_context({"accepted_context": True, "resolution": "governed_bound"},
-                            b"r", turn_id="t")
+    agent = _bound_agent(cap, turn_id="t1")  # bound weakref target must stay alive
+    # A fully valid bound context carrying a schema-invalid accepted_context:
+    # the pinned r2 schema rejects it with the exact typed reason and nothing is
+    # persisted. Digest and serialized size are recomputed to the fixpoint so the
+    # schema guard is the ONLY guard that can fire — a schema-skip mutant would
+    # then fall through to the typed accepted_context qualifier, not a digest error.
+    view = build_context_view(cap.policy, {})
+    view["accepted_context"] = {"availability": "not_applicable",
+                                "bindings": "not-a-list"}
+    view["context_digest"] = native_context_digest(view)
+    size = -1
+    for _ in range(8):
+        current = len(json_utf8(view))
+        view["bounds"]["serialized_bytes"] = current
+        if current == size:
+            break
+        size = current
+    token = bind_execution(cap)
+    try:
+        with pytest.raises(B2BTerminalRefusal) as exc:
+            cap.publish_context(view, UNIT_RENDERED.encode("utf-8"), turn_id="t1")
+    finally:
+        reset_execution(token)
+    assert str(exc.value) == "context_schema_invalid"
+    assert agent._b2b_execution is cap
+    assert cap.context_receipt is None
+    assert cap.sink.context_receipt is None
 
 
 def test_publish_context_validates_and_persists():
@@ -329,13 +369,25 @@ def test_execute_terminal_refuses_wrong_turn():
     token = bind_execution(cap)
     try:
         cap.publish_context(view, UNIT_RENDERED.encode("utf-8"), turn_id="t1")
-        cap.register_context_recheck(lambda c: build_context_view(c.policy, {}))
-        with pytest.raises(B2BTerminalRefusal):
-            execute_terminal(
-                agent, {"messages": [{"role": "user", "content": UNIT_RENDERED}]},
-                cap, turn_id="t-OTHER")
+        # Rechecker replays the SAME published view — never a regenerated one
+        # whose timestamps/digest could diverge.
+        cap.register_context_recheck(lambda c: copy.deepcopy(view))
+        # Valid surroundings: catalogue model and the exact native sidecar
+        # (mission_prompt + rendered bytes) as the FINAL user message, so the
+        # only guard that can fire is the turn check itself.
+        kwargs = {
+            "model": cap.policy_get("project")["model"],
+            "messages": [{"role": "user", "content":
+                          mission_prompt(cap.policy_get("mission_request"))
+                          + "\n\n" + UNIT_RENDERED}]}
+        with pytest.raises(B2BTerminalRefusal) as exc:
+            execute_terminal(agent, kwargs, cap, turn_id="t-OTHER")
     finally:
         reset_execution(token)
+    # The EXACT guard that fired: a runtime/policy refusal leaking through here
+    # would hide a missing turn check.
+    assert str(exc.value) == "context_turn_mismatch"
+    assert cap.sink.dispatched == 0 and cap.sink.committed is None
 
 
 def test_is_b2b_predicates():
