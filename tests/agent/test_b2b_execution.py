@@ -551,7 +551,7 @@ class _TimeoutClients:
 
 
 def _timeout_worker(cap):
-    from agent.chat_completion_nonstream import _NonStreamRequest
+    from agent.b2b_nonstream import _B2BNonStreamRequest
     made = []
 
     def _factory(reason, api_kwargs=None):
@@ -564,7 +564,7 @@ def _timeout_worker(cap):
     agent.client = None
     agent._create_request_openai_client = _factory
     agent._close_request_openai_client = lambda *a, **k: None
-    req = _NonStreamRequest.__new__(_NonStreamRequest)
+    req = _B2BNonStreamRequest.__new__(_B2BNonStreamRequest)
     req.agent = agent
     req.api_kwargs = {"model": "m"}
     req.clients = _TimeoutClients()
@@ -585,8 +585,8 @@ def _cap_with_timeout(seconds, **over):
 
 
 def test_make_client_uses_project_request_timeout(monkeypatch):
-    import agent.b2b_execution as _be_mod
-    monkeypatch.setattr(_be_mod, "before_sdk_dispatch", lambda *a, **k: None)
+    import agent.b2b_nonstream as _b2b_ns_mod
+    monkeypatch.setattr(_b2b_ns_mod, "before_sdk_dispatch", lambda *a, **k: None)
     req, made = _timeout_worker(_cap_with_timeout(600))
     req._make_client("test")
     assert len(made) == 1
@@ -599,8 +599,8 @@ def test_make_client_uses_project_request_timeout(monkeypatch):
 
 
 def test_make_client_request_timeout_defaults_to_five(monkeypatch):
-    import agent.b2b_execution as _be_mod
-    monkeypatch.setattr(_be_mod, "before_sdk_dispatch", lambda *a, **k: None)
+    import agent.b2b_nonstream as _b2b_ns_mod
+    monkeypatch.setattr(_b2b_ns_mod, "before_sdk_dispatch", lambda *a, **k: None)
     req, made = _timeout_worker(_cap_with_timeout(None))
     req._make_client("test")
     kw = made[0].with_options_calls[0]
@@ -610,8 +610,8 @@ def test_make_client_request_timeout_defaults_to_five(monkeypatch):
 
 
 def test_make_client_rejects_invalid_runtime_timeout(monkeypatch):
-    import agent.b2b_execution as _be_mod
-    monkeypatch.setattr(_be_mod, "before_sdk_dispatch", lambda *a, **k: None)
+    import agent.b2b_nonstream as _b2b_ns_mod
+    monkeypatch.setattr(_b2b_ns_mod, "before_sdk_dispatch", lambda *a, **k: None)
     req, made = _timeout_worker(_cap_with_timeout(901))
     with pytest.raises(B2BTerminalRefusal, match="b2b_timeout_policy"):
         req._make_client("test")
@@ -620,8 +620,8 @@ def test_make_client_rejects_invalid_runtime_timeout(monkeypatch):
 
 
 def test_make_client_closes_client_when_isolation_impossible(monkeypatch):
-    import agent.b2b_execution as _be_mod
-    monkeypatch.setattr(_be_mod, "before_sdk_dispatch", lambda *a, **k: None)
+    import agent.b2b_nonstream as _b2b_ns_mod
+    monkeypatch.setattr(_b2b_ns_mod, "before_sdk_dispatch", lambda *a, **k: None)
     closed = []
 
     class _NoCloneClient:
@@ -692,38 +692,43 @@ def _remote_b2b_agent(tmp_path, monkeypatch, cap, *,
 
 
 def test_b2b_watchdog_floors_at_project_timeout_on_remote(tmp_path, monkeypatch):
-    """Remote endpoint + request_timeout_seconds=600: the stale watchdog tracks the
-    project policy — never the implicit 90s fuse that fires mid-call on slow
-    upstreams — and stays bounded by the remaining run budget."""
+    """Remote endpoint + request_timeout_seconds=600: the dedicated request's
+    stale watchdog tracks the project policy — never the implicit 90s fuse that
+    fires mid-call on slow upstreams — and stays bounded by the remaining run
+    budget. The generic resolver is untouched."""
     _b2b_env(tmp_path, monkeypatch)
     import time as _time
+    from agent.b2b_nonstream import _B2BNonStreamRequest
     from agent.chat_completion_helpers import _resolve_nonstream_watchdogs
     kwargs = {"model": "unit-double", "messages": [{"role": "user", "content": "hi"}]}
 
     cap = _cap_with_timeout(600)
     agent = _remote_b2b_agent(tmp_path, monkeypatch, cap)
-    assert _resolve_nonstream_watchdogs(agent, kwargs).stale_timeout == 600.0
+    req = _B2BNonStreamRequest(agent, dict(kwargs), cap=cap,
+                               receipt=object(), request_digest="d" * 64)
+    assert req.wd.stale_timeout == 600.0
 
     # Bounded by the run budget: the policy floor can never outlive the run.
     agent.run_budget_seconds = 300.0
     agent._run_budget_started_at = _time.time()
-    wd = _resolve_nonstream_watchdogs(agent, kwargs)
-    assert 280.0 < wd.stale_timeout <= 300.0
+    req = _B2BNonStreamRequest(agent, dict(kwargs), cap=cap,
+                               receipt=object(), request_digest="d" * 64)
+    assert 280.0 < req.wd.stale_timeout <= 300.0
 
-    # Control: the same REMOTE agent without a B2B cap keeps the 90s implicit fuse.
-    plain = _fresh_agent()
-    assert _resolve_nonstream_watchdogs(plain, kwargs).stale_timeout == 90.0
+    # Control: the ordinary generic helper keeps the 90s implicit fuse even on
+    # the SAME cap-bound agent — the lane owns the floor, not shared state.
+    assert _resolve_nonstream_watchdogs(agent, kwargs).stale_timeout == 90.0
 
 
 def _gate_run(tmp_path, monkeypatch, cap, *, elapsed_offset):
-    """Run a REAL _NonStreamRequest whose worker answers only when the gate opens,
-    with the call clock already ``elapsed_offset`` seconds in. Returns
+    """Run a REAL _B2BNonStreamRequest whose worker answers only when the gate
+    opens, with the call clock already ``elapsed_offset`` seconds in. Returns
     (response|None, error|None, cap)."""
     import threading
-    import agent.b2b_execution as _be_mod
-    from agent.chat_completion_nonstream import _NonStreamRequest
+    import agent.b2b_nonstream as _b2b_ns_mod
+    from agent.b2b_nonstream import _B2BNonStreamRequest
     from types import SimpleNamespace
-    monkeypatch.setattr(_be_mod, "before_sdk_dispatch", lambda *a, **k: None)
+    monkeypatch.setattr(_b2b_ns_mod, "before_sdk_dispatch", lambda *a, **k: None)
     gate = threading.Event()
     response = _Resp(content=_good_proposal())
     outcome = {}
@@ -749,12 +754,10 @@ def _gate_run(tmp_path, monkeypatch, cap, *, elapsed_offset):
     agent._abort_request_openai_client = lambda *a, **k: None
     token = bind_execution(cap)
     try:
-        req = _NonStreamRequest(
+        req = _B2BNonStreamRequest(
             agent, {"model": "unit-double",
-                    "messages": [{"role": "user", "content": "hi"}]})
-        req._b2b_execution = cap
-        req._b2b_receipt = object()
-        req._b2b_request_digest = "d" * 64
+                    "messages": [{"role": "user", "content": "hi"}]},
+            cap=cap, receipt=object(), request_digest="d" * 64)
         req.call_start -= elapsed_offset
 
         def _drive():

@@ -9,6 +9,8 @@ the response is visible to the loop/transcript. Only ``execute_terminal``
 constructs it.
 """
 
+from typing import Mapping
+
 import httpx
 
 from agent import chat_completion_helpers as h
@@ -26,10 +28,35 @@ class _B2BNonStreamRequest(_NonStreamRequest):
         self._b2b_execution = cap
         self._b2b_receipt = receipt
         self._b2b_request_digest = request_digest
+        # The operator-pinned ``request_timeout_seconds`` IS the provider-call
+        # budget -- the implicit stale fuse (90s) must never fire first on a
+        # remote endpoint, or a healthy slow upstream gets killed mid-request.
+        # The floor tracks the policy; the run budget still bounds it so the
+        # watchdog cannot outlive the run it serves.
+        project = cap.policy_get("project", {})
+        policy_timeout = (project.get("request_timeout_seconds")
+                          if isinstance(project, Mapping) else None)
+        if isinstance(policy_timeout, int) and not isinstance(policy_timeout, bool):
+            self.wd.stale_timeout = max(self.wd.stale_timeout, float(policy_timeout))
+        run_budget = getattr(agent, "run_budget_seconds", None)
+        started = getattr(agent, "_run_budget_started_at", None)
+        if (isinstance(run_budget, (int, float)) and run_budget
+                and isinstance(started, (int, float)) and started):
+            remaining = float(run_budget) - (h.time.time() - started)
+            self.wd.stale_timeout = min(self.wd.stale_timeout, max(60.0, remaining))
 
     def _make_client(self, reason: str, kind: str = "openai"):
         if self._b2b_receipt is None or not self._b2b_request_digest:
             raise B2BTerminalRefusal("terminal_guard_required")
+        # Validate the policy BEFORE building the per-request client: a refusal
+        # raised past construction would leak it -- it is not yet registered with
+        # the abort machinery nor covered by the try/finally below.
+        project_policy = self._b2b_execution.policy_get("project", {})
+        raw_timeout = project_policy.get("request_timeout_seconds", 5)
+        if (isinstance(raw_timeout, bool) or not isinstance(raw_timeout, int)
+                or not 1 <= raw_timeout <= 900):
+            raise B2BTerminalRefusal("b2b_timeout_policy")
+        request_timeout = float(raw_timeout)
         # Per-request clients are registered with the abort machinery so the watchdogs
         # force-close the worker's connection, never the shared client (#67142).
         if kind == "anthropic_messages":
@@ -39,13 +66,18 @@ class _B2BNonStreamRequest(_NonStreamRequest):
         # SDK options belong to this request, never to an agent/shared client.
         clone = getattr(client, "with_options", None)
         if not callable(clone):
+            if client is not getattr(self.agent, "client", None):
+                if kind == "anthropic_messages":
+                    self.agent._close_request_anthropic_client(client, reason="b2b_isolated_transport")
+                else:
+                    self.agent._close_request_openai_client(client, reason="b2b_isolated_transport")
             raise B2BTerminalRefusal("b2b_retries_not_disabled")
         original = client
         transport = httpx.HTTPTransport(retries=0, trust_env=False)
         http_client = httpx.Client(
-            transport=transport, trust_env=False, follow_redirects=False, timeout=5.0)
+            transport=transport, trust_env=False, follow_redirects=False, timeout=request_timeout)
         try:
-            client = clone(max_retries=0, http_client=http_client, timeout=5.0)
+            client = clone(max_retries=0, http_client=http_client, timeout=request_timeout)
             if client is original:
                 raise B2BTerminalRefusal("b2b_request_client_not_isolated")
         except Exception:
@@ -63,7 +95,7 @@ class _B2BNonStreamRequest(_NonStreamRequest):
         headers["X-Dubsar-Attempt-Id"] = cap.attempt_id
         headers["X-Dubsar-Request-Digest"] = self._b2b_request_digest
         self.api_kwargs["extra_headers"] = headers
-        self.api_kwargs["timeout"] = 5.0
+        self.api_kwargs["timeout"] = request_timeout
         return self.clients.set_client(client, kind=kind)
 
     def _call(self):

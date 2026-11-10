@@ -37,7 +37,7 @@ from agent.b2b_execution import (
 from gateway.platforms import api_server_b2b as b2b
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from tests.gateway import b2b_unit_fixtures
-from tests.gateway.b2b_process_harness import UNIT_RENDERED
+from tests.gateway.b2b_process_harness import UNIT_RENDERED, renew_unit_oc_read
 
 
 @pytest.fixture
@@ -132,7 +132,8 @@ def test_block_maps_reason_to_explicit_status(b2b_dispatch_lane, reason, expecte
 def _commit_dispatch(lane):
     lane.sink._before_provider = lane.resolved
     assert lane.sink.cas_dispatch(
-        request_digest=lane.policy["request_digest"], receipt=lane.receipt)
+        request_digest=lane.policy["request_digest"], receipt=lane.receipt,
+        rechecked_view=renew_unit_oc_read(lane.view))
     assert lane.store.b2b_attempt(
         profile=lane.profile, attempt_id=lane.attempt_id)[
             "status"] == "dispatch_committed"

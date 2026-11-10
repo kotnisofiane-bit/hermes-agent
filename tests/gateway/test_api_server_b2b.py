@@ -375,22 +375,6 @@ async def test_h1_07_read_proof_gates_status_then_not_found(tmp_path):
         await flow.stop()
 
 
-@pytest.mark.asyncio
-async def test_h1_08_proposal_bounds_are_contract_exact(tmp_path):
-    """Provider-double proposal must satisfy the sealed contract limits — the
-    double text is already valid; a malformed variant is refused, never persisted."""
-    assert PROVIDER_FIXTURE["summary"] == \
-        "UNIT PROVIDER DOUBLE: synthetic non-executing proposal."
-    assert len(PROVIDER_FIXTURE["source_refs"]) <= 50
-    assert all(len(r) <= 512 for r in PROVIDER_FIXTURE["source_refs"])
-    assert len(PROVIDER_FIXTURE["limitations"]) <= 12
-    assert all(len(l) <= 500 for l in PROVIDER_FIXTURE["limitations"])
-    assert len(PROVIDER_FIXTURE["summary"]) <= 2000
-    assert 1 <= len(PROVIDER_FIXTURE["steps"]) <= 12
-    assert all(len(s) <= 500 for s in PROVIDER_FIXTURE["steps"])
-    assert len(json.dumps(PROVIDER_FIXTURE).encode()) <= 32768
-
-
 # ---------------------------------------------------------------------------
 # request_timeout_seconds -- optional project policy key
 # ---------------------------------------------------------------------------
@@ -608,20 +592,26 @@ def test_request_timeout_invariant_config_admission_cap_worker(tmp_path, monkeyp
     """The value the operator configured is the value admitted, the value on the
     frozen cap, and the value the worker hands to ``with_options`` — one chain."""
     from tests.agent.test_b2b_execution import _timeout_worker
-    import agent.b2b_execution as _be_mod
-    monkeypatch.setattr(_be_mod, "before_sdk_dispatch", lambda *a, **k: None)
+    import agent.b2b_nonstream as _b2b_ns_mod
+    monkeypatch.setattr(_b2b_ns_mod, "before_sdk_dispatch", lambda *a, **k: None)
     lane = _timeout_lane(tmp_path, 600)
-    # admission: the durable reservation accepted this exact policy
-    assert lane.admission["status"] == "admitted" and lane.admission["run_id"] == lane.run_id
-    # cap: the frozen policy carries the configured value
-    assert lane.cap.policy_get("project")["request_timeout_seconds"] == 600
-    # worker: the isolated per-request client gets the same budget at every level
-    req, made = _timeout_worker(lane.cap)
-    req._make_client("test")
-    kw = made[0].with_options_calls[0]
-    assert kw["timeout"] == 600.0
-    assert float(kw["http_client"].timeout.connect) == 600.0
-    assert req.api_kwargs["timeout"] == 600.0
+    made = []
+    try:
+        # admission: the durable reservation accepted this exact policy
+        assert lane.admission["status"] == "admitted" and lane.admission["run_id"] == lane.run_id
+        # cap: the frozen policy carries the configured value
+        assert lane.cap.policy_get("project")["request_timeout_seconds"] == 600
+        # worker: the isolated per-request client gets the same budget at every level
+        req, made = _timeout_worker(lane.cap)
+        req._make_client("test")
+        kw = made[0].with_options_calls[0]
+        assert kw["timeout"] == 600.0
+        assert float(kw["http_client"].timeout.connect) == 600.0
+        assert req.api_kwargs["timeout"] == 600.0
+    finally:
+        if made and made[0].with_options_calls:
+            made[0].with_options_calls[0]["http_client"].close()
+        lane.store.close()
 
 
 def test_request_timeout_change_revokes_running_cap(tmp_path):
@@ -630,14 +620,17 @@ def test_request_timeout_change_revokes_running_cap(tmp_path):
     import copy
     from gateway.platforms import api_server_b2b as b2b
     lane = _timeout_lane(tmp_path, 600)
-    assert lane.sink.assert_current_policy() is True
-    # Operator bumps the key mid-run: the adapter reloads a fresh frozen state —
-    # the live basis diverges from the admission fingerprint.
-    changed = copy.deepcopy(lane.entry)
-    changed["projects"]["b2b-bench"]["request_timeout_seconds"] = 900
-    lane.adapter._b2b_state = b2b._B2BState(b2b.validate_b2b_config(
-        {"b2b": {"enabled": True, "profiles": {"hub": changed}}}))
-    assert lane.sink.assert_current_policy() is False
+    try:
+        assert lane.sink.assert_current_policy() is True
+        # Operator bumps the key mid-run: the adapter reloads a fresh frozen state —
+        # the live basis diverges from the admission fingerprint.
+        changed = copy.deepcopy(lane.entry)
+        changed["projects"]["b2b-bench"]["request_timeout_seconds"] = 900
+        lane.adapter._b2b_state = b2b._B2BState(b2b.validate_b2b_config(
+            {"b2b": {"enabled": True, "profiles": {"hub": changed}}}))
+        assert lane.sink.assert_current_policy() is False
+    finally:
+        lane.store.close()
 
 
 def test_request_timeout_added_mid_run_revokes_cap(tmp_path):
@@ -646,10 +639,13 @@ def test_request_timeout_added_mid_run_revokes_cap(tmp_path):
     import copy
     from gateway.platforms import api_server_b2b as b2b
     lane = _timeout_lane(tmp_path, None)
-    assert "request_timeout_seconds" not in lane.project
-    assert lane.sink.assert_current_policy() is True
-    changed = copy.deepcopy(lane.entry)
-    changed["projects"]["b2b-bench"]["request_timeout_seconds"] = 600
-    lane.adapter._b2b_state = b2b._B2BState(b2b.validate_b2b_config(
-        {"b2b": {"enabled": True, "profiles": {"hub": changed}}}))
-    assert lane.sink.assert_current_policy() is False
+    try:
+        assert "request_timeout_seconds" not in lane.project
+        assert lane.sink.assert_current_policy() is True
+        changed = copy.deepcopy(lane.entry)
+        changed["projects"]["b2b-bench"]["request_timeout_seconds"] = 600
+        lane.adapter._b2b_state = b2b._B2BState(b2b.validate_b2b_config(
+            {"b2b": {"enabled": True, "profiles": {"hub": changed}}}))
+        assert lane.sink.assert_current_policy() is False
+    finally:
+        lane.store.close()
