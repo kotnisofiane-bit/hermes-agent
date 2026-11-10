@@ -9,10 +9,14 @@ from __future__ import annotations
 
 import copy
 import tempfile
+import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
+import agent.b2b_nonstream as _b2b_ns_mod
+import agent.chat_completion_helpers as _helpers
 from agent import b2b_execution as be
 from agent.b2b_execution import (
     BoundExecution, B2BTerminalRefusal, ContextReceipt, _deep_freeze,
@@ -21,6 +25,7 @@ from agent.b2b_execution import (
     is_b2b_attempt_id, is_b2b_session_id, json_utf8, mission_prompt,
     native_context_digest, publish_context, require_execution,
     reset_execution, validate_proposal)
+from agent.b2b_nonstream import _B2BNonStreamRequest
 from hermes_constants import get_hermes_home
 from tests.gateway.b2b_process_harness import (
     UNIT_RENDERED, build_context_view, build_unit_native_oc_view, extract_contract_root,
@@ -632,11 +637,14 @@ def test_make_client_uses_project_request_timeout(monkeypatch):
     req._make_client("test")
     assert len(made) == 1
     kw = made[0].with_options_calls[0]
-    assert kw["max_retries"] == 0
-    assert kw["timeout"] == 600.0
-    assert float(kw["http_client"].timeout.connect) == 600.0
-    assert req.api_kwargs["timeout"] == 600.0
-    assert req.clients.calls[0][1] == "openai"
+    try:
+        assert kw["max_retries"] == 0
+        assert kw["timeout"] == 600.0
+        assert float(kw["http_client"].timeout.connect) == 600.0
+        assert req.api_kwargs["timeout"] == 600.0
+        assert req.clients.calls[0][1] == "openai"
+    finally:
+        kw["http_client"].close()
 
 
 def test_make_client_request_timeout_defaults_to_five(monkeypatch):
@@ -645,9 +653,12 @@ def test_make_client_request_timeout_defaults_to_five(monkeypatch):
     req, made = _timeout_worker(_cap_with_timeout(None))
     req._make_client("test")
     kw = made[0].with_options_calls[0]
-    assert kw["timeout"] == 5.0
-    assert float(kw["http_client"].timeout.connect) == 5.0
-    assert req.api_kwargs["timeout"] == 5.0
+    try:
+        assert kw["timeout"] == 5.0
+        assert float(kw["http_client"].timeout.connect) == 5.0
+        assert req.api_kwargs["timeout"] == 5.0
+    finally:
+        kw["http_client"].close()
 
 
 def test_make_client_rejects_invalid_runtime_timeout(monkeypatch):
@@ -677,7 +688,7 @@ def test_make_client_closes_client_when_isolation_impossible(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# stale watchdog on the B2B lane — policy floor, run-budget bound
+# stale watchdog on the B2B lane — the provider timeout arms at the actual send
 # ---------------------------------------------------------------------------
 
 def _b2b_env(tmp_path, monkeypatch):
@@ -722,7 +733,6 @@ def _fresh_agent(*, base_url="https://llm.example.com/v1", session_id=None):
 def _remote_b2b_agent(tmp_path, monkeypatch, cap, *,
                       base_url="https://llm.example.com/v1"):
     """A REAL AIAgent on a REMOTE endpoint, bound to ``cap`` the way the host binds it."""
-    from agent.b2b_execution import install_bounded_agent_policy
     agent = _fresh_agent(base_url=base_url, session_id=cap.session_id)
     token = bind_execution(cap)
     try:
@@ -732,114 +742,453 @@ def _remote_b2b_agent(tmp_path, monkeypatch, cap, *,
     return agent
 
 
-def test_b2b_watchdog_floors_at_project_timeout_on_remote(tmp_path, monkeypatch):
-    """Remote endpoint + request_timeout_seconds=600: the dedicated request's
-    stale watchdog tracks the project policy — never the implicit 90s fuse that
-    fires mid-call on slow upstreams — and stays bounded by the remaining run
-    budget. The generic resolver is untouched."""
-    _b2b_env(tmp_path, monkeypatch)
-    import time as _time
-    from agent.b2b_nonstream import _B2BNonStreamRequest
-    from agent.chat_completion_helpers import _resolve_nonstream_watchdogs
-    kwargs = {"model": "unit-double", "messages": [{"role": "user", "content": "hi"}]}
+class _FakeClock:
+    """Module-shaped stand-in patched onto ``agent.chat_completion_helpers.time``
+    (the binding ``h.time`` the worker/poll actually read) — never global
+    ``time.time``, which would contaminate fixture and event timing.
+    ``time()`` reads a controllable value; every other attribute (monotonic,
+    sleep, ...) delegates to the real module so unrelated helpers keep a real
+    clock."""
 
-    cap = _cap_with_timeout(600)
-    agent = _remote_b2b_agent(tmp_path, monkeypatch, cap)
-    req = _B2BNonStreamRequest(agent, dict(kwargs), cap=cap,
-                               receipt=object(), request_digest="d" * 64)
-    assert req.wd.stale_timeout == 600.0
+    def __init__(self, now=1000.0):
+        self.now = float(now)
+        self.on_read = None
 
-    # Bounded by the run budget: the policy floor can never outlive the run.
-    agent.run_budget_seconds = 300.0
-    agent._run_budget_started_at = _time.time()
-    req = _B2BNonStreamRequest(agent, dict(kwargs), cap=cap,
-                               receipt=object(), request_digest="d" * 64)
-    assert 280.0 < req.wd.stale_timeout <= 300.0
+    def time(self):
+        value = self.now
+        if self.on_read is not None:
+            self.on_read(value)
+        return value
 
-    # Control: the ordinary generic helper keeps the 90s implicit fuse even on
-    # the SAME cap-bound agent — the lane owns the floor, not shared state.
-    assert _resolve_nonstream_watchdogs(agent, kwargs).stale_timeout == 90.0
+    def advance(self, seconds):
+        self.now += float(seconds)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
 
 
-def _gate_run(tmp_path, monkeypatch, cap, *, elapsed_offset):
-    """Run a REAL _B2BNonStreamRequest whose worker answers only when the gate
-    opens, with the call clock already ``elapsed_offset`` seconds in. Returns
-    (response|None, error|None, cap)."""
-    import threading
-    import agent.b2b_nonstream as _b2b_ns_mod
-    from agent.b2b_nonstream import _B2BNonStreamRequest
-    from types import SimpleNamespace
-    monkeypatch.setattr(_b2b_ns_mod, "before_sdk_dispatch", lambda *a, **k: None)
-    gate = threading.Event()
+def _drive_b2b_run(tmp_path, monkeypatch, cap, *, clock=None, prep_seconds=0.0,
+                   dispatch_seconds=0.0, run_budget=None, budget_started=None,
+                   gated=False):
+    """Drive a REAL ``_B2BNonStreamRequest`` through ``run()``/``_call`` — real
+    worker thread, real poll loop — with a fake SDK ``create`` and, optionally,
+    a fake ``h.time`` clock. The fake client's ``create`` records the armed
+    ``wd.stale_timeout``/``call_start``/now AT the actual send. ``finish()``
+    releases the gate, joins driver AND worker, closes the httpx handles the
+    real ``_make_client`` built, and drops the execution binding."""
+    def _stub_dispatch(*a, **k):
+        if clock is not None and dispatch_seconds:
+            clock.advance(dispatch_seconds)
+    monkeypatch.setattr(_b2b_ns_mod, "before_sdk_dispatch", _stub_dispatch)
+
+    send_flag, release, aborted = (threading.Event() for _ in range(3))
+    outcome = {"sends": [], "made": [], "with_options": [],
+               "send_flag": send_flag, "release": release, "aborted": aborted}
     response = _Resp(content=_good_proposal())
-    outcome = {}
+    req = None
+
+    def _create(**_kw):
+        outcome["sends"].append({
+            "stale_timeout": req.wd.stale_timeout, "call_start": req.call_start,
+            "now": clock.time() if clock is not None else time.time()})
+        send_flag.set()
+        if not gated:
+            return response
+        # The stale-kill path must outlive the poll's 2s worker-join for the
+        # TimeoutError to surface, so the abort alone never releases the send.
+        released = release.wait(timeout=15.0)
+        if aborted.is_set() or not released:
+            raise ConnectionError("request client aborted mid-send")
+        return response
 
     class _GateClient:
         def __init__(self):
             self.max_retries = 0
             self.base_url = "https://llm.example.com/v1"
-            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=_create))
 
         def with_options(self, **kw):
             clone = _GateClient()
             clone.max_retries = kw.get("max_retries", 0)
+            outcome["with_options"].append(kw)
             return clone
 
-        def _create(self, **_kw):
-            gate.wait(30)
-            return response
+    def _factory(**_kw):
+        if clock is not None and prep_seconds:
+            clock.advance(prep_seconds)
+        outcome["prep_stale_timeout"] = req.wd.stale_timeout
+        client = _GateClient()
+        outcome["made"].append(client)
+        return client
 
     agent = _remote_b2b_agent(tmp_path, monkeypatch, cap)
-    agent._create_request_openai_client = lambda **kw: _GateClient()
+    if run_budget is not None:
+        agent.run_budget_seconds = run_budget
+        agent._run_budget_started_at = budget_started
+    agent._create_request_openai_client = _factory
     agent._close_request_openai_client = lambda *a, **k: None
-    agent._abort_request_openai_client = lambda *a, **k: None
+    agent._abort_request_openai_client = lambda *a, **k: aborted.set()
+    if clock is not None:
+        monkeypatch.setattr(_helpers, "time", clock)
     token = bind_execution(cap)
     try:
         req = _B2BNonStreamRequest(
             agent, {"model": "unit-double",
                     "messages": [{"role": "user", "content": "hi"}]},
             cap=cap, receipt=object(), request_digest="d" * 64)
-        req.call_start -= elapsed_offset
-
-        def _drive():
-            try:
-                outcome["response"] = req.run()
-            except Exception as exc:  # noqa: BLE001 — surfaced by the assertion
-                outcome["error"] = exc
-
-        driver = threading.Thread(target=_drive, daemon=True)
-        try:
-            driver.start()
-            driver.join(timeout=4.0)
-            outcome["killed_early"] = not driver.is_alive()
-        finally:
-            gate.set()
-        driver.join(timeout=10.0)
-    finally:
-        gate.set()
+    except Exception:
         reset_execution(token)
+        raise
     outcome["req"] = req
+    outcome["agent"] = agent
+
+    def _drive():
+        try:
+            outcome["response"] = req.run()
+        except Exception as exc:  # noqa: BLE001 — surfaced by the assertions
+            outcome["error"] = exc
+
+    driver = threading.Thread(target=_drive, daemon=True)
+    driver.start()
+    outcome["driver"] = driver
+
+    def finish():
+        try:
+            release.set()
+            driver.join(timeout=10.0)
+            # ``run()`` returns before the worker finishes unwinding a killed
+            # send — join it too so post-release normalization is visible.
+            if req is not None and req.thread is not None:
+                req.thread.join(timeout=10.0)
+            # The fake SDK clone does not own the real httpx.Client _make_client
+            # built — close every handle handed to with_options.
+            for call in outcome["with_options"]:
+                handle = call.get("http_client")
+                if handle is not None:
+                    handle.close()
+            assert not driver.is_alive()
+            assert req is None or req.thread is None or not req.thread.is_alive()
+        finally:
+            reset_execution(token)
+
+    outcome["finish"] = finish
     return outcome
 
 
-def test_b2b_remote_run_survives_past_implicit_stale(tmp_path, monkeypatch):
-    """Through run(): a remote worker answering at elapsed>90s is NOT stale-killed
-    when the project pins 600s — the defect the review scenario described."""
+@pytest.mark.parametrize("policy_timeout,armed", [(600, 600.0), (None, 5.0)],
+                         ids=["configured-600", "default-5"])
+def test_b2b_send_arms_policy_timeout_without_run_budget(
+        tmp_path, monkeypatch, policy_timeout, armed):
+    """No active run budget: the preparation ceiling is unbounded (never the
+    implicit 90s generic fuse) and the send arms the validated provider
+    timeout — 600 configured, 5 unconfigured."""
+    _b2b_env(tmp_path, monkeypatch)
+    from agent.chat_completion_helpers import _resolve_nonstream_watchdogs
+    clock = _FakeClock(1000.0)
+    cap = _cap_with_timeout(policy_timeout, sink=_TSink())
+    out = _drive_b2b_run(tmp_path, monkeypatch, cap, clock=clock)
+    try:
+        out["driver"].join(timeout=10.0)
+        send = out["sends"][0]
+        assert out["prep_stale_timeout"] == float("inf")
+        assert send["now"] == 1000.0 and send["call_start"] == 1000.0
+        assert send["stale_timeout"] == armed
+        assert out.get("error") is None and out["response"] is not None
+        assert cap.sink.committed is not None
+        # Control: the generic resolver keeps its implicit 90s fuse — the lane
+        # owns the send-time arming, not shared state.
+        assert _resolve_nonstream_watchdogs(
+            out["agent"], {"model": "unit-double", "messages": []}
+        ).stale_timeout == 90.0
+    finally:
+        out["finish"]()
+
+
+def test_b2b_send_arms_policy_timeout_under_wide_run_budget(tmp_path, monkeypatch):
+    """Wide run budget (900s): the policy 600 still wins at the send — the
+    preparation ceiling was the run budget, never the 60s floor."""
+    _b2b_env(tmp_path, monkeypatch)
+    clock = _FakeClock(1000.0)
+    cap = _cap_with_timeout(600, sink=_TSink())
+    out = _drive_b2b_run(tmp_path, monkeypatch, cap, clock=clock,
+                         run_budget=900.0, budget_started=1000.0)
+    try:
+        out["driver"].join(timeout=10.0)
+        send = out["sends"][0]
+        assert out["prep_stale_timeout"] == 900.0
+        assert send["call_start"] == 1000.0
+        assert send["stale_timeout"] == 600.0
+        assert out.get("error") is None and cap.sink.committed is not None
+    finally:
+        out["finish"]()
+
+
+def test_b2b_send_arms_remaining_run_budget_when_tighter(tmp_path, monkeypatch):
+    """budget 120s with 115s already elapsed: the send arms the FRESH
+    remaining 5s — no 60s floor, no policy floor."""
+    _b2b_env(tmp_path, monkeypatch)
+    clock = _FakeClock(1000.0)
+    cap = _cap_with_timeout(600, sink=_TSink())
+    out = _drive_b2b_run(tmp_path, monkeypatch, cap, clock=clock,
+                         run_budget=120.0, budget_started=885.0)
+    try:
+        out["driver"].join(timeout=10.0)
+        send = out["sends"][0]
+        assert out["prep_stale_timeout"] == 5.0
+        assert send["call_start"] == 1000.0
+        assert send["stale_timeout"] == 5.0
+        assert out.get("error") is None and cap.sink.committed is not None
+    finally:
+        out["finish"]()
+
+
+def test_b2b_send_arms_fresh_remaining_after_slow_preparation(tmp_path, monkeypatch):
+    """Fake clock: budget 120 from t1000, +8s of client/dispatch preparation —
+    the raw deadline covers preparation (120) while the effective window at
+    the send is the fresh remaining (112)."""
+    _b2b_env(tmp_path, monkeypatch)
+    clock = _FakeClock(1000.0)
+    cap = _cap_with_timeout(600, sink=_TSink())
+    out = _drive_b2b_run(tmp_path, monkeypatch, cap, clock=clock,
+                         prep_seconds=4.0, dispatch_seconds=4.0,
+                         run_budget=120.0, budget_started=1000.0)
+    try:
+        out["driver"].join(timeout=10.0)
+        send = out["sends"][0]
+        assert out["prep_stale_timeout"] == 120.0
+        assert send["call_start"] == 1000.0 and send["now"] == 1008.0
+        assert send["stale_timeout"] == 120.0
+        assert send["stale_timeout"] - (send["now"] - send["call_start"]) == 112.0
+        assert out.get("error") is None and cap.sink.committed is not None
+    finally:
+        out["finish"]()
+
+
+def test_b2b_policy_timeout_beats_generic_stale_override(tmp_path, monkeypatch):
+    """An operator's explicit generic stale (900s env) must NOT ride onto the
+    B2B lane: the pinned 600 policy timeout is what arms at the send."""
+    _b2b_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_API_CALL_STALE_TIMEOUT", "900")
+    from agent.chat_completion_helpers import _resolve_nonstream_watchdogs
+    clock = _FakeClock(1000.0)
+    cap = _cap_with_timeout(600, sink=_TSink())
+    out = _drive_b2b_run(tmp_path, monkeypatch, cap, clock=clock)
+    try:
+        out["driver"].join(timeout=10.0)
+        send = out["sends"][0]
+        assert send["stale_timeout"] == 600.0
+        # The generic resolver really carried the 900s override — the lane
+        # dropped it, it was never absent.
+        assert _resolve_nonstream_watchdogs(
+            out["agent"], {"model": "unit-double", "messages": []}
+        ).stale_timeout == 900.0
+        assert out.get("error") is None and cap.sink.committed is not None
+    finally:
+        out["finish"]()
+
+
+def test_b2b_short_policy_send_still_runs_after_slow_preparation(
+        tmp_path, monkeypatch):
+    """request_timeout_seconds=1 with 8s of client/dispatch preparation:
+    preparation never spends the provider timeout — raw deadline 9 (8 prep +
+    1 provider), effective window 1, the send still reaches the wire."""
+    _b2b_env(tmp_path, monkeypatch)
+    clock = _FakeClock(1000.0)
+    cap = _cap_with_timeout(1, sink=_TSink())
+    out = _drive_b2b_run(tmp_path, monkeypatch, cap, clock=clock,
+                         prep_seconds=4.0, dispatch_seconds=4.0,
+                         run_budget=60.0, budget_started=1000.0)
+    try:
+        out["driver"].join(timeout=10.0)
+        send = out["sends"][0]
+        assert send["call_start"] == 1000.0 and send["now"] == 1008.0
+        assert send["stale_timeout"] == 9.0
+        assert send["stale_timeout"] - (send["now"] - send["call_start"]) == 1.0
+        assert out.get("error") is None and cap.sink.committed is not None
+    finally:
+        out["finish"]()
+
+
+def test_b2b_pre_arm_poll_elapsed_cannot_expire_shorter_window(
+        tmp_path, monkeypatch):
+    """The construction clock never moves: a poll that captured elapsed BEFORE
+    the send arming compares it to the absolute deadline (elapsed + window),
+    so a freshly armed shorter window can't be falsely expired. prep 8s + run
+    remaining 5 → deadline 13 ≥ a cached elapsed of 8."""
+    _b2b_env(tmp_path, monkeypatch)
+    clock = _FakeClock(1000.0)
+    cap = _cap_with_timeout(600, sink=_TSink())
+    out = _drive_b2b_run(tmp_path, monkeypatch, cap, clock=clock,
+                         prep_seconds=4.0, dispatch_seconds=4.0,
+                         run_budget=13.0, budget_started=1000.0)
+    try:
+        out["driver"].join(timeout=10.0)
+        send = out["sends"][0]
+        assert send["call_start"] == 1000.0 and send["now"] == 1008.0
+        elapsed_at_send = send["now"] - send["call_start"]
+        assert elapsed_at_send == 8.0
+        assert send["stale_timeout"] == 13.0
+        # The invariant: an older poll's cached elapsed (8) sits below the
+        # armed deadline (13) — the fresh 5s window is never falsely expired.
+        assert send["stale_timeout"] >= elapsed_at_send
+        assert send["stale_timeout"] - elapsed_at_send == 5.0
+        assert out.get("error") is None and cap.sink.committed is not None
+    finally:
+        out["finish"]()
+
+
+@pytest.mark.parametrize("provider_seconds", [595.0, 601.0],
+                         ids=["answer-inside-budget", "answer-past-budget"])
+def test_b2b_provider_timeout_counts_from_actual_send(
+        tmp_path, monkeypatch, provider_seconds):
+    """Codex regression: construction t1000, client/dispatch preparation +8s,
+    SDK send at t1008. The 600s provider allowance starts AT THE SEND — armed
+    as the absolute deadline elapsed+window on the construction clock — so 595
+    provider-seconds (603 total) commits while 601 hits the real
+    ``_stale_kill``. The response is released only after a full poll has
+    completed at the chosen elapsed, proven by a SECOND time-read."""
+    _b2b_env(tmp_path, monkeypatch)
+    clock = _FakeClock(1000.0)
+    killed = threading.Event()
+    second_poll = threading.Event()
+    cap = _cap_with_timeout(600, sink=_TSink())
+    out = _drive_b2b_run(tmp_path, monkeypatch, cap, clock=clock,
+                         prep_seconds=4.0, dispatch_seconds=4.0, gated=True)
+    try:
+        req = out["req"]
+        # Record the REAL kill before the clock advances: kills are impossible
+        # while the armed deadline is inf or elapsed stays inside preparation.
+        orig_kill = req._stale_kill
+
+        def _recording_kill(elapsed):
+            killed.set()
+            return orig_kill(elapsed)
+        req._stale_kill = _recording_kill
+        assert out["send_flag"].wait(4.0), "worker never reached the SDK send"
+        send = out["sends"][0]
+        # The poll reads h.time once per iteration; a SECOND read at the target
+        # proves one full previous poll (incl. its stale comparison) completed.
+        target = 1008.0 + provider_seconds
+        send_flag = out["send_flag"]
+        reads = {"at_target": 0}
+
+        def _on_read(v):
+            if send_flag.is_set() and v >= target:
+                reads["at_target"] += 1
+                if reads["at_target"] >= 2:
+                    second_poll.set()
+        clock.on_read = _on_read
+        clock.advance(provider_seconds)
+        deadline = time.time() + 4.0
+        while (not killed.is_set() and not second_poll.is_set()
+               and time.time() < deadline):
+            time.sleep(0.02)
+        if provider_seconds <= 600.0:
+            # BEHAVIOR FIRST: a whole poll at 603 total seconds passed without
+            # any stale kill — the send-armed 600s budget covers 595.
+            assert second_poll.is_set() and not killed.is_set()
+            out["release"].set()
+            out["driver"].join(timeout=10.0)
+            assert out.get("error") is None and out["response"] is not None
+            assert cap.sink.committed is not None
+        else:
+            assert killed.is_set()
+            out["driver"].join(timeout=10.0)
+            assert isinstance(out.get("error"), TimeoutError)
+            assert cap.sink.committed is None
+        # The armed representation: stable construction clock, absolute
+        # deadline = preparation elapsed + effective provider window.
+        assert send["call_start"] == 1000.0 and send["now"] == 1008.0
+        assert send["stale_timeout"] == 608.0
+        assert send["stale_timeout"] - (send["now"] - send["call_start"]) == 600.0
+    finally:
+        out["finish"]()
+    if provider_seconds > 600.0:
+        # The aborted send unwound through ordinary worker normalization —
+        # the existing reason, never a new one.
+        assert cap.sink.blocked == ["provider_result_unavailable"]
+
+
+@pytest.mark.parametrize("budget", [0.0, -5.0], ids=["zero", "negative"])
+def test_b2b_exhausted_run_budget_stops_before_any_client(
+        tmp_path, monkeypatch, budget):
+    """A run budget already spent BEFORE the worker starts stops the call
+    before any client is built — classified provider_result_unavailable, no
+    SDK send."""
     _b2b_env(tmp_path, monkeypatch)
     cap = _cap_with_timeout(600, sink=_TSink())
-    out = _gate_run(tmp_path, monkeypatch, cap, elapsed_offset=100.0)
-    assert out["req"].wd.stale_timeout == 600.0
-    assert not out["killed_early"]          # still polling at ~103s, past 90
-    assert out.get("error") is None and out.get("response") is not None
-    assert cap.sink.committed is not None   # result passed the B2B result fence
+    out = _drive_b2b_run(tmp_path, monkeypatch, cap, run_budget=budget,
+                         budget_started=time.time())
+    try:
+        out["driver"].join(timeout=10.0)
+        assert out["made"] == [] and out["sends"] == []
+        assert isinstance(out.get("error"), B2BTerminalRefusal)
+        assert str(out["error"]) == "provider_result_unavailable"
+        assert cap.sink.blocked == ["provider_result_unavailable"]
+    finally:
+        out["finish"]()
 
 
-def test_b2b_remote_run_still_killed_without_policy_floor(tmp_path, monkeypatch):
-    """Control: without the configured key the implicit 90s fuse still cuts the
-    remote call — proving the policy floor, not the lane, carries the 600s."""
+def test_b2b_run_budget_start_at_epoch_zero_is_a_real_start(tmp_path, monkeypatch):
+    """``_run_budget_started_at=0`` is a VALID numeric start (epoch), not a
+    falsy "no budget" marker — a 600s budget from epoch 0 is long spent, so the
+    call stops before any client."""
     _b2b_env(tmp_path, monkeypatch)
-    cap = _cap_with_timeout(None, sink=_TSink())
-    out = _gate_run(tmp_path, monkeypatch, cap, elapsed_offset=100.0)
-    assert out["req"].wd.stale_timeout == 90.0
-    assert out["killed_early"]
-    assert isinstance(out.get("error"), TimeoutError)
+    cap = _cap_with_timeout(600, sink=_TSink())
+    out = _drive_b2b_run(tmp_path, monkeypatch, cap, run_budget=600.0,
+                         budget_started=0.0)
+    try:
+        out["driver"].join(timeout=10.0)
+        assert out["made"] == [] and out["sends"] == []
+        assert isinstance(out.get("error"), B2BTerminalRefusal)
+        assert str(out["error"]) == "provider_result_unavailable"
+        assert cap.sink.blocked == ["provider_result_unavailable"]
+    finally:
+        out["finish"]()
+
+
+def test_b2b_budget_spent_inside_preparation_stops_before_send(
+        tmp_path, monkeypatch):
+    """Fake clock: budget 10s alive at entry, +20s of client/dispatch
+    preparation spends it — the pre-send check stops the SDK call, still
+    classified provider_result_unavailable (never a new reason)."""
+    _b2b_env(tmp_path, monkeypatch)
+    clock = _FakeClock(1000.0)
+    cap = _cap_with_timeout(600, sink=_TSink())
+    out = _drive_b2b_run(tmp_path, monkeypatch, cap, clock=clock,
+                         prep_seconds=15.0, dispatch_seconds=5.0,
+                         run_budget=10.0, budget_started=1000.0)
+    try:
+        out["driver"].join(timeout=10.0)
+        assert len(out["made"]) == 1     # the client WAS built — budget died mid-prep
+        assert out["sends"] == []        # but the send never happened
+        assert isinstance(out.get("error"), B2BTerminalRefusal)
+        assert str(out["error"]) == "provider_result_unavailable"
+        assert cap.sink.blocked == ["provider_result_unavailable"]
+    finally:
+        out["finish"]()
+
+
+def test_b2b_exhausted_budget_blocks_real_sink_as_failed(tmp_path, monkeypatch):
+    """Real durable lane (config → admission → _AttemptSink): the pre-client
+    stop blocks the attempt as ``provider_result_unavailable`` → durable
+    ``failed`` — the existing mapping, never a new refusal reason."""
+    _b2b_env(tmp_path, monkeypatch)
+    from tests.gateway.test_api_server_b2b_timeout import _timeout_lane
+    lane = _timeout_lane(tmp_path, 600)
+    try:
+        out = _drive_b2b_run(tmp_path, monkeypatch, lane.cap, run_budget=0.0,
+                             budget_started=time.time())
+        try:
+            out["driver"].join(timeout=10.0)
+            assert out["made"] == [] and out["sends"] == []
+            assert isinstance(out.get("error"), B2BTerminalRefusal)
+            assert str(out["error"]) == "provider_result_unavailable"
+            row = lane.store.b2b_attempt(profile="hub",
+                                         attempt_id=lane.attempt_id)
+            assert row["status"] == "failed"
+        finally:
+            out["finish"]()
+    finally:
+        lane.store.close()
