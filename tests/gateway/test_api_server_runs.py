@@ -10,16 +10,24 @@ Covers:
 """
 
 import asyncio
+import copy
 import hashlib
+import json
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from agent.b2b_execution import (
+    B2BTerminalRefusal, extract_allowed_refs, json_utf8, native_context_digest,
+    recheck_context, source_basis, validate_proposal,
+)
 from gateway.config import PlatformConfig
+from gateway.platforms import api_server_b2b as b2b
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _api_request_profile,
@@ -27,6 +35,8 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+from tests.gateway import b2b_unit_fixtures
 from tools import approval as approval_mod
 from tools import approval_gateway_wait
 
@@ -2372,3 +2382,257 @@ class TestHostedRoomRuns:
                 )
             assert rejected.status == 403
             create.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# B2B namespace guards — reserved session ids refuse every generic run surface
+# before history load or agent construction.
+# ---------------------------------------------------------------------------
+
+def test_b2b_session_id_predicate():
+    from agent.b2b_execution import is_b2b_session_id
+    assert is_b2b_session_id("b2b_" + "a" * 64)
+    assert not is_b2b_session_id("b2b_" + "a" * 63)
+    assert not is_b2b_session_id("api_x")
+
+
+@pytest.mark.asyncio
+async def test_generic_runs_reject_b2b_session():
+    """POST /v1/runs with a reserved b2b_ session_id -> 404 before any turn."""
+    adapter = _make_adapter(api_key="k" * 16)
+    app = _create_runs_app(adapter)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.post(
+            "/v1/runs",
+            json={"session_id": "b2b_" + "f" * 64, "input": "x"},
+            headers={"Authorization": "Bearer " + "k" * 16})
+        assert resp.status == 404, await resp.text()
+
+
+# ---------------------------------------------------------------------------
+# b2b seal reservation - real _AttemptSink + real disk RunIdempotencyStore.
+# All context / source / provider data are UNIT CONTEXT/SOURCE/RESULT DOUBLES.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def b2b_seal_lane(tmp_path):
+    """UNIT CONTEXT/SOURCE/RESULT DOUBLES; real sink, schemas and disk transactions."""
+    lane = b2b_unit_fixtures.build_b2b_dispatch_lane(tmp_path)
+    sink, receipt = lane.sink, lane.receipt
+    sink._before_provider = lane.resolved
+    assert sink.cas_dispatch(
+        request_digest=lane.policy["request_digest"], receipt=receipt)
+    public_json = json_utf8({
+        "summary": "s", "steps": ["st"], "source_refs": [], "limitations": []})
+    parsed, reason = validate_proposal(
+        public_json.decode(), extract_allowed_refs(receipt.view))
+    sink.commit_result(text=public_json.decode(), parsed=parsed, reason=reason)
+
+    assert lane.store.b2b_attempt(profile=lane.profile, attempt_id=lane.attempt_id)[
+        "status"] == "result_received"
+    try:
+        yield lane
+    finally:
+        lane.store.close()
+
+
+def _seal_recheck_view(lane, *, divergent=False):
+    view = copy.deepcopy(lane.view)
+    view["captured_at"] = "2026-10-29T23:59:59.000Z"
+    assert view["captured_at"] != lane.view["captured_at"]
+    if divergent:
+        view["operational_context"]["view"]["view_instant"] = "1970-01-01T00:00:00.000Z"
+    view["context_digest"] = native_context_digest(view)
+    for _ in range(8):
+        size = len(json_utf8(view))
+        if view["bounds"]["serialized_bytes"] == size:
+            return view
+        view["bounds"]["serialized_bytes"] = size
+    raise AssertionError("serialized_bytes did not converge")
+
+
+def _assert_seal_rollback(lane, before):
+    lane.store.close()
+    reopened = RunIdempotencyStore(str(lane.db_path))
+    try:
+        after = reopened.b2b_snapshot(profile=lane.sink.profile, attempt_id=lane.sink.attempt_id)
+        assert after == before
+        assert after["attempt"]["status"] == "result_received"
+        assert not {"source_before_seal", "context_recheck", "proposal"} & after["artifacts"].keys()
+    finally:
+        reopened.close()
+
+
+def test_b2b_seal_positive_exact15_and_persisted(b2b_seal_lane):
+    lane = b2b_seal_lane
+    sink, receipt = lane.sink, lane.receipt
+    initial = lane.store.b2b_snapshot(profile=sink.profile, attempt_id=sink.attempt_id)
+    fresh = _seal_recheck_view(lane)
+    assert fresh["context_digest"] != receipt.digest
+    assert json_utf8(source_basis(fresh)) == receipt.source_basis_bytes
+    lane.cap.register_context_recheck(lambda cap: fresh)
+    qualified = recheck_context(lane.cap, receipt)
+    created = sink.seal(source_before_seal=lane.resolved, rechecked_view=qualified,
+                        created_at="2026-10-29T23:59:59Z")
+    assert set(created) == {
+        "proposal_id", "attempt_id", "binding_digest", "profile", "session_id",
+        "project_id", "mission_id", "mission_revision", "context_digest",
+        "summary", "steps", "source_refs", "limitations", "state", "created_at"}
+    assert "source_basis_digest" not in created
+    lane.store.close()
+    reopened = RunIdempotencyStore(str(lane.db_path))
+    try:
+        snap = reopened.b2b_snapshot(profile=sink.profile, attempt_id=sink.attempt_id)
+        assert snap["attempt"]["status"] == "proposal_ready"
+        assert snap["attempt"]["run_id"] == sink.run_id
+        assert created["state"] == "prepared" and created["context_digest"] == receipt.digest
+        assert (created["profile"], created["session_id"], created["binding_digest"],
+                created["attempt_id"]) == (sink.profile, sink.session_id, sink.binding_digest,
+                                          sink.attempt_id)
+        artifacts = snap["artifacts"]
+        for kind, original in initial["artifacts"].items():
+            assert artifacts[kind] == original
+        assert artifacts["proposal"]["payload"] == json_utf8(created)
+        for artifact in artifacts.values():
+            assert artifact["digest"] == hashlib.sha256(artifact["payload"]).hexdigest()
+        rechecked = json.loads(artifacts["context_recheck"]["payload"])
+        assert rechecked["view"] == fresh
+        assert rechecked["source_basis_digest"] == receipt.source_basis_digest
+        assert created["created_at"] == "2026-10-29T23:59:59Z"
+        assert reopened.b2b_snapshot(profile=sink.profile, attempt_id=sink.attempt_id) == snap
+        replay = reopened.b2b_seal(
+            profile=sink.profile, attempt_id=sink.attempt_id,
+            artifacts={kind: artifacts[kind]["payload"] for kind in
+                       ("source_before_seal", "context_recheck", "proposal")})
+        assert replay == json_utf8(created)
+        assert reopened.b2b_snapshot(profile=sink.profile, attempt_id=sink.attempt_id) == snap
+    finally:
+        reopened.close()
+
+
+def test_b2b_seal_rejects_stale_source_basis(b2b_seal_lane):
+    lane = b2b_seal_lane
+    before = lane.store.b2b_snapshot(profile=lane.sink.profile, attempt_id=lane.sink.attempt_id)
+    fresh = _seal_recheck_view(lane, divergent=True)
+    assert json_utf8(source_basis(fresh)) != lane.receipt.source_basis_bytes
+    with pytest.raises(B2BTerminalRefusal, match="context_stale"):
+        lane.sink.seal(source_before_seal=lane.resolved, rechecked_view=fresh,
+                       created_at="2026-10-29T23:59:59Z")
+    _assert_seal_rollback(lane, before)
+
+
+@pytest.mark.parametrize("fault", ["forged_digest", "missing_digest", "wrong_digest",
+                                  "missing_view", "nonmapping_view"])
+def test_b2b_seal_store_rejects_invalid_context(b2b_seal_lane, fault):
+    lane = b2b_seal_lane
+    sink, receipt = lane.sink, lane.receipt
+    before = lane.store.b2b_snapshot(profile=sink.profile, attempt_id=sink.attempt_id)
+    recheck = {
+        "format": "dubsar.b2b-context-recheck/1", "attempt_id": sink.attempt_id,
+        "run_id": sink.run_id, "view": _seal_recheck_view(lane, divergent=fault == "forged_digest"),
+        "source_basis_digest": receipt.source_basis_digest}
+    if fault == "missing_digest":
+        del recheck["source_basis_digest"]
+    elif fault == "wrong_digest":
+        recheck["source_basis_digest"] = "0" * 64
+    elif fault == "missing_view":
+        del recheck["view"]
+    elif fault == "nonmapping_view":
+        recheck["view"] = []
+    proposal = json_utf8({"proposal_id": "b2bprop_" + sink.attempt_id[5:],
+                    "attempt_id": sink.attempt_id, "binding_digest": sink.binding_digest,
+                    "profile": sink.profile, "session_id": sink.session_id,
+                    "project_id": sink.policy["project_id"],
+                    "mission_id": sink.policy["mission_id"],
+                    "mission_revision": sink.policy["mission_revision"],
+                    "context_digest": receipt.digest,
+                    "summary": "s", "steps": ["st"], "source_refs": [],
+                    "limitations": [], "state": "prepared",
+                    "created_at": "2026-10-29T23:59:59Z"})
+    with pytest.raises(ValueError, match="b2b_seal_context"):
+        lane.store.b2b_seal(
+            profile=sink.profile, attempt_id=sink.attempt_id,
+            artifacts={"source_before_seal": b2b._source_record(lane.resolved),
+                       "context_recheck": json_utf8(recheck), "proposal": proposal})
+    _assert_seal_rollback(lane, before)
+
+
+# ---------------------------------------------------------------------------
+# sink.block failure isolation — a durable-sink error inside _execute_run's
+# error branches must not replace the original outcome or skip _finish.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["generic", "auth", "cancelled"])
+async def test_b2b_sink_block_failure_keeps_native_terminal(adapter, tmp_path,
+                                                            monkeypatch, fault):
+    """``sink.block`` raising (store locked/integrity) inside the three except
+    branches still lands the NATIVE terminal status/event, retires live state,
+    and -- for cancellation -- re-raises the original CancelledError."""
+    import sqlite3 as _sqlite3
+
+    import gateway.platforms.api_server as _api_server
+    from gateway.platforms import api_server_runs as _runs
+
+    lane = b2b_unit_fixtures.build_b2b_dispatch_lane(tmp_path)
+    try:
+        store = adapter._run_idempotency_store
+        run_id = lane.run_id
+        store.reserve(scope="b2b:" + lane.attempt_id, key=lane.attempt_id,
+                      fingerprint="fp", run_id=run_id,
+                      status={"status": "running", "session_id": lane.session_id})
+        adapter._run_idempotency_ids.add(run_id)
+        queue = asyncio.Queue()
+        adapter._run_streams[run_id] = queue
+
+        def _exploding_block(reason):
+            raise _sqlite3.OperationalError("b2b attempts store locked")
+        monkeypatch.setattr(lane.sink, "block", _exploding_block)
+
+        if fault == "generic":
+            boom = ValueError("unit constructor failure")
+        elif fault == "auth":
+            boom = _api_server._ProviderAuthResolutionError("provider auth down")
+        else:
+            boom = asyncio.CancelledError()
+
+        def _raise_create_agent(**kwargs):
+            raise boom
+        monkeypatch.setattr(adapter, "_create_agent", _raise_create_agent)
+
+        launch = _runs._RunLaunch(
+            adapter, run_id, queue, lane.session_id, None, False, "mission", [],
+            False,
+            dict(ephemeral_system_prompt=None, session_id=lane.session_id,
+                 gateway_session_key=None, route=None, room_dispatch=None,
+                 room_execution_policy=None, requested_model=None,
+                 requested_provider=None, model_options=None,
+                 confirmed_runtime_lock=True),
+            request_profile=None, browser_control_principal=None,
+            browser_control_transport_family=None, turn_author=None,
+            b2b_execution=lane.cap)
+
+        expected = "cancelled" if fault == "cancelled" else "failed"
+        if fault == "cancelled":
+            with pytest.raises(asyncio.CancelledError):
+                await _runs._execute_run(adapter, launch, _api_server=_api_server)
+        else:
+            await _runs._execute_run(adapter, launch, _api_server=_api_server)
+
+        # Native in-memory terminal status + terminal SSE event + sentinel.
+        assert adapter._run_statuses[run_id]["status"] == expected
+        events = []
+        while not queue.empty():
+            events.append(queue.get_nowait())
+        assert any(e and e.get("event") == f"run.{expected}" for e in events), events
+        assert events[-1] is None
+        # Live run state fully retired.
+        for table in (adapter._active_run_agents, adapter._active_run_tasks,
+                      adapter._run_approval_sessions, adapter._stopping_run_ids,
+                      adapter._shutdown_interrupted_run_ids):
+            assert run_id not in table
+        # Durable terminal status on the real store.
+        stored = store.status_for_run(scope="b2b:" + lane.attempt_id, run_id=run_id)
+        assert stored["status"]["status"] == expected
+    finally:
+        lane.store.close()

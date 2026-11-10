@@ -1173,6 +1173,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
+        self._extra = extra
         self._host, self._port = listen_address(extra)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
@@ -1181,6 +1182,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             extra.get("model_name", _get_scoped_secret("API_SERVER_MODEL_NAME", "")))
         # alias (client "model") -> {model, provider?, api_key? (UPSTREAM, never logged), base_url?}
         self._model_routes: Dict[str, Dict[str, Any]] = self._parse_model_routes(extra.get("model_routes"))
+        from gateway.platforms.api_server_b2b import bind_b2b_state
+        bind_b2b_state(self)
         # Opt-in bare ``model`` passthrough on OpenAI-compatible surfaces (generic clients
         # hardcode "gpt-4o" etc., hence off by default).
         # Off by default: generic OpenAI clients routinely hardcode model names ("gpt-4o", ...), and
@@ -1629,6 +1632,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("POST", "/api/jobs/{job_id}/run", self._handle_run_job)]
         routes.extend(_room_grants._http_routes(self))
         routes.extend(_api_runs._http_routes(self))
+        from gateway.platforms.api_server_b2b import b2b_http_routes
+        routes.extend(b2b_http_routes(self))
         if _CRON_AVAILABLE:
             # Chronos fire webhook (NAS -> agent): authenticated by a NAS-minted JWT.
             routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
@@ -2206,6 +2211,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
         session ``/model`` override, disables the fallback chain and fails closed."""
+        from gateway.platforms.api_server_b2b_execution import guard_agent_construction
+        guard_agent_construction(
+            self, session_id=session_id,
+            ephemeral_system_prompt=ephemeral_system_prompt,
+            gateway_session_key=gateway_session_key, room_dispatch=room_dispatch,
+            room_execution_policy=room_execution_policy, session_model=session_model,
+            model_options=model_options, route=route,
+            requested_model=requested_model, requested_provider=requested_provider)
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
@@ -2217,10 +2230,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             runtime_kwargs = _resolve_runtime_agent_kwargs()
         except RuntimeError as exc:
             raise _ProviderAuthResolutionError(str(exc)) from exc
-        # A fallback-provider runtime carries its own ``model``: pop it (overrides config, and
-        # must not collide with the ``**runtime_kwargs`` spread).
+        # A fallback-provider runtime carries its own model, not a second constructor argument.
         model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
-        runtime_kwargs.pop("_fallback_notice", None)  # raw API surface: the switch is already logged
+        runtime_kwargs.pop("_fallback_notice", None)
         request_reasoning_config = _request_reasoning_config(model_options)
         request_service_tier = _request_service_tier(model_options)
         model, session_override, request_model, request_provider = self._select_agent_runtime(
@@ -2859,6 +2871,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return body, None
 
     async def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        from gateway.platforms.api_server_b2b_sessions import resolve_generic_session_id
+        session_id, guard_err = await resolve_generic_session_id(self, session_id)
+        if guard_err is not None:
+            return None, guard_err
         db = await self._ensure_session_db_async()
         if db is None:
             return None, self._session_db_unavailable()
@@ -2868,6 +2884,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return session, None
 
     async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+        from gateway.platforms.api_server_b2b_sessions import resolve_history_session
+        session_id = await resolve_history_session(self, session_id, None)
         db = await self._ensure_session_db_async()
         if db is None:
             return []
@@ -2902,12 +2920,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             request.query.get("include_hidden"), default=False)
 
         async def _list() -> list:
-            # include_pinned back-fills pins past the recency window; search_query pushes the
-            # title needle into SQL (substring) so a hidden/old row is found, exact match below.
-            rows = await asyncio.to_thread(
-                db.list_sessions_rich, source=source, limit=limit, offset=offset,
-                include_children=include_children, order_by_last_active=True, include_pinned=True,
-                search_query=title_filter, include_hidden=include_hidden)
+            # Row source of truth lives in the topical sibling: one native call
+            # on the ordinary lane, the protected-lineage scan when enabled.
+            from gateway.platforms.api_server_b2b_sessions import list_generic_sessions
+            rows = await list_generic_sessions(
+                self, db, source=source, limit=limit, offset=offset,
+                include_children=include_children, title_filter=title_filter,
+                include_hidden=include_hidden)
             if title_filter:
                 rows = [s for s in rows if (s.get("title") or "").strip() == title_filter]
             return rows
@@ -2952,6 +2971,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return self._session_db_unavailable()
         raw_id = body.get("id") or body.get("session_id")
         session_id = str(raw_id).strip() if raw_id else f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+        # Reserved-namespace closed-create contract lives in the topical sibling.
+        from gateway.platforms.api_server_b2b_sessions import validate_genesis_creation
+        session_id, genesis_err = validate_genesis_creation(self, body, raw_id, session_id)
+        if genesis_err is not None:
+            return genesis_err
         from gateway.session import _is_path_unsafe
         if not session_id or re.search(r'[\r\n\x00]', session_id) or _is_path_unsafe(session_id):
             return _error_response("Invalid session ID", 400, code="invalid_session_id")
@@ -3010,11 +3034,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     @_require_auth
     async def _handle_get_session(self, request: "web.Request") -> "web.Response":
-        """GET /api/sessions/{session_id}."""
-        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
-        if err:
-            return err
-        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+        """GET /api/sessions/{session_id} — ordinary + reserved orchestration
+        lives in the topical sibling; this stays a thin delegate."""
+        session_id = request.match_info["session_id"]
+        from gateway.platforms.api_server_b2b_sessions import get_generic_session
+        return await get_generic_session(self, session_id)
 
     @_require_auth
     async def _handle_patch_session(self, request: "web.Request") -> "web.Response":
@@ -3075,7 +3099,16 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if err:
             return err
         db = await self._ensure_session_db_async()
-        resolved_id = await asyncio.to_thread(db.resolve_resume_session_id, session_id)
+        if db is None:
+            return self._session_db_unavailable()
+        # The seam also owns the lineage check on BOTH the requested id and the
+        # resolved tip; fail_open=False keeps the native /messages contract —
+        # a resolver error surfaces as a 500, never silently the original id.
+        from gateway.platforms.api_server_b2b_sessions import resolve_generic_session_id
+        resolved_id, guard_err = await resolve_generic_session_id(
+            self, session_id, db=db, resolve_tip=True, fail_open=False)
+        if guard_err is not None:
+            return guard_err
         raw_limit, raw_offset = request.query.get("limit"), request.query.get("offset", "0")
         order = request.query.get("order")
         if order not in (None, "oldest", "latest"):
@@ -3114,6 +3147,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
         if not fork_id or re.search(r'[\r\n\x00]', fork_id):
             return _error_response("Invalid session ID", 400, code="invalid_session_id")
+        from gateway.platforms.api_server_b2b_sessions import guard_fork_destination
+        fork_err = guard_fork_destination(self, fork_id)
+        if fork_err is not None:
+            return fork_err
         if await asyncio.to_thread(db.get_session, fork_id):
             return _error_response(f"Session already exists: {fork_id}", 409, code="session_exists")
 
@@ -4161,8 +4198,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         return await _api_runs._handle_runs(self, request, _api_server=sys.modules[__name__])
 
-    def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
-        return _api_runs._request_owns_run(self, request, run_id)
+    async def _request_owns_run(self, request: "web.Request", run_id: str) -> bool:
+        return await _api_runs._request_owns_run(self, request, run_id)
 
     def _release_run_owner_if_forgotten(self, run_id: str) -> None:
         _api_runs._release_run_owner_if_forgotten(self, run_id)
