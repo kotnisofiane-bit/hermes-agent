@@ -1124,7 +1124,8 @@ def provider_request_digest(kwargs: Mapping[str, Any]) -> str:
 
 
 def before_sdk_dispatch(agent: Any, kwargs: Mapping[str, Any], cap: BoundExecution, *,
-                        receipt: ContextReceipt, expected_digest: str, client: Any) -> None:
+                        receipt: ContextReceipt, expected_digest: str, client: Any,
+                        dispatch_gate: Callable[[], None]) -> None:
     """Last fence inside the request-local worker, after client/request transformations."""
     assert_terminal_runtime(agent, kwargs, cap)
     if (cap.context_receipt is not receipt or cap.current_turn_id != receipt.turn_id or
@@ -1144,6 +1145,12 @@ def before_sdk_dispatch(agent: Any, kwargs: Mapping[str, Any], cap: BoundExecuti
         cap, receipt, deadline=cap.sink.context_recheck_deadline())
     if not cap.sink.resolve_before_provider():
         raise B2BTerminalRefusal("source_before_provider_denied")
+    # The single budget/cancel rejection gate: AFTER the final C1 + source
+    # renewal, immediately BEFORE the durable CAS. Past this point the dispatch
+    # is committed and the send runs unconditionally — see
+    # _B2BNonStreamRequest._check_dispatch_allowed for why a committed dispatch
+    # may overrun the run budget and must never be abandoned here.
+    dispatch_gate()
     if not cap.sink.cas_dispatch(request_digest=expected_digest, receipt=receipt,
                                  rechecked_view=fresh):
         raise B2BTerminalRefusal("dispatch_already_committed")

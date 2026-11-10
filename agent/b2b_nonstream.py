@@ -30,27 +30,47 @@ class _B2BNonStreamRequest(_NonStreamRequest):
         # alone -- client build, dispatch checks and the CAS can never spend
         # the operator-pinned ``request_timeout_seconds`` (a 1s policy must
         # still reach the wire). The provider budget arms only at the send.
-        self._arm_stale_window(float("inf"))
+        self._arm_stale_window(self._remaining_run_budget())
+
+    def _remaining_run_budget(self) -> float:
+        """Seconds of run budget left on the worker clock; ``inf`` when the
+        agent carries no numeric budget/start pair. A numeric zero budget or
+        epoch-0 start is a real (exhausted) budget, never "no budget"."""
+        budget = getattr(self.agent, "run_budget_seconds", None)
+        started = getattr(self.agent, "_run_budget_started_at", None)
+        if not (isinstance(budget, (int, float))
+                and isinstance(started, (int, float))):
+            return float("inf")
+        return max(0.0, float(budget) - (h.time.time() - float(started)))
+
+    def _check_dispatch_allowed(self) -> None:
+        """The ONE budget/cancel rejection gate, invoked by
+        ``before_sdk_dispatch`` AFTER the final C1 + source renewal and
+        immediately BEFORE the durable dispatch CAS. Refusing here is still
+        safe -- no committed marker exists. Once the CAS has committed, the
+        run may overrun by up to ``request_timeout_seconds`` (<=900s):
+        abandoning the send then would turn a bounded overrun into a
+        nonretryable, possibly-billed ``indeterminate`` -- strictly worse.
+        This is no voluntary abort after CAS, not a guarantee that the
+        network cannot fail."""
+        if self.cancelled or self._remaining_run_budget() <= 0:
+            # Persist BEFORE raising: _call swallows a cancelled worker's
+            # exception -- without the durable block the attempt would stay
+            # context_ready forever.
+            self._b2b_execution.sink.block("provider_result_unavailable")
+            raise B2BTerminalRefusal("provider_result_unavailable")
 
     def _arm_stale_window(self, requested_timeout: float) -> float:
         """Arm the stale deadline on the construction-origin clock and return
-        the effective window: ``elapsed + min(requested_timeout, remaining run
-        budget)`` -- no floor, an exhausted budget returns zero. ``call_start``
-        never moves, so the raw ``wd.stale_timeout`` includes preparation
-        elapsed; a poll holding a pre-arm elapsed can never falsely expire a
-        freshly armed shorter window. A numeric zero budget or epoch-0 start
-        is a real (exhausted) window, never "no budget"."""
+        the armed window: ``elapsed + requested_timeout`` -- the run budget
+        never clamps the provider window here (see _check_dispatch_allowed).
+        ``call_start`` never moves, so the raw ``wd.stale_timeout`` includes
+        preparation elapsed; a poll holding a pre-arm elapsed can never
+        falsely expire a freshly armed shorter window."""
         now = h.time.time()
         elapsed = max(0.0, now - self.call_start)
-        window = requested_timeout
-        run_budget = getattr(self.agent, "run_budget_seconds", None)
-        started = getattr(self.agent, "_run_budget_started_at", None)
-        if (isinstance(run_budget, (int, float))
-                and isinstance(started, (int, float))):
-            window = min(window,
-                         max(0.0, float(run_budget) - (now - float(started))))
-        self.wd.stale_timeout = elapsed + window
-        return window
+        self.wd.stale_timeout = elapsed + requested_timeout
+        return requested_timeout
 
     def _make_client(self, reason: str, kind: str = "openai"):
         if self._b2b_receipt is None or not self._b2b_request_digest:
@@ -97,7 +117,8 @@ class _B2BNonStreamRequest(_NonStreamRequest):
         cap = self._b2b_execution
         before_sdk_dispatch(
             self.agent, self.api_kwargs, cap, receipt=self._b2b_receipt,
-            expected_digest=self._b2b_request_digest, client=client)
+            expected_digest=self._b2b_request_digest, client=client,
+            dispatch_gate=self._check_dispatch_allowed)
         headers = dict(self.api_kwargs.get("extra_headers") or {})
         headers["X-Dubsar-Attempt-Id"] = cap.attempt_id
         headers["X-Dubsar-Request-Digest"] = self._b2b_request_digest
@@ -116,16 +137,17 @@ class _B2BNonStreamRequest(_NonStreamRequest):
                 watchdog_context_token = watchdog_state_var.set(self.codex_watchdog_state)
             # The B2B chat-only lane has no virtual provider/last-moment payload
             # transform between the durable dispatch fence and this single SDK call.
-            # Refresh the preparation ceiling -- a run budget already spent
-            # stops before any client is built, as an ordinary provider timeout.
-            if self._arm_stale_window(float("inf")) <= 0:
-                raise TimeoutError("b2b run budget exhausted before provider dispatch")
             client = self._make_client("b2b_chat_completion_request")
-            # Arm the validated provider timeout AT the actual send -- still
-            # bounded by whatever run budget preparation left over; a budget
-            # spent inside build/checks/CAS stops before the wire.
-            if self._arm_stale_window(float(self.api_kwargs["timeout"])) <= 0:
-                raise TimeoutError("b2b run budget exhausted before provider dispatch")
+            # Arm the validated provider timeout AT the actual send. A spent
+            # run budget or a cancel was already refused inside
+            # before_sdk_dispatch's single pre-CAS gate; once the dispatch CAS
+            # has committed the send runs unconditionally -- the run may
+            # overrun by up to request_timeout_seconds (<=900s). Abandoning
+            # here would turn a bounded overrun into a nonretryable,
+            # possibly-billed indeterminate -- strictly worse. This is no
+            # voluntary abort after CAS, not a guarantee the network cannot
+            # fail.
+            self._arm_stale_window(float(self.api_kwargs["timeout"]))
             response = client.chat.completions.create(**self.api_kwargs)
             # Validate + persist the public result BEFORE the response is
             # visible to the loop/transcript -- a rejected shape never leaves the

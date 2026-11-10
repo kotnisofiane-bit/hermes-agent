@@ -26,10 +26,14 @@ from agent.b2b_execution import (
     native_context_digest, publish_context, require_execution,
     reset_execution, validate_proposal)
 from agent.b2b_nonstream import _B2BNonStreamRequest
+from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from hermes_constants import get_hermes_home
 from tests.gateway.b2b_process_harness import (
     UNIT_RENDERED, build_context_view, build_unit_native_oc_view, extract_contract_root,
     renew_unit_oc_read, reseal_unit_context_view)
+from tests.gateway.b2b_unit_fixtures import _FakeClock
+from tests.gateway.test_api_server_b2b_terminal import (
+    _api_kwargs, _terminal_lane)
 
 
 # ---------------------------------------------------------------------------
@@ -742,43 +746,24 @@ def _remote_b2b_agent(tmp_path, monkeypatch, cap, *,
     return agent
 
 
-class _FakeClock:
-    """Module-shaped stand-in patched onto ``agent.chat_completion_helpers.time``
-    (the binding ``h.time`` the worker/poll actually read) — never global
-    ``time.time``, which would contaminate fixture and event timing.
-    ``time()`` reads a controllable value; every other attribute (monotonic,
-    sleep, ...) delegates to the real module so unrelated helpers keep a real
-    clock."""
-
-    def __init__(self, now=1000.0):
-        self.now = float(now)
-        self.on_read = None
-
-    def time(self):
-        value = self.now
-        if self.on_read is not None:
-            self.on_read(value)
-        return value
-
-    def advance(self, seconds):
-        self.now += float(seconds)
-
-    def __getattr__(self, name):
-        return getattr(time, name)
-
-
 def _drive_b2b_run(tmp_path, monkeypatch, cap, *, clock=None, prep_seconds=0.0,
                    dispatch_seconds=0.0, run_budget=None, budget_started=None,
                    gated=False):
     """Drive a REAL ``_B2BNonStreamRequest`` through ``run()``/``_call`` — real
     worker thread, real poll loop — with a fake SDK ``create`` and, optionally,
     a fake ``h.time`` clock. The fake client's ``create`` records the armed
-    ``wd.stale_timeout``/``call_start``/now AT the actual send. ``finish()``
+    ``wd.stale_timeout``/``call_start``/now AT the actual send. The dispatch
+    stub simulates the fence's elapsed time, then invokes the worker's REAL
+    budget/cancel ``dispatch_gate`` when the production call passes one, so
+    the single pre-CAS gate is exercised rather than bypassed. ``finish()``
     releases the gate, joins driver AND worker, closes the httpx handles the
     real ``_make_client`` built, and drops the execution binding."""
     def _stub_dispatch(*a, **k):
         if clock is not None and dispatch_seconds:
             clock.advance(dispatch_seconds)
+        gate = k.get("dispatch_gate")
+        if gate is not None:
+            gate()
     monkeypatch.setattr(_b2b_ns_mod, "before_sdk_dispatch", _stub_dispatch)
 
     send_flag, release, aborted = (threading.Event() for _ in range(3))
@@ -924,9 +909,13 @@ def test_b2b_send_arms_policy_timeout_under_wide_run_budget(tmp_path, monkeypatc
         out["finish"]()
 
 
-def test_b2b_send_arms_remaining_run_budget_when_tighter(tmp_path, monkeypatch):
-    """budget 120s with 115s already elapsed: the send arms the FRESH
-    remaining 5s — no 60s floor, no policy floor."""
+def test_b2b_send_arms_policy_timeout_despite_tight_run_budget(
+        tmp_path, monkeypatch):
+    """budget 120s with 115s already elapsed: the single pre-CAS gate still
+    sees remaining >0 so the dispatch commits — and the send then arms the
+    FULL policy window (600), never the remaining 5s. A committed dispatch
+    may overrun by up to request_timeout_seconds; the preparation ceiling
+    itself stays the remaining run budget."""
     _b2b_env(tmp_path, monkeypatch)
     clock = _FakeClock(1000.0)
     cap = _cap_with_timeout(600, sink=_TSink())
@@ -937,16 +926,16 @@ def test_b2b_send_arms_remaining_run_budget_when_tighter(tmp_path, monkeypatch):
         send = out["sends"][0]
         assert out["prep_stale_timeout"] == 5.0
         assert send["call_start"] == 1000.0
-        assert send["stale_timeout"] == 5.0
+        assert send["stale_timeout"] == 600.0
         assert out.get("error") is None and cap.sink.committed is not None
     finally:
         out["finish"]()
 
 
-def test_b2b_send_arms_fresh_remaining_after_slow_preparation(tmp_path, monkeypatch):
+def test_b2b_send_arms_policy_timeout_after_slow_preparation(tmp_path, monkeypatch):
     """Fake clock: budget 120 from t1000, +8s of client/dispatch preparation —
-    the raw deadline covers preparation (120) while the effective window at
-    the send is the fresh remaining (112)."""
+    the raw deadline covers preparation (8 + 600) while the effective window
+    at the send is the full policy 600, never the fresh remaining 112."""
     _b2b_env(tmp_path, monkeypatch)
     clock = _FakeClock(1000.0)
     cap = _cap_with_timeout(600, sink=_TSink())
@@ -958,8 +947,8 @@ def test_b2b_send_arms_fresh_remaining_after_slow_preparation(tmp_path, monkeypa
         send = out["sends"][0]
         assert out["prep_stale_timeout"] == 120.0
         assert send["call_start"] == 1000.0 and send["now"] == 1008.0
-        assert send["stale_timeout"] == 120.0
-        assert send["stale_timeout"] - (send["now"] - send["call_start"]) == 112.0
+        assert send["stale_timeout"] == 608.0
+        assert send["stale_timeout"] - (send["now"] - send["call_start"]) == 600.0
         assert out.get("error") is None and cap.sink.committed is not None
     finally:
         out["finish"]()
@@ -1010,12 +999,14 @@ def test_b2b_short_policy_send_still_runs_after_slow_preparation(
         out["finish"]()
 
 
-def test_b2b_pre_arm_poll_elapsed_cannot_expire_shorter_window(
+def test_b2b_pre_arm_poll_elapsed_cannot_expire_armed_window(
         tmp_path, monkeypatch):
     """The construction clock never moves: a poll that captured elapsed BEFORE
     the send arming compares it to the absolute deadline (elapsed + window),
-    so a freshly armed shorter window can't be falsely expired. prep 8s + run
-    remaining 5 → deadline 13 ≥ a cached elapsed of 8."""
+    so a freshly armed window can never be falsely expired by a stale cached
+    elapsed. prep 8s + policy 600 → deadline 608 ≥ a cached elapsed of 8
+    (run budget 13 still has 5s left at the pre-CAS gate, so the dispatch
+    commits)."""
     _b2b_env(tmp_path, monkeypatch)
     clock = _FakeClock(1000.0)
     cap = _cap_with_timeout(600, sink=_TSink())
@@ -1028,11 +1019,11 @@ def test_b2b_pre_arm_poll_elapsed_cannot_expire_shorter_window(
         assert send["call_start"] == 1000.0 and send["now"] == 1008.0
         elapsed_at_send = send["now"] - send["call_start"]
         assert elapsed_at_send == 8.0
-        assert send["stale_timeout"] == 13.0
+        assert send["stale_timeout"] == 608.0
         # The invariant: an older poll's cached elapsed (8) sits below the
-        # armed deadline (13) — the fresh 5s window is never falsely expired.
+        # armed deadline (608) — the fresh 600s window is never falsely expired.
         assert send["stale_timeout"] >= elapsed_at_send
-        assert send["stale_timeout"] - elapsed_at_send == 5.0
+        assert send["stale_timeout"] - elapsed_at_send == 600.0
         assert out.get("error") is None and cap.sink.committed is not None
     finally:
         out["finish"]()
@@ -1111,18 +1102,19 @@ def test_b2b_provider_timeout_counts_from_actual_send(
 
 
 @pytest.mark.parametrize("budget", [0.0, -5.0], ids=["zero", "negative"])
-def test_b2b_exhausted_run_budget_stops_before_any_client(
+def test_b2b_exhausted_run_budget_stops_at_dispatch_gate(
         tmp_path, monkeypatch, budget):
-    """A run budget already spent BEFORE the worker starts stops the call
-    before any client is built — classified provider_result_unavailable, no
-    SDK send."""
+    """A run budget already spent BEFORE the worker starts stops the dispatch
+    at the SINGLE pre-CAS gate — the client was built (the gate is after
+    preparation, not before it), the SDK send never ran, classified
+    provider_result_unavailable."""
     _b2b_env(tmp_path, monkeypatch)
     cap = _cap_with_timeout(600, sink=_TSink())
     out = _drive_b2b_run(tmp_path, monkeypatch, cap, run_budget=budget,
                          budget_started=time.time())
     try:
         out["driver"].join(timeout=10.0)
-        assert out["made"] == [] and out["sends"] == []
+        assert len(out["made"]) == 1 and out["sends"] == []
         assert isinstance(out.get("error"), B2BTerminalRefusal)
         assert str(out["error"]) == "provider_result_unavailable"
         assert cap.sink.blocked == ["provider_result_unavailable"]
@@ -1133,62 +1125,206 @@ def test_b2b_exhausted_run_budget_stops_before_any_client(
 def test_b2b_run_budget_start_at_epoch_zero_is_a_real_start(tmp_path, monkeypatch):
     """``_run_budget_started_at=0`` is a VALID numeric start (epoch), not a
     falsy "no budget" marker — a 600s budget from epoch 0 is long spent, so the
-    call stops before any client."""
+    dispatch stops at the pre-CAS gate after the client build."""
     _b2b_env(tmp_path, monkeypatch)
     cap = _cap_with_timeout(600, sink=_TSink())
     out = _drive_b2b_run(tmp_path, monkeypatch, cap, run_budget=600.0,
                          budget_started=0.0)
     try:
         out["driver"].join(timeout=10.0)
-        assert out["made"] == [] and out["sends"] == []
+        assert len(out["made"]) == 1 and out["sends"] == []
         assert isinstance(out.get("error"), B2BTerminalRefusal)
         assert str(out["error"]) == "provider_result_unavailable"
         assert cap.sink.blocked == ["provider_result_unavailable"]
     finally:
         out["finish"]()
+
+
+def _terminal_gate_probe(tmp_path, monkeypatch, *, run_budget=None,
+                         budget_started=None, on_resolve=None):
+    """Real ``_terminal_lane`` driven through ``request._call()`` under the
+    execution binding: real ``_AttemptSink``/disk store/SDK -> loopback
+    double, REAL ``before_sdk_dispatch`` + CAS fence -- never a stubbed
+    dispatch. A ``_FakeClock`` binds ``_helpers.time`` only; the sink's
+    signed-window checks keep real clocks. Invocation counts of the
+    worker-side C1, the source renewal and ``cas_dispatch`` are recorded;
+    ``on_resolve(request, clock)`` runs inside the REAL renewal after it
+    returns True and before the gate (clock spend / cancel injection).
+    ``request._call()`` isolates the generic poll loop exactly like the
+    post-CAS witness did. Caller closes via ``_close_probe``."""
+    request = None
+    recheck_calls = []
+
+    def _recheck(_cap):
+        recheck_calls.append(len(recheck_calls) + 1)
+        return copy.deepcopy(lane.view)
+
+    lane, provider, agent = _terminal_lane(
+        tmp_path, monkeypatch, recheck=_recheck)
+    try:
+        clock = _FakeClock(time.time())
+        monkeypatch.setattr(_helpers, "time", clock)
+        if run_budget is not None:
+            agent.run_budget_seconds = run_budget
+            agent._run_budget_started_at = (
+                clock.time() if budget_started is None else budget_started)
+
+        resolve_calls = []
+        original_resolve = lane.sink.resolve_before_provider
+
+        def _resolve_probe():
+            resolve_calls.append(len(resolve_calls) + 1)
+            ok = original_resolve()
+            if ok and on_resolve is not None:
+                on_resolve(request, clock)
+            return ok
+        monkeypatch.setattr(
+            lane.sink, "resolve_before_provider", _resolve_probe)
+
+        cas_calls = []
+        original_cas = lane.sink.cas_dispatch
+
+        def _cas_spy(**kw):
+            cas_calls.append(kw)
+            return original_cas(**kw)
+        monkeypatch.setattr(lane.sink, "cas_dispatch", _cas_spy)
+
+        api_kwargs = copy.deepcopy(_api_kwargs(lane))
+        request = _B2BNonStreamRequest(
+            agent, api_kwargs, cap=lane.cap, receipt=lane.receipt,
+            request_digest=be.provider_request_digest(api_kwargs))
+
+        token = bind_execution(lane.cap)
+        try:
+            request._call()
+        finally:
+            reset_execution(token)
+
+        return SimpleNamespace(
+            lane=lane, provider=provider, agent=agent, request=request,
+            clock=clock, recheck_calls=recheck_calls,
+            resolve_calls=resolve_calls, cas_calls=cas_calls)
+    except BaseException:
+        if request is not None:
+            request.clients.close_once("gate_probe_error_cleanup")
+        agent.client.close()
+        lane.store.close()
+        provider.stop()
+        raise
+
+
+def _close_probe(probe, reason):
+    if probe.request is not None:
+        probe.request.clients.close_once(reason)
+    probe.agent.client.close()
+    probe.lane.store.close()
+    probe.provider.stop()
 
 
 def test_b2b_budget_spent_inside_preparation_stops_before_send(
         tmp_path, monkeypatch):
-    """Fake clock: budget 10s alive at entry, +20s of client/dispatch
-    preparation spends it — the pre-send check stops the SDK call, still
-    classified provider_result_unavailable (never a new reason)."""
-    _b2b_env(tmp_path, monkeypatch)
-    clock = _FakeClock(1000.0)
-    cap = _cap_with_timeout(600, sink=_TSink())
-    out = _drive_b2b_run(tmp_path, monkeypatch, cap, clock=clock,
-                         prep_seconds=15.0, dispatch_seconds=5.0,
-                         run_budget=10.0, budget_started=1000.0)
+    """REAL durable lane (real ``_AttemptSink``, disk store, real
+    ``before_sdk_dispatch`` + CAS fence, real SDK client -> loopback double):
+    a 10s run budget spent INSIDE the source renewal stops at the single
+    pre-CAS gate — the worker-side C1 and the renewal provably ran,
+    ``cas_dispatch`` was NEVER invoked and no provider POST happened, so the
+    attempt has no dispatch uncertainty at all: durable ``failed`` via the
+    existing ``provider_result_unavailable`` classification (no committed
+    marker -> never ``indeterminate``), no dispatch/result artifacts —
+    verified again on a reopened disk connection."""
+    probe = _terminal_gate_probe(
+        tmp_path, monkeypatch, run_budget=10.0,
+        on_resolve=lambda request, clock: clock.advance(15.0))
     try:
-        out["driver"].join(timeout=10.0)
-        assert len(out["made"]) == 1     # the client WAS built — budget died mid-prep
-        assert out["sends"] == []        # but the send never happened
-        assert isinstance(out.get("error"), B2BTerminalRefusal)
-        assert str(out["error"]) == "provider_result_unavailable"
-        assert cap.sink.blocked == ["provider_result_unavailable"]
-    finally:
-        out["finish"]()
-
-
-def test_b2b_exhausted_budget_blocks_real_sink_as_failed(tmp_path, monkeypatch):
-    """Real durable lane (config → admission → _AttemptSink): the pre-client
-    stop blocks the attempt as ``provider_result_unavailable`` → durable
-    ``failed`` — the existing mapping, never a new refusal reason."""
-    _b2b_env(tmp_path, monkeypatch)
-    from tests.gateway.test_api_server_b2b_timeout import _timeout_lane
-    lane = _timeout_lane(tmp_path, 600)
-    try:
-        out = _drive_b2b_run(tmp_path, monkeypatch, lane.cap, run_budget=0.0,
-                             budget_started=time.time())
+        request = probe.request
+        # The gate refusal normalized inside the worker like any classified
+        # refusal: no response, the typed error surfaced.
+        assert request.result["response"] is None
+        assert isinstance(request.result["error"], B2BTerminalRefusal)
+        assert str(request.result["error"]) == "provider_result_unavailable"
+        # The worker-side C1 and the renewal ran; the gate sits between the
+        # renewal and the CAS -- the CAS never executed.
+        assert probe.recheck_calls == [1]
+        assert probe.resolve_calls == [1]
+        assert probe.cas_calls == []
+        assert probe.provider.posts == []
+        for kind in ("provider_dispatch", "provider_result"):
+            assert probe.lane.store.b2b_artifact(
+                attempt_id=probe.lane.attempt_id, kind=kind) is None
+        # Durable on a second connection: failed, never indeterminate.
+        probe.lane.store.close()
+        reopened = RunIdempotencyStore(str(probe.lane.db_path))
         try:
-            out["driver"].join(timeout=10.0)
-            assert out["made"] == [] and out["sends"] == []
-            assert isinstance(out.get("error"), B2BTerminalRefusal)
-            assert str(out["error"]) == "provider_result_unavailable"
-            row = lane.store.b2b_attempt(profile="hub",
-                                         attempt_id=lane.attempt_id)
-            assert row["status"] == "failed"
+            assert reopened.b2b_attempt(
+                profile=probe.lane.profile, attempt_id=probe.lane.attempt_id)[
+                    "status"] == "failed"
         finally:
-            out["finish"]()
+            reopened.close()
     finally:
-        lane.store.close()
+        _close_probe(probe, "budget_gate_teardown")
+
+
+@pytest.mark.parametrize("budget", [0.0, -5.0], ids=["zero", "negative"])
+def test_b2b_exhausted_budget_blocks_real_sink_as_failed(
+        tmp_path, monkeypatch, budget):
+    """REAL durable lane (real ``_AttemptSink``, disk store, real
+    ``before_sdk_dispatch`` + CAS fence): an already-spent run budget is
+    refused by the single pre-CAS gate — AFTER the real C1 + renewal, before
+    any ``cas_dispatch`` invocation — so no dispatch was ever committed and
+    there is no provider-side uncertainty to resolve: durable ``failed``
+    (never ``indeterminate``), no provider POST, no dispatch/result
+    artifacts."""
+    probe = _terminal_gate_probe(
+        tmp_path, monkeypatch, run_budget=budget)
+    try:
+        request = probe.request
+        assert request.result["response"] is None
+        assert isinstance(request.result["error"], B2BTerminalRefusal)
+        assert str(request.result["error"]) == "provider_result_unavailable"
+        assert probe.recheck_calls == [1]
+        assert probe.resolve_calls == [1]
+        assert probe.cas_calls == []
+        assert probe.provider.posts == []
+        assert probe.lane.store.b2b_attempt(
+            profile="hub", attempt_id=probe.lane.attempt_id)[
+                "status"] == "failed"
+        for kind in ("provider_dispatch", "provider_result"):
+            assert probe.lane.store.b2b_artifact(
+                attempt_id=probe.lane.attempt_id, kind=kind) is None
+    finally:
+        _close_probe(probe, "exhausted_budget_teardown")
+
+
+def test_b2b_cancel_during_preparation_blocks_failed_at_gate(
+        tmp_path, monkeypatch):
+    """REAL durable lane, real ``before_sdk_dispatch`` + CAS fence: the cancel
+    flag lands INSIDE the wrapped real source renewal — the SAME pre-CAS gate
+    refuses (``self.cancelled`` branch): C1 and the renewal provably ran, no
+    ``cas_dispatch``, no provider POST, durable ``failed`` even though
+    ``_call`` swallows the cancelled worker's exception -- the durable block
+    lands BEFORE the raise so a swallowed refusal can never leave the attempt
+    ``context_ready``."""
+    probe = _terminal_gate_probe(
+        tmp_path, monkeypatch,
+        on_resolve=lambda request, clock: setattr(
+            request, "cancelled", True))
+    try:
+        request = probe.request
+        # _call swallowed the refusal as an ordinary cancel: neither response
+        # nor error surfaced -- but the durable block already landed.
+        assert request.result["response"] is None
+        assert request.result["error"] is None
+        # The worker-side C1 and the renewal ran; the gate is AFTER them and
+        # BEFORE the CAS, which never executed.
+        assert probe.recheck_calls == [1]
+        assert probe.resolve_calls == [1]
+        assert probe.cas_calls == []
+        assert probe.provider.posts == []
+        assert probe.lane.store.b2b_attempt(
+            profile=probe.lane.profile, attempt_id=probe.lane.attempt_id)[
+                "status"] == "failed"
+        for kind in ("provider_dispatch", "provider_result"):
+            assert probe.lane.store.b2b_artifact(
+                attempt_id=probe.lane.attempt_id, kind=kind) is None
+    finally:
+        _close_probe(probe, "cancel_gate_teardown")

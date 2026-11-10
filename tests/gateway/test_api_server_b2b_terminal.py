@@ -32,16 +32,19 @@ import uuid
 import openai
 import pytest
 
+from agent import chat_completion_helpers as h
 from agent.b2b_execution import (
     BLOCK_REASONS, B2BTerminalRefusal, bind_execution, current_execution,
     execute_terminal, extract_allowed_refs, install_bounded_agent_policy,
     json_utf8, mission_prompt, provider_request_digest, recheck_context,
     reset_execution, validate_proposal, validate_terminal_result,
 )
+from agent.b2b_nonstream import _B2BNonStreamRequest
 from gateway.platforms import api_server_b2b as b2b
 from gateway.platforms import api_server_b2b_execution as bxe
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from tests.gateway import b2b_unit_fixtures
+from tests.gateway.b2b_unit_fixtures import _FakeClock
 from tests.gateway.b2b_process_harness import (
     UNIT_RENDERED, build_unit_native_oc_view, renew_unit_oc_read)
 
@@ -502,7 +505,7 @@ class _UnitSDKAgent:
 
 
 def _terminal_lane(tmp_path, monkeypatch, *, fail_body=None, view_factory=None,
-                   recheck=None):
+                   recheck=None, request_timeout_seconds=None):
     """Dispatch lane bound to a live loopback provider; real SDK stand-in agent
     installed through install_bounded_agent_policy; only ``resolve_source`` is
     mocked to the supplied resolved unit double.
@@ -514,6 +517,8 @@ def _terminal_lane(tmp_path, monkeypatch, *, fail_body=None, view_factory=None,
     lane = None
     try:
         lane_kw = {} if view_factory is None else {"view_factory": view_factory}
+        if request_timeout_seconds is not None:
+            lane_kw["request_timeout_seconds"] = request_timeout_seconds
         lane = b2b_unit_fixtures.build_b2b_dispatch_lane(
             tmp_path, provider_base_url=provider.base_url, **lane_kw)
         provider.db_path = lane.db_path
@@ -1115,3 +1120,143 @@ async def test_b2b_finalize_seal_recheck_is_bounded(
                 "status"] == "source_denied"
     finally:
         release.set()
+
+
+# ---------------------------------------------------------------------------
+# Post-CAS budget overrun -- the dispatch gate sits BEFORE the committed CAS;
+# once cas_dispatch commits there is NO voluntary abort: a run budget spent BY
+# the CAS itself must not stop the send (a bounded overrun, never an invented
+# retry) -- durable result_received, then the real seal path.
+#
+# Converted from the pass-4 post-CAS-window witness: real _AttemptSink, real
+# disk store, real worker, real SDK -> loopback double. Only
+# ``agent.chat_completion_helpers.time`` is the controllable _FakeClock; the
+# sink's signed-window checks, the store and the source rechecks keep real
+# clocks, exactly like production.
+# ---------------------------------------------------------------------------
+
+RUN_BUDGET_S = 10.0
+CAS_COST_S = 11.0
+
+
+def test_b2b_post_cas_budget_overrun_still_sends_and_seals(
+        tmp_path, monkeypatch):
+    """A run budget still positive at the pre-CAS gate but spent BY the CAS
+    itself leaves the send committed: one real POST, worker response with no
+    error, durable ``provider_result``/``result_received`` (never
+    ``indeterminate``), then ``_b2b_finalize``/``seal`` produce the proposal.
+    The send arms the full policy ``request_timeout_seconds`` (600) -- no
+    run-budget clamp past the gate."""
+    lane, provider, agent = _terminal_lane(
+        tmp_path, monkeypatch, request_timeout_seconds=600)
+    request = None
+    try:
+        clock = _FakeClock(time.time())
+        monkeypatch.setattr(h, "time", clock)
+        agent.run_budget_seconds = RUN_BUDGET_S
+        agent._run_budget_started_at = clock.time()
+
+        api_kwargs = copy.deepcopy(_api_kwargs(lane))
+        request = _B2BNonStreamRequest(
+            agent, api_kwargs, cap=lane.cap, receipt=lane.receipt,
+            request_digest=provider_request_digest(api_kwargs))
+        # Armed AT construction from the remaining run budget alone.
+        init_stale_timeout = request.wd.stale_timeout
+
+        evidence = {"pre_cas_remaining": None, "committed_status": None,
+                    "dispatch_marker_at_commit": None}
+        original_cas_dispatch = lane.sink.cas_dispatch
+
+        def cas_dispatch_witness(*, request_digest, receipt,
+                                 rechecked_view=None):
+            # The pre-CAS gate already passed: the budget is still positive.
+            remaining = (RUN_BUDGET_S
+                         - (clock.time() - agent._run_budget_started_at))
+            evidence["pre_cas_remaining"] = remaining
+            assert remaining > 0, remaining
+            committed = original_cas_dispatch(
+                request_digest=request_digest, receipt=receipt,
+                rechecked_view=rechecked_view)
+            assert committed is True
+            evidence["committed_status"] = lane.store.b2b_attempt(
+                profile=lane.profile, attempt_id=lane.attempt_id)["status"]
+            evidence["dispatch_marker_at_commit"] = (
+                lane.store.b2b_artifact(
+                    attempt_id=lane.attempt_id,
+                    kind="provider_dispatch") is not None)
+            # The CAS itself (proof validation, record serialization, disk
+            # CAS) consumed 11s of the 10s run budget.
+            clock.advance(CAS_COST_S)
+            return committed
+
+        monkeypatch.setattr(lane.sink, "cas_dispatch", cas_dispatch_witness)
+
+        arm_calls = []
+        original_arm = request._arm_stale_window
+
+        def arm_spy(requested_timeout):
+            window = original_arm(requested_timeout)
+            arm_calls.append({
+                "requested": requested_timeout, "now": clock.time(),
+                "window": window, "stale_timeout": request.wd.stale_timeout})
+            return window
+
+        monkeypatch.setattr(request, "_arm_stale_window", arm_spy)
+
+        token = bind_execution(lane.cap)
+        try:
+            request._call()
+        finally:
+            reset_execution(token)
+
+        # The pre-CAS gate passed with the full budget; the real CAS committed
+        # durably before the budget ran out INSIDE it.
+        assert evidence["pre_cas_remaining"] == RUN_BUDGET_S
+        assert evidence["committed_status"] == "dispatch_committed"
+        assert evidence["dispatch_marker_at_commit"] is True
+
+        # The send still ran: exactly one POST, worker response, no error,
+        # durable provider_result / result_received -- never indeterminate.
+        assert len(provider.posts) == 1
+        obs = provider.db_observations[0]
+        assert obs["status"] == "dispatch_committed", obs
+        assert request.result["error"] is None
+        assert request.result["response"] is not None
+        assert lane.store.b2b_attempt(
+            profile=lane.profile, attempt_id=lane.attempt_id)[
+                "status"] == "result_received"
+        assert lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="provider_result") is not None
+
+        # Armed-window detail: the init arm was the remaining run budget
+        # alone (10); the send arm is the full policy window (600) with NO
+        # run-budget clamp -- raw deadline = the 11s preparation elapsed
+        # (spent inside the CAS) + 600.
+        assert init_stale_timeout == RUN_BUDGET_S
+        assert arm_calls[-1]["requested"] == 600.0
+        assert arm_calls[-1]["window"] == 600.0
+        assert arm_calls[-1]["stale_timeout"] == CAS_COST_S + 600.0
+
+        # The real finalize/seal path: attested result -> sealed proposal.
+        lane.adapter._profile_scope = (
+            lambda profile: contextlib.nullcontext())
+
+        async def _seal_resolve(*a, **k):
+            return lane.resolved, "ok"
+        monkeypatch.setattr(b2b, "_resolve_source_async", _seal_resolve)
+        text = request.result["response"].choices[0].message.content
+        status, fields, extra = asyncio.run(bxe._b2b_finalize(
+            lane.cap, {"final_response": text}, "completed", {}))
+        assert status == "completed" and fields["completed"] is True
+        assert extra["b2b"]["state"] == "prepared"
+        assert lane.store.b2b_attempt(
+            profile=lane.profile, attempt_id=lane.attempt_id)[
+                "status"] == "proposal_ready"
+        assert lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="proposal") is not None
+    finally:
+        if request is not None:
+            request.clients.close_once("post_cas_witness_teardown")
+        agent.client.close()
+        lane.store.close()
+        provider.stop()

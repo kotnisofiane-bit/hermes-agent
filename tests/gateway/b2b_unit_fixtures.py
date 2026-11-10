@@ -25,11 +25,37 @@ from tests.gateway.b2b_process_harness import (
 )
 
 
+class _FakeClock:
+    """Module-shaped stand-in patched onto ``agent.chat_completion_helpers.time``
+    (the binding ``h.time`` the worker/poll actually read) — never global
+    ``time.time``, which would contaminate fixture and event timing.
+    ``time()`` reads a controllable value; every other attribute (monotonic,
+    sleep, ...) delegates to the real module so unrelated helpers keep a real
+    clock."""
+
+    def __init__(self, now=1000.0):
+        self.now = float(now)
+        self.on_read = None
+
+    def time(self):
+        value = self.now
+        if self.on_read is not None:
+            self.on_read(value)
+        return value
+
+    def advance(self, seconds):
+        self.now += float(seconds)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
 def build_b2b_dispatch_lane(tmp_path, *,
                             provider_base_url="http://127.0.0.1:1/v1",
                             mission_source_refs=(),
                             project_id="b2b-bench",
-                            view_factory=build_context_view):
+                            view_factory=build_context_view,
+                            request_timeout_seconds=None):
     """One admitted B2B attempt with a published context receipt -- ready for the
     dispatch fence. NO CAS and NO result commit: ``status == "context_ready"``.
 
@@ -57,6 +83,11 @@ def build_b2b_dispatch_lane(tmp_path, *,
                  "model": "unit-double", "provider": "custom",
                  "base_url": provider_base_url, "api_mode": "chat_completions",
                  "logical_mission": None, "project_context": None}}}
+    # Threaded into the project BEFORE config/policy/sink exist -- the
+    # admission fingerprint then covers it, never a post-hoc policy mutation.
+    if request_timeout_seconds is not None:
+        entry["projects"][project_id]["request_timeout_seconds"] = (
+            request_timeout_seconds)
     config = b2b.B2BConfig({"enabled": True, "profiles": {profile: entry}})
     state = b2b._B2BState(config)
     adapter = SimpleNamespace(_b2b_state=state)
