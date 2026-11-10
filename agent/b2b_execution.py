@@ -233,7 +233,16 @@ def context_proof(view: Mapping[str, Any]) -> Dict[str, Any]:
 
 def assert_source_equivalent(original_view: Mapping[str, Any],
                              fresh_view: Mapping[str, Any]) -> None:
-    """One source/read rule for the worker, sink, and durable transactions."""
+    """One source/read rule for the worker, sink, and durable transactions.
+
+    Only the native OC receipts (``dubsar.my-work-oc-context-view/1`` and
+    ``/2``) carry an independently attested fresh read (``view_ref`` +
+    ``view_instant``) this comparer can require to move forward — they alone
+    support the replay/freshness guarantee. A LEGACY ``operational_context.view``
+    of any other shape is still accepted on source-basis equality alone: there
+    is no attested read to compare, so replay/freshness is not provable for it
+    and is not claimed.
+    """
     original, fresh = context_proof(original_view), context_proof(fresh_view)
     if json_utf8(source_basis(original["view"])) != json_utf8(source_basis(fresh["view"])):
         raise B2BTerminalRefusal("context_stale")
@@ -429,6 +438,8 @@ class BoundExecution:
     _recheck: Any = dataclasses.field(default=None, repr=False, compare=False)
     _receipt: Any = dataclasses.field(default=None, repr=False, compare=False)
     _last_context_read: Any = dataclasses.field(default=None, repr=False, compare=False)
+    _context_recheck_timed_out: Any = dataclasses.field(
+        default=False, repr=False, compare=False)
     _agent_ref: Any = dataclasses.field(default=None, repr=False, compare=False)
     _context_lock: Any = dataclasses.field(default_factory=threading.RLock,
                                          repr=False, compare=False)
@@ -732,12 +743,77 @@ def qualify_context_view(cap: BoundExecution, view: Mapping[str, Any]) -> Dict[s
     return plain
 
 
-def recheck_context(cap: BoundExecution, receipt: ContextReceipt) -> Dict[str, Any]:
-    with cap._context_lock:
+def _context_recheck_window_closed(cap: BoundExecution) -> None:
+    """Mark the capability timed out, classify durably ``source_window_closed``
+    (safe source_denied — no CAS or renewal ran) and raise. Never returns."""
+    object.__setattr__(cap, "_context_recheck_timed_out", True)
+    sink = getattr(cap, "sink", None)
+    block = getattr(sink, "block", None)
+    if callable(block):
         try:
-            fresh = cap.context_recheck()
+            block("source_window_closed")
         except Exception:
-            raise B2BTerminalRefusal("context_recheck_unavailable") from None
+            pass  # durable write failed -- the typed refusal still surfaces
+    raise B2BTerminalRefusal("source_window_closed")
+
+
+def recheck_context(cap: BoundExecution, receipt: ContextReceipt, *,
+                    deadline: Optional[float] = None) -> Dict[str, Any]:
+    """Re-qualify a fresh context read against the accepted receipt.
+
+    ``deadline=None`` runs the producer callback synchronously inside
+    ``cap._context_lock``. With a monotonic ``deadline`` (the sink's
+    ``context_recheck_deadline``) lock acquisition and the callback are
+    bounded by the signed source window the read must fit inside: the
+    callback alone runs on a daemon thread under ``copy_context().run`` while
+    the caller ``Event``-waits the remaining budget. Only the caller
+    qualifies, compares and publishes ``_last_context_read`` — a late
+    callback result is discarded (an arbitrary synchronous callback cannot
+    be cancelled; its result is simply never used). A cap that ever expired
+    refuses every later recheck on either seam with ``source_window_closed``;
+    callback errors still normalize to ``context_recheck_unavailable``.
+    """
+    if cap._context_recheck_timed_out:
+        raise B2BTerminalRefusal("source_window_closed")
+    if deadline is None:
+        cap._context_lock.acquire()
+        acquired = True
+    else:
+        remaining = deadline - time.monotonic()
+        acquired = remaining > 0 and cap._context_lock.acquire(timeout=remaining)
+    if not acquired:
+        _context_recheck_window_closed(cap)
+    try:
+        if cap._context_recheck_timed_out:
+            raise B2BTerminalRefusal("source_window_closed")
+        if deadline is not None and time.monotonic() >= deadline:
+            _context_recheck_window_closed(cap)
+        if deadline is None:
+            try:
+                fresh = cap.context_recheck()
+            except Exception:
+                raise B2BTerminalRefusal("context_recheck_unavailable") from None
+        else:
+            outcome: Dict[str, Any] = {}
+            done = threading.Event()
+            invoke_context = contextvars.copy_context()
+
+            def _invoke() -> None:
+                try:
+                    outcome["value"] = cap.context_recheck()
+                except BaseException as exc:  # noqa: BLE001 -- normalized below
+                    outcome["error"] = exc
+                finally:
+                    done.set()
+
+            threading.Thread(target=lambda: invoke_context.run(_invoke),
+                             daemon=True).start()
+            if (not done.wait(max(0.0, deadline - time.monotonic())) or
+                    time.monotonic() >= deadline):
+                _context_recheck_window_closed(cap)
+            if outcome.get("error") is not None:
+                raise B2BTerminalRefusal("context_recheck_unavailable") from None
+            fresh = outcome.get("value")
         if not isinstance(fresh, Mapping):
             raise B2BTerminalRefusal("context_recheck_unavailable")
         qualified = qualify_context_view(cap, fresh)
@@ -746,8 +822,14 @@ def recheck_context(cap: BoundExecution, receipt: ContextReceipt) -> Dict[str, A
         previous = cap._last_context_read
         if previous is not None:
             assert_source_equivalent(previous, qualified)
+        if cap._context_recheck_timed_out:
+            raise B2BTerminalRefusal("source_window_closed")
+        if deadline is not None and time.monotonic() >= deadline:
+            _context_recheck_window_closed(cap)
         object.__setattr__(cap, "_last_context_read", _deep_freeze(qualified))
         return qualified
+    finally:
+        cap._context_lock.release()
 
 
 def publish_context(cap: BoundExecution, view: Mapping[str, Any], rendered: Any, *,
@@ -986,9 +1068,14 @@ def before_sdk_dispatch(agent: Any, kwargs: Mapping[str, Any], cap: BoundExecuti
             str(getattr(client, "base_url", "")).rstrip("/") !=
             str(cap.policy_get("project", {}).get("base_url") or "").rstrip("/")):
         raise B2BTerminalRefusal("b2b_client_policy")
-    # P1 exchange and request-local construction may have taken time. Re-read
-    # native sources here as well, immediately before the irreversible marker.
-    fresh = recheck_context(cap, receipt)
+    # Re-read native sources bounded by the signed window left in the initial
+    # exchange, then RENEW it so the CAS keeps signed headroom — a slow C1 must
+    # never consume the last source seconds. The sink re-checks current policy
+    # on the fresh resolution; kwargs/digest are not transformed past this fence.
+    fresh = recheck_context(
+        cap, receipt, deadline=cap.sink.context_recheck_deadline())
+    if not cap.sink.resolve_before_provider():
+        raise B2BTerminalRefusal("source_before_provider_denied")
     if not cap.sink.cas_dispatch(request_digest=expected_digest, receipt=receipt,
                                  rechecked_view=fresh):
         raise B2BTerminalRefusal("dispatch_already_committed")
@@ -1007,12 +1094,16 @@ def execute_terminal(agent: Any, api_kwargs: Any, cap: BoundExecution,
 
     Order is load-bearing: (1) capability/identity + policy/runtime recheck;
     (2) context receipt present, this-turn, qualified by a registered rechecker with
-    matching digests/tuple/runtime; (3) exact rendered bytes present as the FINAL
-    user message of the FINAL kwargs; (4) fresh ``before_provider`` source exchange;
-    (5) durable dispatch CAS wins — a second terminal passage can never re-send;
-    (6) exactly one request-local non-stream worker executes (SDK retries 0);
-    (7) public result validated + persisted INSIDE the worker before the response
-    returns to the loop/transcript.
+    matching digests/tuple/runtime; (3) first C1 context recheck, bounded by the
+    prospective signed window so a stalled read can never outlive the exchange it
+    precedes; (4) exact rendered bytes present as the FINAL user message of the
+    FINAL kwargs; (5) fresh ``before_provider`` source exchange giving the actual
+    remaining TTL; (6) inside the request-local worker — a final C1 bounded by
+    that window, a RENEWED ``before_provider`` exchange, then the durable
+    dispatch CAS wins (a second terminal passage can never re-send); (7) exactly
+    one request-local non-stream worker executes (SDK retries 0); (8) public
+    result validated + persisted INSIDE the worker before the response returns
+    to the loop/transcript.
     """
     sink = cap.sink
     if sink is None:
@@ -1024,7 +1115,7 @@ def execute_terminal(agent: Any, api_kwargs: Any, cap: BoundExecution,
     if turn_id and receipt.turn_id != turn_id:
         raise B2BTerminalRefusal("context_turn_mismatch")
     assert_terminal_runtime(agent, api_kwargs, cap)
-    recheck_context(cap, receipt)
+    recheck_context(cap, receipt, deadline=sink.context_recheck_deadline())
     kwargs = _plain_json(api_kwargs)
     if not _expected_rendered_in_kwargs(kwargs, receipt.rendered, cap):
         raise B2BTerminalRefusal("context_absent_from_kwargs")

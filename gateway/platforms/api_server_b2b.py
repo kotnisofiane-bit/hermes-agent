@@ -40,6 +40,9 @@ _READ_OPERATION = "read"
 _PURPOSES = frozenset({"bind", "before_provider", "before_seal"})
 _BODY_MAX = 65536
 _SOURCE_DEADLINE_S = 1.0
+# Slack between a bounded C1 deadline and the hard signed-window edge, so the
+# renewal exchange itself still fits inside the window the C1 respected.
+_CONTEXT_RECHECK_SAFETY_S = 0.1
 _REQUEST_TTL_S = 10
 _MAX_WINDOW_S = 30
 _SIG_RE = re.compile(r"^[A-Za-z0-9_-]{86}$")
@@ -878,6 +881,24 @@ class _AttemptSink:
         self._before_provider = resolved
         return True
 
+    def context_recheck_deadline(self) -> float:
+        """Monotonic deadline for the next bounded C1 recheck: an explicit
+        source/C1 budget, never the worker/provider timeout. With a completed
+        ``before_provider`` exchange it is the earliest request/response
+        ``expires_at`` minus ``now`` minus the renewal reserve — strictly below
+        the remaining TTL, short response window included; before any exchange
+        it is the prospective ``_REQUEST_TTL_S`` window."""
+        resolved = self._before_provider
+        if resolved is not None:
+            remaining = min(
+                resolved["_signed_request"]["expires_at"],
+                resolved["_signed_response"]["expires_at"]) - time.time()
+        else:
+            remaining = float(_REQUEST_TTL_S)
+        budget = max(
+            0.0, remaining - (_SOURCE_DEADLINE_S + _CONTEXT_RECHECK_SAFETY_S))
+        return time.monotonic() + budget
+
     def _qualify_context(self, view: Mapping[str, Any]) -> Dict[str, Any]:
         # Validate against the sink's frozen policy, without minting a capability.
         policy = types.SimpleNamespace(policy_get=self.policy.get)
@@ -893,28 +914,35 @@ class _AttemptSink:
         fresh = self._qualify_context(rechecked_view)
         assert_source_equivalent(receipt.view, fresh)
         proof = context_proof(fresh)
+        # Serialize BOTH durable records before the final signed-window check so
+        # no local preparation stands between the check and the store CAS.
+        source_record = _source_record(resolved)
         now = time.time()
-        if not all(env["issued_at"] <= now < env["expires_at"] for env in
+        dispatch_record = json_utf8({
+            "format": "dubsar.b2b-provider-dispatch/1",
+            "attempt_id": self.attempt_id, "run_id": self.run_id,
+            "binding_digest": self.binding_digest, "request_digest": request_digest,
+            "context_digest": receipt.digest,
+            "source_basis_digest": receipt.source_basis_digest,
+            "source_basis_contract": receipt.source_basis_contract,
+            "view_digest": receipt.view_digest,
+            "context_recheck": {
+                "format": "dubsar.b2b-context-recheck/2",
+                "attempt_id": self.attempt_id, "run_id": self.run_id, **proof},
+            "rendered_digest": receipt.rendered_digest,
+            "model": self.policy["project"]["model"],
+            "provider": self.policy["project"]["provider"], "committed_at": now})
+        window_now = time.time()
+        if not all(env["issued_at"] <= window_now < env["expires_at"] for env in
                    (resolved["_signed_request"], resolved["_signed_response"])):
+            # The signed window closed after the last exchange: a typed refusal,
+            # never the duplicate-CAS False (that answer stays exclusive to a
+            # genuinely committed dispatch marker).
             self.block("source_window_closed")
-            return False
+            raise B2BTerminalRefusal("source_window_closed")
         return self._store.b2b_cas_dispatch(
             profile=self.profile, attempt_id=self.attempt_id,
-            source_record=_source_record(resolved),
-            dispatch_record=json_utf8({
-                "format": "dubsar.b2b-provider-dispatch/1",
-                "attempt_id": self.attempt_id, "run_id": self.run_id,
-                "binding_digest": self.binding_digest, "request_digest": request_digest,
-                "context_digest": receipt.digest,
-                "source_basis_digest": receipt.source_basis_digest,
-                "source_basis_contract": receipt.source_basis_contract,
-                "view_digest": receipt.view_digest,
-                "context_recheck": {
-                    "format": "dubsar.b2b-context-recheck/2",
-                    "attempt_id": self.attempt_id, "run_id": self.run_id, **proof},
-                "rendered_digest": receipt.rendered_digest,
-                "model": self.policy["project"]["model"],
-                "provider": self.policy["project"]["provider"], "committed_at": now}))
+            source_record=source_record, dispatch_record=dispatch_record)
 
     def commit_result(self, *, text: Any, parsed: Any, reason: str) -> None:
         receipt = self.context_receipt

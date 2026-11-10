@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import tempfile
+import time
 
 import pytest
 
@@ -228,28 +229,40 @@ def test_native_read_metadata_changes_preserve_source_identity(ordered):
 
 
 _NATIVE_SOURCE_MUTATIONS = [
-    (("qualification", "values", 0, "observation_ref"), "oco_" + "c" * 32),
-    (("qualification", "values", 0, "value"), "b" * 40),
-    (("qualification", "values", 0, "source_observed_at"), "2026-10-30T11:59:59.000Z"),
-    (("qualification", "values", 0, "received_at"), "2026-10-30T12:00:00.002Z"),
-    (("qualification", "mapping_ref"), "mapping:changed"),
-    (("qualification", "mapping_version"), 2),
-    (("qualification", "rule_ref"), "rule:changed"),
-    (("qualification", "rule_version"), 2),
-    (("qualification", "freshness"), "stale"),
-    (("qualification", "status"), "pending_recalculation"),
-    (("qualification", "admissibility"), "limited"),
-    (("qualification", "agreement"), "conflict"),
-    (("qualification", "limits"), [{"code": "SOURCE_CHANGED"}]),
-    (("reserves",), [{"code": "SOURCE_CHANGED"}]),
-    (("bounds", "max_observations_examined"), 199),
-    (("bounds", "truncated"), True),
-    (("unknown_future_source_field",), "changed"),
+    # (path, replacement, exact refusal reason)
+    # Qualification breakage: the native read qualifier itself refuses first.
+    (("qualification", "freshness"), "stale", "context_oc_unqualified"),
+    (("qualification", "status"), "pending_recalculation", "context_oc_unqualified"),
+    (("qualification", "admissibility"), "limited", "context_oc_unqualified"),
+    (("qualification", "agreement"), "conflict", "context_oc_unqualified"),
+    (("bounds", "truncated"), True, "context_oc_unqualified"),
+    # Source-basis drift: the mutated view still qualifies, so only the
+    # source-basis comparer can catch it (context_stale).
+    (("qualification", "values", 0, "observation_ref"), "oco_" + "c" * 32,
+     "context_stale"),
+    (("qualification", "values", 0, "value"), "b" * 40, "context_stale"),
+    (("qualification", "values", 0, "source_observed_at"),
+     "2026-10-30T11:59:59.000Z", "context_stale"),
+    (("qualification", "values", 0, "received_at"), "2026-10-30T12:00:00.002Z",
+     "context_stale"),
+    (("qualification", "mapping_ref"), "mapping:changed", "context_stale"),
+    (("qualification", "mapping_version"), 2, "context_stale"),
+    (("qualification", "rule_ref"), "rule:changed", "context_stale"),
+    (("qualification", "rule_version"), 2, "context_stale"),
+    (("qualification", "limits"), [{"code": "SOURCE_CHANGED"}], "context_stale"),
+    (("reserves",), [{"code": "SOURCE_CHANGED"}], "context_stale"),
+    (("bounds", "max_observations_examined"), 199, "context_stale"),
+    (("unknown_future_source_field",), "changed", "context_stale"),
 ]
 
 
-@pytest.mark.parametrize(("path", "replacement"), _NATIVE_SOURCE_MUTATIONS)
-def test_native_source_drift_is_never_normalized_away(path, replacement):
+@pytest.mark.parametrize(("path", "replacement", "reason"), _NATIVE_SOURCE_MUTATIONS)
+def test_native_receipt_mutation_qualification_vs_source_drift(
+        path, replacement, reason):
+    """Every receipt mutation is refused with the EXACT typed reason:
+    ``context_oc_unqualified`` when the read qualifier rejects the mutation,
+    ``context_stale`` when the mutated view still qualifies and only the
+    source-basis comparer can catch the drift."""
     original = build_unit_native_oc_view(_cap().policy, {})
     fresh = renew_unit_oc_read(original)
     target = fresh["operational_context"]["view"]
@@ -257,24 +270,50 @@ def test_native_source_drift_is_never_normalized_away(path, replacement):
         target = target[part]
     target[path[-1]] = replacement
     reseal_unit_context_view(fresh)
-    with pytest.raises(B2BTerminalRefusal):
+    if reason == "context_stale":
+        # Not a qualification break: both views still qualify, so the refusal
+        # below provably comes from the comparer, not the qualifier.
+        be.context_proof(original)
+        be.context_proof(fresh)
+    with pytest.raises(B2BTerminalRefusal) as exc:
         be.assert_source_equivalent(original, fresh)
+    assert str(exc.value) == reason
 
 
-@pytest.mark.parametrize(("field", "replacement"), [
-    ("age_ms", 2001), ("freshness_max_age_ms", 1999), ("eligible", False),
-    ("head_complete", False), ("history_truncated", True),
-    ("binding_version", 2), ("mapping_version", 2), ("rule_version", 2),
-    ("producer_epoch", "epoch:changed"), ("freshness", "stale"),
-    ("instant", "2026-10-30T12:00:01.000Z"),
-])
-def test_ordered_snapshot_age_is_checked_before_excluding_read_metadata(field, replacement):
+_ORDERED_PROJECTION_MUTATIONS = [
+    # (field, replacement, exact refusal reason)
+    ("age_ms", 2001, "context_oc_source_stale"),
+    ("freshness_max_age_ms", 1999, "context_oc_source_stale"),
+    ("eligible", False, "context_oc_projection"),
+    ("head_complete", False, "context_oc_projection"),
+    ("history_truncated", True, "context_oc_projection"),
+    ("freshness", "stale", "context_oc_projection"),
+    ("instant", "2026-10-30T12:00:01.000Z", "context_oc_projection"),
+    ("binding_version", 2, "context_stale"),
+    ("mapping_version", 2, "context_stale"),
+    ("rule_version", 2, "context_stale"),
+    ("producer_epoch", "epoch:changed", "context_stale"),
+]
+
+
+@pytest.mark.parametrize(("field", "replacement", "reason"),
+                         _ORDERED_PROJECTION_MUTATIONS)
+def test_ordered_projection_mutation_qualification_vs_source_drift(
+        field, replacement, reason):
+    """``state_projection`` drift: fields the governed projection guards fire
+    their own typed reasons (``context_oc_projection``/``context_oc_source_stale``);
+    fields it never reads still qualify and are caught only by the source-basis
+    comparer (``context_stale``)."""
     original = build_unit_native_oc_view(_cap().policy, {}, ordered=True)
     fresh = renew_unit_oc_read(original)
     fresh["operational_context"]["view"]["state_projection"][field] = replacement
     reseal_unit_context_view(fresh)
-    with pytest.raises(B2BTerminalRefusal):
+    if reason == "context_stale":
+        be.context_proof(original)
+        be.context_proof(fresh)
+    with pytest.raises(B2BTerminalRefusal) as exc:
         be.assert_source_equivalent(original, fresh)
+    assert str(exc.value) == reason
 
 
 @pytest.mark.parametrize("fault", ["cached", "backwards", "malformed_ref", "malformed_time"])
@@ -468,6 +507,8 @@ class _TSink:
         self.blocked.append(reason)
     def assert_current_policy(self):
         return self.ok
+    def context_recheck_deadline(self):
+        return time.monotonic() + 5.0
     def resolve_before_provider(self):
         return self.ok
     def cas_dispatch(self, **kw):
