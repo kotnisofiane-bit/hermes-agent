@@ -12,8 +12,12 @@ an inert constructor are preparation, not evidence that a context producer
 is installed. Enabled lanes remain `not-ready`; complete preparation reports
 `c1_producer_unavailable`. The proposal POST returns
 `503 execution_unavailable` before `b2b_admit`, title changes or worker launch.
-No attempt or binding is created by that refusal. There is no operator flag
-that enables C1 in this delivery.
+That refusal covers NEW admissions only: an already-durable attempt is always
+served by the idempotent replay (`_replayed_response`) before the readiness
+guard, so a lost-ACK retry recovers its run — and any error entering the
+profile scope or reading the serving config still answers the same typed 503,
+never an untyped 500. No attempt or binding is created by that refusal. There
+is no operator flag that enables C1 in this delivery.
 
 The future L2-mw lot must connect per-mission My Work and Operational Context
 to the actual gateway conversation path. Existing plugin factory/publication

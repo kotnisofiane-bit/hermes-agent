@@ -155,10 +155,15 @@ def b2b_execution_inputs_ready(project: Any, config: Optional[Mapping]) -> bool:
         and _init_inert_config(config))
 
 
-def b2b_execution_unavailable_code(project: Any, config: Optional[Mapping]) -> str:
-    """Typed refusal for ONE project: ``execution_inputs_unavailable`` when the
-    preparation predicate fails, ``c1_producer_unavailable`` when preparation is
-    complete and only the missing C1 producer keeps the lane closed."""
+def b2b_execution_unavailable_code(project: Any, config: Optional[Mapping]) -> Optional[str]:
+    """THE execution-unavailability classification for ONE project — the
+    single source the POST admission gate and ``/health/detailed`` both
+    consult. ``None`` only when ``b2b_execution_ready`` opens the lane
+    (impossible until the C1 producer ships); ``execution_inputs_unavailable``
+    for a preparation hole; ``c1_producer_unavailable`` when preparation is
+    complete and only the missing producer keeps the lane closed."""
+    if b2b_execution_ready(project, config):
+        return None
     if b2b_execution_inputs_ready(project, config):
         return "c1_producer_unavailable"
     return "execution_inputs_unavailable"
@@ -196,12 +201,17 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
     for name, entry in state.config.profiles.items():
         code = "execution_inputs_unavailable"
         try:
-            with adapter._profile_scope(name if name != "default" else None):
+            # Every profile is judged under ITS OWN home — including
+            # ``default``, which must resolve to the canonical default home
+            # (``get_profile_dir("default")``), never the request's ambient
+            # home a prefixed ``/p/<other>/`` request bound.
+            with adapter._profile_scope(name):
                 from gateway.run import _load_gateway_config
                 config = _load_gateway_config()
                 projects = entry.get("projects") or {}
                 if projects and all(
-                        b2b_execution_inputs_ready(project, config)
+                        b2b_execution_unavailable_code(project, config)
+                        == "c1_producer_unavailable"
                         for project in projects.values()):
                     code = "c1_producer_unavailable"
         except Exception:

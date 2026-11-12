@@ -292,6 +292,70 @@ def test_execution_status_each_profile_under_own_scope(tmp_path):
     lane.store.close()
 
 
+def test_execution_status_classifies_through_single_function(tmp_path, monkeypatch):
+    """``/health/detailed`` and the POST gate share ONE classification
+    function — never a second inline implementation: patch
+    ``b2b_execution_unavailable_code`` and the reported per-profile code
+    follows it."""
+    lane = _ready_lane(tmp_path)
+    _write_serving_config(_profile_config_dir("hub"))
+    state = _state({"hub": _lane_entry(lane)})
+    adapter = _status_adapter(state)
+    calls = []
+
+    def _spy(project, config):
+        calls.append(project)
+        return "execution_inputs_unavailable"
+
+    monkeypatch.setattr(
+        b2b_exec, "b2b_execution_unavailable_code", _spy)
+    status = b2b_execution_status(adapter)
+    assert calls, "status bypassed the single classifier"
+    assert status["b2b_execution_profiles"] == {
+        "hub": {"state": "not-ready", "code": "execution_inputs_unavailable"}}
+    lane.store.close()
+
+
+def test_execution_status_default_profile_under_own_home(tmp_path):
+    """Multiplex ``/p/<other>/health/detailed`` binds the OTHER profile's
+    home as ambient (prefix middleware -> ``asyncio.to_thread`` copies the
+    context): the B2B ``default`` entry must still be judged under the
+    DEFAULT home's own serving config, never the request's ambient home."""
+    import contextlib
+    from agent.secret_scope import set_multiplex_active
+    from gateway.run import _profile_runtime_scope
+    from hermes_cli.profiles import get_active_profile_name, get_profile_dir
+    lane = _ready_lane(tmp_path)
+    hub_home = _profile_config_dir("hub")
+    _write_serving_config(hub_home, context_length=None)   # non-inert
+    _write_serving_config(get_profile_dir("default"))       # inert pins
+    state = _state({"default": _lane_entry(lane), "hub": _lane_entry(lane)})
+
+    seen = []
+    real_scope = APIServerAdapter._profile_scope
+
+    @contextlib.contextmanager
+    def _spy_scope(profile):
+        with real_scope(profile):
+            seen.append((profile, get_active_profile_name()))
+            yield
+
+    adapter = _status_adapter(state)
+    adapter._profile_scope = _spy_scope
+    set_multiplex_active(True)
+    try:
+        with _profile_runtime_scope(hub_home):   # /p/hub/ ambient binding
+            status = b2b_execution_status(adapter)
+    finally:
+        set_multiplex_active(False)
+    assert status["b2b_execution_profiles"] == {
+        "default": {"state": "not-ready", "code": "c1_producer_unavailable"},
+        "hub": {"state": "not-ready", "code": "execution_inputs_unavailable"}}
+    assert status["b2b_execution_code"] == "execution_inputs_unavailable"
+    assert seen == [("default", "default"), ("hub", "hub")]
+    lane.store.close()
+
+
 # ---------------------------------------------------------------------------
 # _create_agent — bounded construction vs durable refusal
 # ---------------------------------------------------------------------------

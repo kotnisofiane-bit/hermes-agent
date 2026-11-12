@@ -710,3 +710,141 @@ async def test_b2b_proposal_post_refuses_execution_unavailable_no_writes(
             assert not table
     finally:
         lane.source.stop()
+
+
+@pytest.mark.asyncio
+async def test_b2b_proposal_post_replays_durable_attempt_before_readiness_guard(
+        tmp_path, monkeypatch, opened):
+    """Lost-ACK contract: an already-durable attempt row is ALWAYS served by
+    the idempotent replay — never refused ``execution_unavailable`` by the
+    new-admissions-only readiness guard. POST 1 admits for real under the
+    standard test-only availability lift; POST 2 runs with production
+    readiness (closed) and must get the SAME run_id back as ``replayed``."""
+    from gateway.platforms import api_server_b2b_execution as b2b_exec
+    lane = _valid_admission_lane(
+        tmp_path, monkeypatch, opened, prepared=False)
+    adapter = lane.adapter
+    try:
+        # The attested genesis observation is immutable; the live session's
+        # title moves after admission titling, so the retry's source body
+        # must serve the SAME observation or the fingerprint diverges.
+        underlying = lane.source._body_for
+        frozen = {}
+
+        def _frozen_body(env):
+            body = underlying(env)
+            body["observation_genesis"] = frozen.setdefault(
+                "obs", body["observation_genesis"])
+            return body
+
+        lane.source._body_for = _frozen_body
+
+        async def _stub_spawn(*a, **k):
+            return object()
+
+        monkeypatch.setattr(b2b, "_spawn_run", _stub_spawn)
+        monkeypatch.setattr(
+            adapter, "_create_agent", _tripwire("_create_agent"))
+
+        async with TestClient(TestServer(_app(adapter))) as client:
+            def post():
+                return client.post(
+                    f"/p/hub/api/sessions/{lane.session_id}/b2b-proposal",
+                    json={"attempt_id": lane.attempt_id,
+                          "binding_digest": lane.binding},
+                    headers={"Authorization": f"Bearer {_API_KEY}",
+                             "Idempotency-Key": lane.attempt_id})
+
+            # TEST-ONLY availability lift — the same seam the construction
+            # tests use; production b2b_execution_ready stays False. POST 1
+            # therefore admits durably like a pre-guard deployment did.
+            real_ready = b2b_exec.b2b_execution_ready
+            monkeypatch.setattr(
+                b2b_exec, "b2b_execution_ready", lambda *a, **k: True)
+            resp = await post()
+            assert resp.status == 200, await resp.text()
+            first = await resp.json()
+            assert first["status"] == "admitted"
+            monkeypatch.setattr(b2b_exec, "b2b_execution_ready", real_ready)
+
+            # Lost-ACK retry against the CLOSED lane: replayed, not refused.
+            resp = await post()
+            assert resp.status == 200, await resp.text()
+            second = await resp.json()
+            assert second["status"] == "replayed"
+            assert second["run_id"] == first["run_id"]
+            assert second["attempt_id"] == lane.attempt_id
+            assert second["binding_digest"] == lane.binding
+            assert second["session_id"] == lane.session_id
+            assert second["profile"] == "hub"
+
+        counts = _store_counts(adapter._run_idempotency_store)
+        assert counts["b2b_bindings"] == 1
+        assert counts["b2b_attempts"] == 1
+        assert counts["b2b_artifacts"] >= 1
+    finally:
+        lane.source.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broken", ["scope", "config"],
+                         ids=["scope_entry", "config_load"])
+async def test_b2b_proposal_post_guard_error_refuses_typed_unavailable(
+        tmp_path, monkeypatch, opened, broken):
+    """A failure INSIDE the new-admission readiness guard — profile-scope
+    entry or serving-config read — must still answer the typed
+    ``503 execution_unavailable`` (the lane fails closed), never an untyped
+    500, and must write nothing."""
+    lane = _valid_admission_lane(
+        tmp_path, monkeypatch, opened, prepared=False)
+    adapter = lane.adapter
+    try:
+        if broken == "scope":
+            # The /p/<profile>/ middleware enters the scope FIRST; the
+            # guard's own entry is the second one — fail only that.
+            scope_calls = []
+            real_scope = APIServerAdapter._profile_scope
+
+            def _flaky_scope(profile):
+                scope_calls.append(profile)
+                if len(scope_calls) > 1:
+                    raise RuntimeError("profile scope entry failed")
+                return real_scope(profile)
+
+            monkeypatch.setattr(adapter, "_profile_scope", _flaky_scope)
+        else:
+            import gateway.run as gw_run
+
+            def _boom_config(*a, **k):
+                raise RuntimeError("config read failed")
+            monkeypatch.setattr(
+                gw_run, "_load_gateway_config", _boom_config)
+        monkeypatch.setattr(
+            adapter, "_create_agent", _tripwire("_create_agent"))
+        session_before = adapter._session_db.get_session(lane.session_id)
+        counts_before = _store_counts(adapter._run_idempotency_store)
+        changes_before = adapter._run_idempotency_store._conn.total_changes
+
+        async with TestClient(TestServer(_app(adapter))) as client:
+            resp = await client.post(
+                f"/p/hub/api/sessions/{lane.session_id}/b2b-proposal",
+                json={"attempt_id": lane.attempt_id,
+                      "binding_digest": lane.binding},
+                headers={"Authorization": f"Bearer {_API_KEY}",
+                         "Idempotency-Key": lane.attempt_id})
+            assert resp.status == 503, await resp.text()
+            payload = await resp.json()
+            assert payload.get("error") == "execution_unavailable"
+            assert payload.get("code") == "execution_unavailable"
+
+        assert adapter._session_db.get_session(
+            lane.session_id) == session_before
+        counts = _store_counts(adapter._run_idempotency_store)
+        assert counts["b2b_bindings"] == 0
+        assert counts["b2b_attempts"] == 0
+        assert counts["b2b_artifacts"] == 0
+        assert counts["run_idempotency"] == counts_before["run_idempotency"]
+        assert (adapter._run_idempotency_store._conn.total_changes
+                == changes_before)
+    finally:
+        lane.source.stop()
