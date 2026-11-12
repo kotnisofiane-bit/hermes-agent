@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import json
+import os
 from contextlib import suppress
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 from agent.b2b_execution import (
-    B2BTerminalRefusal, is_b2b_session_id,
+    B2BTerminalRefusal, R2_SCHEMA_PINS, is_b2b_session_id,
 )
 from gateway.platforms.api_server_b2b import _state_for
 
@@ -32,10 +34,10 @@ def guard_agent_construction(
     session_model: Optional[str], model_options: Optional[Dict[str, Any]],
     route: Optional[Dict[str, Any]], requested_model: Optional[str],
     requested_provider: Optional[str],
-) -> None:
+) -> Optional[Any]:
     """Pre-construction B2B gate for ``_create_agent`` (the moved guard block).
 
-    Absent/disabled state: ordinary ids return immediately — no
+    Absent/disabled state: ordinary ids return ``None`` immediately — no
     ``current_execution``, home resolve, or sink/policy checks. A reserved id
     still refuses ``b2b_capability_mismatch`` cheaply: no admission can exist
     on a disabled lane (and ``assert_current_policy`` would deny any stale cap
@@ -43,8 +45,10 @@ def guard_agent_construction(
 
     Enabled: an ordinary id refuses only while a foreign cap is bound to this
     context. A reserved id requires a matching admitted cap whose policy_home
-    and still-current operator policy verify — then rejects any caller-side
-    override — before the WITHDRAWN runtime refuses durably at the sink
+    and still-current operator policy verify, then rejects any caller-side
+    override. With the project's execution-context inputs verified on disk,
+    the gate RETURNS the bound cap so ``_create_agent`` can hand it to
+    ``construct_b2b_agent``; without them it refuses durably at the sink
     (``context_unavailable``), ahead of every construction seam.
     """
     state = _state_for(adapter)
@@ -79,14 +83,141 @@ def guard_agent_construction(
             requested_model not in (None, project["model"]) or
             requested_provider not in (None, project["provider"])):
         raise B2BTerminalRefusal("b2b_policy_override")
-    # H1: B2B runtime construction is WITHDRAWN. AIAgent.__init__ can reach
-    # the provider before any bounded policy could be installed (lazy
-    # context_length metadata probes), so the admitted attempt refuses
-    # durably here — before run_agent import, runtime/credential/tool
-    # resolution or memory checkout. A governed construction path returns
-    # with C1's context producer.
-    cap.sink.block("context_unavailable")
-    raise B2BTerminalRefusal("context_unavailable")
+    # L2: governed construction is open only when the operator's real
+    # execution context for THIS project is in place — the pinned r2 contract
+    # root and the My Work allocation/start roots C1 binds at context
+    # publication, on disk, plus the serving-profile pins that keep
+    # AIAgent.__init__ from reaching the provider before the bounded policy
+    # exists (H1's withdrawal reason). Anything absent or incoherent keeps
+    # the same durable terminal refusal — before run_agent import,
+    # runtime/credential/tool resolution or memory checkout.
+    from gateway.run import _load_gateway_config
+    if not b2b_execution_ready(project, _load_gateway_config()):
+        cap.sink.block("context_unavailable")
+        raise B2BTerminalRefusal("context_unavailable")
+    return cap
+
+
+def _abs_dir(value: Any) -> bool:
+    """An existing absolute directory — the on-disk half of every
+    host-supplied context root (config validation already enforces the
+    absolute shape)."""
+    return isinstance(value, str) and os.path.isdir(value)
+
+
+def _contract_root_ready(root: Any) -> bool:
+    """The pinned r2 contract root, verified by content: every schema file
+    exists AND hashes to its production pin — a directory of lookalikes is
+    not the contract."""
+    if not _abs_dir(root):
+        return False
+    for name, pin in R2_SCHEMA_PINS.items():
+        path = os.path.join(root, name)
+        try:
+            with open(path, "rb") as fh:
+                if hashlib.sha256(fh.read()).hexdigest() != pin:
+                    return False
+        except OSError:
+            return False
+    return True
+
+
+def _init_inert_config(config: Optional[Mapping]) -> bool:
+    """The serving profile's effective config must pin away every provider
+    reach ``AIAgent.__init__`` could make before the bounded policy exists —
+    H1's withdrawal reason. ``model.context_length`` skips the lazy metadata
+    probes; ``compression.enabled: false`` skips the init-time aux model
+    feasibility probe. Both are explicit operator pins, never defaults."""
+    if not isinstance(config, Mapping):
+        return False
+    model = config.get("model")
+    context_length = model.get("context_length") if isinstance(model, Mapping) else None
+    if (not isinstance(context_length, int) or isinstance(context_length, bool)
+            or context_length <= 0):
+        return False
+    compression = config.get("compression")
+    return isinstance(compression, Mapping) and compression.get("enabled") is False
+
+
+def b2b_execution_ready(project: Any, config: Optional[Mapping]) -> bool:
+    """Operator-input readiness for ONE validated project entry: the on-disk
+    artifacts the governed lane consumes — the verified r2 contract root and
+    the My Work ``allocation_root``/``start`` directories C1 binds at context
+    publication — plus the serving-profile pins that keep construction inert.
+    All operator inputs; nothing inferred from defaults or ambient state."""
+    if not isinstance(project, Mapping):
+        return False
+    context = project.get("project_context")
+    return (
+        _contract_root_ready(project.get("context_contract_root"))
+        and isinstance(context, Mapping)
+        and context.get("project_id") == project.get("project_id")
+        and all(_abs_dir(context.get(key)) for key in ("allocation_root", "start"))
+        and _init_inert_config(config))
+
+
+def b2b_execution_status(state: Any, config: Optional[Mapping]) -> str:
+    """The smoke-visible lane state: ``not-configured`` without a bound lane,
+    ``ready`` only when EVERY configured project entry could run the governed
+    path, else ``refused`` — the same fail-closed reading a turned-down lane
+    emits durably at the terminal."""
+    if state is None or not state.config.enabled:
+        return "not-configured"
+    projects = [project for entry in state.config.profiles.values()
+                for project in (entry.get("projects") or {}).values()]
+    if not projects:
+        return "refused"
+    for project in projects:
+        if not b2b_execution_ready(project, config):
+            return "refused"
+    return "ready"
+
+
+def construct_b2b_agent(adapter: Any, cap: Any, *, session_id: Optional[str],
+                        stream_delta_callback: Any, tool_progress_callback: Any,
+                        tool_start_callback: Any, tool_complete_callback: Any,
+                        interim_assistant_callback: Any, reasoning_callback: Any,
+                        status_callback: Any) -> Any:
+    """Bounded B2B agent for ONE admitted execution. Every policy-visible
+    value comes from the frozen project policy — model/provider/base_url/
+    api_mode, one iteration, no toolsets, no memory checkout, no context
+    files, no checkpoints, no fallback or credential pool. Credentials still
+    resolve through the serving profile's own runtime config (profile-scoped
+    .env); ``install_bounded_agent_policy`` freezes the dispatch surface
+    before the agent leaves this worker."""
+    project = cap.policy_get("project")
+    from run_agent import AIAgent
+    from gateway.run import _resolve_runtime_agent_kwargs
+    from gateway.platforms.api_server import _ProviderAuthResolutionError
+    try:
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+    except RuntimeError as exc:
+        raise _ProviderAuthResolutionError(str(exc)) from exc
+    agent = AIAgent(
+        model=project["model"], provider=project["provider"],
+        api_mode=project["api_mode"], base_url=project["base_url"],
+        api_key=runtime_kwargs.get("api_key"),
+        max_iterations=1, quiet_mode=True, verbose_logging=False,
+        ephemeral_system_prompt=None, enabled_toolsets=[],
+        session_id=session_id, platform="api_server",
+        stream_delta_callback=stream_delta_callback,
+        tool_progress_callback=tool_progress_callback,
+        tool_start_callback=tool_start_callback,
+        tool_complete_callback=tool_complete_callback,
+        interim_assistant_callback=interim_assistant_callback,
+        reasoning_callback=reasoning_callback,
+        status_callback=status_callback,
+        session_db=adapter._ensure_session_db(),
+        fallback_model=None, reasoning_config=None,
+        gateway_session_key=None, memory_manager=None,
+        checkpoints_enabled=False,
+        skip_memory=True, skip_context_files=True)
+    agent._hermes_api_runtime = {
+        "provider": project["provider"], "model": project["model"],
+        "route_source": "b2b_policy"}
+    from agent.b2b_execution import install_bounded_agent_policy
+    install_bounded_agent_policy(agent, cap)
+    return agent
 
 
 async def construct_run_agent(adapter: Any, run: Any, construct_agent: Callable[[], Any],

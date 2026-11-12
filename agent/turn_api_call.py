@@ -87,6 +87,17 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        # B2B lane: the admitted execution owns the only provider call — it
+        # goes through execute_terminal's receipt/runtime/source/CAS fences,
+        # never the generic streaming or relay paths. An ordinary session
+        # pays one contextvar read; a bound cap on a foreign session refuses.
+        from agent.b2b_execution import (
+            execute_terminal, require_execution, validate_terminal_result)
+        cap = require_execution(agent)
+        if cap is not None:
+            response = execute_terminal(agent, next_api_kwargs, cap, turn_id=turn_id)
+            validate_terminal_result(agent, response)
+            return response
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),

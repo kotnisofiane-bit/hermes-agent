@@ -1,13 +1,13 @@
-"""B2B proposal POST: admission never consumes the single attempt while the H1
-execution runtime is withdrawn, and the typed surface resolves the owning
-profile from the REQUEST's home -- never a literal ``"default"``.
+"""B2B proposal POST: a refused source exchange never consumes the single
+attempt, and the typed surface resolves the owning profile from the
+REQUEST's home -- never a literal ``"default"``.
 
-The valid signed request must reach the same ``503 execution_unavailable``
-refusal every time, BEFORE the session DB, the durable store, source I/O,
-admission, titling or spawn -- a repeated POST stays non-consuming. Signed GETs
-on previously existing attempts remain usable; a proof on a never-admitted
-tuple is a plain 404. All crypto is real Ed25519; only the tripwires that must
-never run are patched.
+The valid signed request reaches ``_resolve_source_async`` under the owning
+profile; a source refusal lands as the classified denial BEFORE admission,
+titling or spawn -- a repeated POST stays non-consuming. Signed GETs on
+previously existing attempts remain usable; a proof on a never-admitted
+tuple is a plain 404. All crypto is real Ed25519; only the source exchange
+itself and the tripwires that must never run are patched.
 """
 
 from __future__ import annotations
@@ -118,19 +118,21 @@ def _tripwire(name):
 @pytest.mark.asyncio
 async def test_b2b_proposal_post_refuses_before_admission_without_writes(
         tmp_path, monkeypatch, opened):
-    """A valid signed POST gets 503 execution_unavailable BEFORE session-db,
-    store, source, admit, title or spawn -- and repeated POSTs stay that way."""
+    """A valid signed POST whose source exchange refuses gets 503
+    source_unavailable BEFORE admit, title or spawn -- and repeated POSTs
+    stay non-consuming."""
     _profile_home(tmp_path, monkeypatch, "hub")
     adapter = _adapter(tmp_path, monkeypatch, "hub")
     opened.extend([adapter._session_db, adapter._run_idempotency_store])
     session_id, attempt_id, binding, body = _post_body()
     adapter._session_db.create_session(session_id, "api_server")
 
-    for target in ("resolve_source", "_resolve_source_async",
-                   "_launch_b2b_run", "_spawn_run"):
+    async def _unavailable(*a, **k):
+        return None, "source_unavailable"
+
+    monkeypatch.setattr(b2b, "_resolve_source_async", _unavailable)
+    for target in ("resolve_source", "_launch_b2b_run", "_spawn_run"):
         monkeypatch.setattr(b2b, target, _tripwire(f"b2b.{target}"))
-    monkeypatch.setattr(adapter, "_ensure_session_db_async",
-                        _tripwire("_ensure_session_db_async"))
     monkeypatch.setattr(adapter, "_create_agent", _tripwire("_create_agent"))
 
     session_before = adapter._session_db.get_session(session_id)
@@ -146,8 +148,8 @@ async def test_b2b_proposal_post_refuses_before_admission_without_writes(
                          "Idempotency-Key": attempt_id})
             payload = await resp.json()
             assert resp.status == 503, payload
-            assert payload.get("error") == "execution_unavailable"
-            assert payload.get("code") == "execution_unavailable"
+            assert payload.get("error") == "source_unavailable"
+            assert payload.get("code") == "source_unavailable"
 
     # No durable writes of any kind: no run/attempt/binding/artifact rows, no
     # native session mutation (title etc.), no extra store transactions.
@@ -172,8 +174,10 @@ async def test_b2b_proposal_post_resolves_owning_profile(
     opened.extend([adapter._session_db, adapter._run_idempotency_store])
     session_id, attempt_id, binding, body = _post_body()
 
-    monkeypatch.setattr(adapter, "_ensure_session_db_async",
-                        _tripwire("_ensure_session_db_async"))
+    async def _unavailable(*a, **k):
+        return None, "source_unavailable"
+
+    monkeypatch.setattr(b2b, "_resolve_source_async", _unavailable)
 
     async with TestClient(TestServer(_app(adapter))) as client:
         resp = await client.post(
@@ -183,7 +187,7 @@ async def test_b2b_proposal_post_resolves_owning_profile(
                      "Idempotency-Key": attempt_id})
         payload = await resp.json()
         assert resp.status == 503, payload
-        assert payload.get("error") == "execution_unavailable"
+        assert payload.get("error") == "source_unavailable"
         # A foreign prefix still 404s in the middleware before the handler.
         resp = await client.post(
             f"/p/foreign/api/sessions/{session_id}/b2b-proposal",
@@ -251,22 +255,23 @@ class _ProposalRequest:
 
 
 @pytest.mark.asyncio
-async def test_b2b_proposal_post_handler_refuses_before_db_tripwire(
+async def test_b2b_proposal_post_handler_source_denied_before_launch(
         tmp_path, monkeypatch, opened):
-    """Direct-handler boundary: fully valid request under a trusted selector
-    scope -> 503 execution_unavailable BEFORE the session-db seam, independent
-    of any profile-resolution fallback (the selector is set explicitly)."""
+    """Direct-handler boundary: a fully valid request under a trusted selector
+    scope whose source exchange denies -> 403 source_denied BEFORE admission
+    -- independent of any profile-resolution fallback (selector explicit)."""
     _profile_home(tmp_path, monkeypatch, "hub")
     adapter = _adapter(tmp_path, monkeypatch, "hub")
     opened.extend([adapter._session_db, adapter._run_idempotency_store])
     session_id, attempt_id, binding, body = _post_body()
     adapter._session_db.create_session(session_id, "api_server")
 
-    for target in ("resolve_source", "_resolve_source_async",
-                   "_launch_b2b_run", "_spawn_run"):
+    async def _denied(*a, **k):
+        return None, "source_denied"
+
+    monkeypatch.setattr(b2b, "_resolve_source_async", _denied)
+    for target in ("resolve_source", "_launch_b2b_run", "_spawn_run"):
         monkeypatch.setattr(b2b, target, _tripwire(f"b2b.{target}"))
-    monkeypatch.setattr(adapter, "_ensure_session_db_async",
-                        _tripwire("_ensure_session_db_async"))
 
     session_before = adapter._session_db.get_session(session_id)
     counts_before = _store_counts(adapter._run_idempotency_store)
@@ -280,9 +285,9 @@ async def test_b2b_proposal_post_handler_refuses_before_db_tripwire(
     finally:
         _api_request_profile.reset(token)
 
-    assert response.status == 503
+    assert response.status == 403
     payload = json.loads(response.body)
-    assert payload.get("error") == "execution_unavailable"
+    assert payload.get("error") == "source_denied"
     assert adapter._session_db.get_session(session_id) == session_before
     assert _store_counts(adapter._run_idempotency_store) == counts_before
     assert adapter._run_idempotency_store._conn.total_changes == changes_before
