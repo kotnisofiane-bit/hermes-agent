@@ -11,6 +11,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 import logging
+import sys
 import time
 from typing import Any, Dict, Optional
 
@@ -72,6 +73,25 @@ def perform_api_call(
     interrupted: Any,
 ) -> ApiCallVerdict:
     """Issue the request (see ``_should_stream`` for the streaming decision)."""
+    # B2B capability gate at ENTRY — before middleware can run at all: a bound
+    # cap on a foreign session, a B2B session without its admitted cap, or a
+    # stale tag refuses here, so a middleware short-circuit can never launder
+    # the lane. Ordinary sessions must not even import agent.b2b_execution, so
+    # the import is gated on checks that are complete without it: the
+    # bound-agent attr tag, the reserved "b2b_" session-id namespace, or an
+    # active capability contextvar. The contextvar can only be set by
+    # bind_execution, which necessarily already loaded the module — so when
+    # sys.modules lacks it, no cap can be active and skipping is airtight.
+    _b2b_mod = sys.modules.get("agent.b2b_execution")
+    _b2b_sid = getattr(agent, "session_id", "") or ""
+    if (getattr(agent, "_b2b_execution", None) is not None
+            or (isinstance(_b2b_sid, str) and _b2b_sid.startswith("b2b_"))
+            or (_b2b_mod is not None
+                and _b2b_mod.current_execution() is not None)):
+        from agent.b2b_execution import require_execution
+        _b2b_cap = require_execution(agent)
+    else:
+        _b2b_cap = None
     response = None
 
     def _verdict(action: str) -> ApiCallVerdict:
@@ -89,15 +109,12 @@ def perform_api_call(
     def _perform_api_call(next_api_kwargs):
         # B2B lane: the admitted execution owns the only provider call — it
         # goes through execute_terminal's receipt/runtime/source/CAS fences,
-        # never the generic streaming or relay paths. An ordinary session
-        # pays one contextvar read; a bound cap on a foreign session refuses.
-        from agent.b2b_execution import (
-            execute_terminal, require_execution, validate_terminal_result)
-        cap = require_execution(agent)
-        if cap is not None:
-            response = execute_terminal(agent, next_api_kwargs, cap, turn_id=turn_id)
-            validate_terminal_result(agent, response)
-            return response
+        # never the generic streaming or relay paths. Attestation is NOT here:
+        # it runs on whatever middleware actually returns, after it returns.
+        if _b2b_cap is not None:
+            from agent.b2b_execution import execute_terminal
+            return execute_terminal(
+                agent, next_api_kwargs, _b2b_cap, turn_id=turn_id)
         if agent.api_mode == "codex_responses":
             next_api_kwargs = agent._get_transport().preflight_kwargs(
                 next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
@@ -156,6 +173,13 @@ def perform_api_call(
                 bool(agent._pending_redirect) if _redirect_lock is not None
                 else agent._has_pending_redirect()
             )
+    if _b2b_cap is not None:
+        # Attest what middleware ACTUALLY returned — before intake and before
+        # redirect handling: a short-circuit or a substituted downstream
+        # response fails ``middleware_response_unattested`` here even though
+        # it never touched execute_terminal.
+        from agent.b2b_execution import validate_terminal_result
+        validate_terminal_result(agent, response)
     if _redirect_crossed_response:
         # Response and redirect can cross threads: discard the now-stale
         # response and rebuild from the correction rather than lose it.

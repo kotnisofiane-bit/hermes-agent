@@ -2319,16 +2319,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # Served BY the gateway process, so gateway_running is True by definition; busy/
         # drainable use the same shared contract as /api/status so the two never disagree.
         active_api_runs, process_depth, active_delegations = self._readiness_work_counts()
-        from gateway.run import _resolve_gateway_model, _load_gateway_config
+        from gateway.run import _resolve_gateway_model
         readiness = collect_runtime_readiness(
             configured_model=_resolve_gateway_model(), runtime_status=runtime,
             active_api_runs=active_api_runs, process_completion_queue_depth=process_depth,
             active_delegations=active_delegations)
         from gateway.platforms.api_server_b2b_execution import b2b_execution_status
-        from gateway.platforms.api_server_b2b import _state_for
+        # Per-profile config reads + contract hashing stay OFF the event loop.
+        b2b_status = await asyncio.to_thread(b2b_execution_status, self)
         return web.json_response({
             "status": readiness["status"], "readiness": readiness, "platform": "hermes-agent",
-            "b2b_execution": b2b_execution_status(_state_for(self), _load_gateway_config()),
+            **b2b_status,
             "version": _hermes_version(), "gateway_state": gw_state,
             "platforms": runtime.get("platforms", {}), "active_agents": gw_active,
             "gateway_busy": derive_gateway_busy(

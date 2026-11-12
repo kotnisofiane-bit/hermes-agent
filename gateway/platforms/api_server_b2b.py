@@ -1146,6 +1146,19 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
+    # L2-mw admission gate: the project identity is proven by the signed
+    # source, but execution stays CLOSED until the C1 producer ships —
+    # evaluate readiness under the OWNING profile's scope against ITS serving
+    # config, off the event loop (config + contract hashing), BEFORE any
+    # admission/title/spawn durable write consumes the single attempt.
+    def _execution_ready() -> bool:
+        with adapter._profile_scope(profile if profile != "default" else None):
+            from gateway.run import _load_gateway_config
+            from gateway.platforms.api_server_b2b_execution import (
+                b2b_execution_ready)
+            return b2b_execution_ready(project, _load_gateway_config())
+    if not await _a.to_thread(_execution_ready):
+        return _deny(503, "execution_unavailable")
     policy = {
         "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
         "attempt_id": attempt_id, "profile_home": str(home),
