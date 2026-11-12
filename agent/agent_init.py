@@ -500,7 +500,9 @@ def _finalize_routing(agent, api_mode, credential_pool):
 
     # Pre-warm the OpenRouter metadata cache (1h TTL) off-thread so the first pricing estimate
     # doesn't block. Process-level Event guard: an unguarded spawn leaks a thread per message.
-    if (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
+    # An explicit runtime context pin needs no provider metadata — skip the network prewarm.
+    if getattr(agent, "_runtime_context_length", None) is None and \
+            (agent.provider == "openrouter" or agent._is_openrouter_url()) and \
             not _ra()._openrouter_prewarm_done.is_set():
         _ra()._openrouter_prewarm_done.set()
         threading.Thread(
@@ -1821,6 +1823,12 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
         _config_context_length = _scope_context_length_to_default_runtime(
             agent, _agent_cfg, _model_section, _custom_providers, _config_context_length, base_url
         )
+    # An explicit runtime pin (bounded lanes) describes THIS runtime: it beats
+    # the scoped default-profile pin even when the route differs from config's
+    # default — and needs no provider metadata to resolve.
+    _runtime_pin = getattr(agent, "_runtime_context_length", None)
+    if _runtime_pin is not None:
+        _config_context_length = _runtime_pin
 
     # Reused by _check_compression_model_feasibility (aux compression model detection).
     agent._custom_providers = _custom_providers
@@ -1852,6 +1860,8 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
     _effective_context_length = agent._effective_lmstudio_context_length(
         _config_context_length, _lmstudio_runtime_context_length,
     )
+    if _runtime_pin is not None:
+        _effective_context_length = _runtime_pin
     return _config_context_length, _custom_providers, _effective_context_length, _model_cfg
 
 
@@ -2353,6 +2363,7 @@ def init_agent(
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
+    context_length: Optional[int] = None,
 ):
     _install_safe_stdio()
 
@@ -2392,6 +2403,16 @@ def init_agent(
     agent._credential_pool = credential_pool
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
+    # Explicit runtime context-window pin (bounded lanes): describes THIS
+    # runtime even when model/provider/route differ from the serving config's
+    # default. Stored before _finalize_routing so the OpenRouter metadata
+    # prewarm — which a pinned bounded project never needs — is skipped.
+    if context_length is not None and (
+            not isinstance(context_length, int) or isinstance(context_length, bool)
+            or context_length <= 0):
+        raise ValueError(
+            "context_length must be a positive int when supplied")
+    agent._runtime_context_length = context_length
     _resolve_api_mode(agent, api_mode, provider_name, base_url)
     _finalize_routing(agent, api_mode, credential_pool)
 

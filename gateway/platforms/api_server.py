@@ -2211,14 +2211,25 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         ``gateway_session_key`` persists across transcripts (memory scope), unlike ``session_id``;
         ``route`` / ``session_model`` are mutually exclusive; ``confirmed_runtime_lock`` beats the
         session ``/model`` override, disables the fallback chain and fails closed."""
-        from gateway.platforms.api_server_b2b_execution import guard_agent_construction
-        guard_agent_construction(
+        from gateway.platforms.api_server_b2b_execution import (
+            construct_b2b_agent, guard_agent_construction)
+        _b2b_cap = guard_agent_construction(
             self, session_id=session_id,
             ephemeral_system_prompt=ephemeral_system_prompt,
             gateway_session_key=gateway_session_key, room_dispatch=room_dispatch,
             room_execution_policy=room_execution_policy, session_model=session_model,
             model_options=model_options, route=route,
             requested_model=requested_model, requested_provider=requested_provider)
+        if _b2b_cap is not None:
+            return construct_b2b_agent(
+                self, _b2b_cap, session_id=session_id,
+                stream_delta_callback=stream_delta_callback,
+                tool_progress_callback=tool_progress_callback,
+                tool_start_callback=tool_start_callback,
+                tool_complete_callback=tool_complete_callback,
+                interim_assistant_callback=interim_assistant_callback,
+                reasoning_callback=reasoning_callback,
+                status_callback=status_callback)
         from run_agent import AIAgent
         from gateway.run import (
             _checkpoint_agent_kwargs, _current_max_iterations, _resolve_runtime_agent_kwargs,
@@ -2313,8 +2324,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             configured_model=_resolve_gateway_model(), runtime_status=runtime,
             active_api_runs=active_api_runs, process_completion_queue_depth=process_depth,
             active_delegations=active_delegations)
+        from gateway.platforms.api_server_b2b_execution import b2b_execution_status
+        # Per-profile config reads + contract hashing stay OFF the event loop.
+        b2b_status = await asyncio.to_thread(b2b_execution_status, self)
         return web.json_response({
             "status": readiness["status"], "readiness": readiness, "platform": "hermes-agent",
+            **b2b_status,
             "version": _hermes_version(), "gateway_state": gw_state,
             "platforms": runtime.get("platforms", {}), "active_agents": gw_active,
             "gateway_busy": derive_gateway_busy(

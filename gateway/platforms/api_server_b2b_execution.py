@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import hashlib
 import json
+import os
 from contextlib import suppress
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Mapping, Optional
 
 from agent.b2b_execution import (
-    B2BTerminalRefusal, is_b2b_session_id,
+    B2BTerminalRefusal, R2_SCHEMA_PINS, is_b2b_session_id,
 )
 from gateway.platforms.api_server_b2b import _state_for
 
@@ -32,10 +34,10 @@ def guard_agent_construction(
     session_model: Optional[str], model_options: Optional[Dict[str, Any]],
     route: Optional[Dict[str, Any]], requested_model: Optional[str],
     requested_provider: Optional[str],
-) -> None:
+) -> Optional[Any]:
     """Pre-construction B2B gate for ``_create_agent`` (the moved guard block).
 
-    Absent/disabled state: ordinary ids return immediately — no
+    Absent/disabled state: ordinary ids return ``None`` immediately — no
     ``current_execution``, home resolve, or sink/policy checks. A reserved id
     still refuses ``b2b_capability_mismatch`` cheaply: no admission can exist
     on a disabled lane (and ``assert_current_policy`` would deny any stale cap
@@ -43,8 +45,10 @@ def guard_agent_construction(
 
     Enabled: an ordinary id refuses only while a foreign cap is bound to this
     context. A reserved id requires a matching admitted cap whose policy_home
-    and still-current operator policy verify — then rejects any caller-side
-    override — before the WITHDRAWN runtime refuses durably at the sink
+    and still-current operator policy verify, then rejects any caller-side
+    override. With the project's execution-context inputs verified on disk,
+    the gate RETURNS the bound cap so ``_create_agent`` can hand it to
+    ``construct_b2b_agent``; without them it refuses durably at the sink
     (``context_unavailable``), ahead of every construction seam.
     """
     state = _state_for(adapter)
@@ -79,14 +83,243 @@ def guard_agent_construction(
             requested_model not in (None, project["model"]) or
             requested_provider not in (None, project["provider"])):
         raise B2BTerminalRefusal("b2b_policy_override")
-    # H1: B2B runtime construction is WITHDRAWN. AIAgent.__init__ can reach
-    # the provider before any bounded policy could be installed (lazy
-    # context_length metadata probes), so the admitted attempt refuses
-    # durably here — before run_agent import, runtime/credential/tool
-    # resolution or memory checkout. A governed construction path returns
-    # with C1's context producer.
-    cap.sink.block("context_unavailable")
-    raise B2BTerminalRefusal("context_unavailable")
+    # L2: governed construction is open only when the operator's real
+    # execution context for THIS project is in place AND the C1 producer has
+    # published it — b2b_execution_ready stays False until the producer is
+    # integrated, so every stale admitted cap keeps the same durable terminal
+    # refusal — before run_agent import, runtime/credential/tool resolution
+    # or memory checkout.
+    from gateway.run import _load_gateway_config
+    if not b2b_execution_ready(project, _load_gateway_config()):
+        cap.sink.block("context_unavailable")
+        raise B2BTerminalRefusal("context_unavailable")
+    return cap
+
+
+def _abs_dir(value: Any) -> bool:
+    """An existing absolute directory — the on-disk half of every
+    host-supplied context root (config validation already enforces the
+    absolute shape)."""
+    return isinstance(value, str) and os.path.isdir(value)
+
+
+def _contract_root_ready(root: Any) -> bool:
+    """The pinned r2 contract root, verified by content: every schema file
+    exists AND hashes to its production pin — a directory of lookalikes is
+    not the contract."""
+    if not _abs_dir(root):
+        return False
+    for name, pin in R2_SCHEMA_PINS.items():
+        path = os.path.join(root, name)
+        try:
+            with open(path, "rb") as fh:
+                if hashlib.sha256(fh.read()).hexdigest() != pin:
+                    return False
+        except OSError:
+            return False
+    return True
+
+
+def _init_inert_config(config: Optional[Mapping]) -> bool:
+    """The serving profile's effective config must pin away every provider
+    reach ``AIAgent.__init__`` could make before the bounded policy exists —
+    H1's withdrawal reason. ``model.context_length`` skips the lazy metadata
+    probes; ``compression.enabled: false`` skips the init-time aux model
+    feasibility probe. Both are explicit operator pins, never defaults."""
+    if not isinstance(config, Mapping):
+        return False
+    model = config.get("model")
+    context_length = model.get("context_length") if isinstance(model, Mapping) else None
+    if (not isinstance(context_length, int) or isinstance(context_length, bool)
+            or context_length <= 0):
+        return False
+    compression = config.get("compression")
+    return isinstance(compression, Mapping) and compression.get("enabled") is False
+
+
+def b2b_execution_inputs_ready(project: Any, config: Optional[Mapping]) -> bool:
+    """Operator-input PREPARATION for ONE validated project entry: the on-disk
+    artifacts the governed lane consumes — the verified r2 contract root and
+    the My Work ``allocation_root``/``start`` directories C1 binds at context
+    publication — plus the serving-profile pins that keep construction inert.
+    All operator inputs; nothing inferred from defaults or ambient state.
+    Preparation is necessary but NOT sufficient: see b2b_execution_ready."""
+    if not isinstance(project, Mapping):
+        return False
+    context = project.get("project_context")
+    return (
+        _contract_root_ready(project.get("context_contract_root"))
+        and isinstance(context, Mapping)
+        and context.get("project_id") == project.get("project_id")
+        and all(_abs_dir(context.get(key)) for key in ("allocation_root", "start"))
+        and _init_inert_config(config))
+
+
+def b2b_execution_unavailable_code(project: Any, config: Optional[Mapping]) -> Optional[str]:
+    """THE execution-unavailability classification for ONE project — the
+    single source the POST admission gate and ``/health/detailed`` both
+    consult. ``None`` only when ``b2b_execution_ready`` opens the lane
+    (impossible until the C1 producer ships); ``execution_inputs_unavailable``
+    for a preparation hole; ``c1_producer_unavailable`` when preparation is
+    complete and only the missing producer keeps the lane closed."""
+    if b2b_execution_ready(project, config):
+        return None
+    if b2b_execution_inputs_ready(project, config):
+        return "c1_producer_unavailable"
+    return "execution_inputs_unavailable"
+
+
+def b2b_execution_ready(project: Any, config: Optional[Mapping]) -> bool:
+    """EXECUTION readiness for ONE validated project entry — CLOSED in this
+    delivery: the C1 context producer is not integrated, so no input set opens
+    execution and no config/env switch reopens it. Deliberately a single
+    predicate: the producer integration lands HERE (and only here), so every
+    caller — the pre-admission gate, the admitted-cap guard, health — fails
+    closed by construction until then."""
+    return False
+
+
+def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
+    """The smoke-visible lane diagnostic — SYNCHRONOUS; the health handler runs
+    it via ``asyncio.to_thread`` so per-profile config/schema reads and contract
+    hashing never touch the event loop (and it performs no credential or
+    network probes).
+
+    Shape: absent/disabled lane → ``not-configured``/``null``/``{}``. Enabled →
+    every profile is evaluated under its OWN profile scope against its OWN
+    serving config (A→B→A), and reported ``not-ready`` — never ``ready`` —
+    with a typed code: ``execution_inputs_unavailable`` for any preparation
+    hole (including empty profiles/projects and evaluation errors) and
+    ``c1_producer_unavailable`` when preparation is complete and only the
+    missing C1 producer holds the lane closed. The aggregate is the fail-closed
+    combination: any ``execution_inputs_unavailable`` wins."""
+    state = _state_for(adapter)
+    if state is None or not state.config.enabled:
+        return {"b2b_execution": "not-configured", "b2b_execution_code": None,
+                "b2b_execution_profiles": {}}
+    profiles: Dict[str, Any] = {}
+    for name, entry in state.config.profiles.items():
+        code = "execution_inputs_unavailable"
+        try:
+            # Every profile is judged under ITS OWN home — including
+            # ``default``, which must resolve to the canonical default home
+            # (``get_profile_dir("default")``), never the request's ambient
+            # home a prefixed ``/p/<other>/`` request bound.
+            with adapter._profile_scope(name):
+                from gateway.run import _load_gateway_config
+                config = _load_gateway_config()
+                projects = entry.get("projects") or {}
+                if projects and all(
+                        b2b_execution_unavailable_code(project, config)
+                        == "c1_producer_unavailable"
+                        for project in projects.values()):
+                    code = "c1_producer_unavailable"
+        except Exception:
+            code = "execution_inputs_unavailable"
+        profiles[name] = {"state": "not-ready", "code": code}
+    aggregate = ("execution_inputs_unavailable"
+                 if not profiles or any(
+                     p["code"] == "execution_inputs_unavailable"
+                     for p in profiles.values())
+                 else "c1_producer_unavailable")
+    return {"b2b_execution": "not-ready", "b2b_execution_code": aggregate,
+            "b2b_execution_profiles": profiles}
+
+
+def construct_b2b_agent(adapter: Any, cap: Any, *, session_id: Optional[str],
+                        stream_delta_callback: Any, tool_progress_callback: Any,
+                        tool_start_callback: Any, tool_complete_callback: Any,
+                        interim_assistant_callback: Any, reasoning_callback: Any,
+                        status_callback: Any) -> Any:
+    """Bounded B2B agent for ONE admitted execution. Every policy-visible
+    value comes from the frozen project policy — model/provider/base_url/
+    api_mode, one iteration, no toolsets, no memory checkout, no context
+    files, no checkpoints, no fallback or credential pool. Credentials resolve
+    ONLY through the project's pinned provider
+    (``_resolve_runtime_agent_kwargs_for_provider``) under the owning
+    profile's scope — never the serving profile's default route, credential
+    pool, or a fallback provider. The pin's canonical expected provider comes
+    from registry alias resolution (or ``custom`` for a saved named-custom
+    entry); the resolved runtime's EFFECTIVE provider must equal it —
+    ``requested_provider`` is an echo, not proof — the endpoint must match
+    after trimming a trailing '/' only, a credential must exist, and a
+    reported api_mode must equal the pin's, else the attempt is blocked
+    ``policy_provider_unavailable`` BEFORE AIAgent exists. The
+    serving config's explicit ``model.context_length`` rides as a runtime pin
+    so init never needs provider metadata. ``install_bounded_agent_policy``
+    freezes the dispatch surface before the agent leaves this worker."""
+    project = cap.policy_get("project")
+    from run_agent import AIAgent
+    from gateway.run import (
+        _load_gateway_config, _resolve_runtime_agent_kwargs_for_provider)
+
+    def _refuse_provider():
+        cap.sink.block("policy_provider_unavailable")
+        raise B2BTerminalRefusal("policy_provider_unavailable") from None
+
+    # Canonical expected provider: registry alias resolution for ordinary pins,
+    # a saved providers:/custom_providers: entry for named-custom (``custom:<name>``
+    # and bare ``<name>`` spellings). Empty/"auto"/unknown refuse BEFORE the
+    # resolver runs — the pin names one provider, never a search.
+    raw_provider = str(project["provider"] or "").strip().lower()
+    from hermes_cli.auth import resolve_provider
+    from hermes_cli.runtime_provider_custom import has_named_custom_provider
+    expected_provider = None
+    if raw_provider and raw_provider != "auto":
+        try:
+            expected_provider = ("custom"
+                                 if has_named_custom_provider(raw_provider)
+                                 else resolve_provider(raw_provider))
+        except Exception:
+            expected_provider = None
+    if not expected_provider or expected_provider == "auto":
+        _refuse_provider()
+
+    try:
+        runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
+            project["provider"], target_model=project["model"])
+    except Exception:
+        _refuse_provider()
+    # Only the EFFECTIVE provider proves the route — requested_provider merely
+    # echoes the request and hides a ladder fallback. Endpoint match trims a
+    # trailing '/' only; a missing credential is a refusal, not a 401 later.
+    if runtime_kwargs.get("provider") != expected_provider:
+        _refuse_provider()
+    if (str(runtime_kwargs.get("base_url") or "").rstrip("/")
+            != str(project["base_url"] or "").rstrip("/")):
+        _refuse_provider()
+    if not runtime_kwargs.get("api_key"):
+        _refuse_provider()
+    runtime_api_mode = runtime_kwargs.get("api_mode")
+    if runtime_api_mode and runtime_api_mode != project["api_mode"]:
+        _refuse_provider()
+    model_cfg = _load_gateway_config().get("model") or {}
+    agent = AIAgent(
+        model=project["model"], provider=project["provider"],
+        api_mode=project["api_mode"], base_url=project["base_url"],
+        api_key=runtime_kwargs.get("api_key"),
+        context_length=model_cfg.get("context_length"),
+        max_iterations=1, quiet_mode=True, verbose_logging=False,
+        ephemeral_system_prompt=None, enabled_toolsets=[],
+        session_id=session_id, platform="api_server",
+        stream_delta_callback=stream_delta_callback,
+        tool_progress_callback=tool_progress_callback,
+        tool_start_callback=tool_start_callback,
+        tool_complete_callback=tool_complete_callback,
+        interim_assistant_callback=interim_assistant_callback,
+        reasoning_callback=reasoning_callback,
+        status_callback=status_callback,
+        session_db=adapter._ensure_session_db(),
+        fallback_model=None, reasoning_config=None,
+        gateway_session_key=None, memory_manager=None,
+        checkpoints_enabled=False,
+        skip_memory=True, skip_context_files=True)
+    agent._hermes_api_runtime = {
+        "provider": project["provider"], "model": project["model"],
+        "route_source": "b2b_policy"}
+    from agent.b2b_execution import install_bounded_agent_policy
+    install_bounded_agent_policy(agent, cap)
+    return agent
 
 
 async def construct_run_agent(adapter: Any, run: Any, construct_agent: Callable[[], Any],

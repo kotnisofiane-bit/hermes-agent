@@ -1146,6 +1146,32 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
+    # L2-mw admission gate: the project identity is proven by the signed
+    # source, but execution stays CLOSED until the C1 producer ships. The
+    # refusal covers NEW admissions only — an already-durable attempt row is
+    # always served by the idempotent replay below (b2b_admit ->
+    # _replayed_response), so a lost-ACK retry never hears
+    # "execution_unavailable" for a committed lane. Readiness is classified
+    # by the single source (b2b_execution_unavailable_code — the same one
+    # /health/detailed reports) under the OWNING profile's scope against ITS
+    # serving config, off the event loop, BEFORE any admission/title/spawn
+    # durable write consumes the single attempt; any error entering the
+    # scope or reading the config is itself a typed execution_unavailable,
+    # never an untyped 500.
+    existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
+
+    def _execution_ready() -> bool:
+        try:
+            with adapter._profile_scope(profile):
+                from gateway.run import _load_gateway_config
+                config = _load_gateway_config()
+            from gateway.platforms.api_server_b2b_execution import (
+                b2b_execution_unavailable_code)
+            return b2b_execution_unavailable_code(project, config) is None
+        except Exception:
+            return False
+    if existing_attempt is None and not await _a.to_thread(_execution_ready):
+        return _deny(503, "execution_unavailable")
     policy = {
         "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
         "attempt_id": attempt_id, "profile_home": str(home),
@@ -1165,7 +1191,7 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     scope = _run_scope(profile, resolved["requester_id"], binding_digest)
     initial_status = {"status": "queued", "session_id": session_id, "created_at": time.time()}
     # Lost-ACK replay is allowed even while the original holds the final native worker slot.
-    if store.b2b_attempt(profile=profile, attempt_id=attempt_id) is None:
+    if existing_attempt is None:
         limited = adapter._concurrency_limited_response()
         if limited is not None:
             return limited
@@ -1296,11 +1322,23 @@ async def _handle_b2b_proposal_post(adapter: Any, request: Any):
         return _deny(400, "invalid_attempt_id")
     if (request.headers.get("Idempotency-Key") or "").strip() != attempt_id:
         return _deny(400, "idempotency_key_mismatch")
-    # H1: the execution runtime is withdrawn, so admission never consumes the
-    # binding's single attempt — refuse BEFORE the session DB, the durable
-    # store, source I/O, admit/title/spawn. A repeated POST stays
-    # non-consuming; signed GETs on previously existing attempts still read.
-    return _deny(503, "execution_unavailable")
+    db = await adapter._ensure_session_db_async()
+    if db is None:
+        return _deny(503, "store_unavailable")
+    store = adapter._run_idempotency_store
+    if not _store_durable(store):
+        return _deny(503, "store_unavailable")
+    resolved, reason = await _resolve_source_async(
+        entry, keys, "bind", attempt_id=attempt_id, profile=profile, session_id=session_id)
+    if resolved is None:
+        # Any signed-source invalidity collapses to one refusal shape — the
+        # specific check is journal-side, never leaked to the caller.
+        return _deny(503 if reason == "source_unavailable" else 403,
+                     "source_unavailable" if reason == "source_unavailable" else "source_denied")
+    return await _launch_b2b_run(
+        adapter, request, profile=profile, entry=entry, keys=keys,
+        session_id=session_id, binding_digest=binding_digest, attempt_id=attempt_id,
+        resolved=resolved, store=store, db=db)
 
 
 async def _b2b_get(adapter: Any, request: Any, *, want_context: bool):

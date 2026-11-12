@@ -50,11 +50,14 @@ def _adapter(lane):
 
 def _guarded_create(lane, adapter, monkeypatch, *, session_id, **kwargs):
     """Call _create_agent under the admitted profile/capability scope with
-    runtime-resolution imports and the agent constructor turned into tripwires."""
+    runtime-resolution imports and the agent constructor turned into tripwires.
+
+    ``_load_gateway_config`` is NOT tripwired: the readiness gate reads the
+    effective serving config to verify the operator's inert-init inputs --
+    it returns {} on error and never touches runtime/provider state."""
     for name in (
             "_resolve_runtime_agent_kwargs", "_resolve_gateway_model",
-            "_load_gateway_config", "_checkpoint_agent_kwargs",
-            "_current_max_iterations"):
+            "_checkpoint_agent_kwargs", "_current_max_iterations"):
         monkeypatch.setattr(
             f"gateway.run.{name}", _sentinel(f"gateway.run.{name}"), raising=False)
     monkeypatch.setattr(

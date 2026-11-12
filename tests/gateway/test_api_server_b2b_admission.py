@@ -1,13 +1,13 @@
-"""B2B proposal POST: admission never consumes the single attempt while the H1
-execution runtime is withdrawn, and the typed surface resolves the owning
-profile from the REQUEST's home -- never a literal ``"default"``.
+"""B2B proposal POST: a refused source exchange never consumes the single
+attempt, and the typed surface resolves the owning profile from the
+REQUEST's home -- never a literal ``"default"``.
 
-The valid signed request must reach the same ``503 execution_unavailable``
-refusal every time, BEFORE the session DB, the durable store, source I/O,
-admission, titling or spawn -- a repeated POST stays non-consuming. Signed GETs
-on previously existing attempts remain usable; a proof on a never-admitted
-tuple is a plain 404. All crypto is real Ed25519; only the tripwires that must
-never run are patched.
+The valid signed request reaches ``_resolve_source_async`` under the owning
+profile; a source refusal lands as the classified denial BEFORE admission,
+titling or spawn -- a repeated POST stays non-consuming. Signed GETs on
+previously existing attempts remain usable; a proof on a never-admitted
+tuple is a plain 404. All crypto is real Ed25519; only the source exchange
+itself and the tripwires that must never run are patched.
 """
 
 from __future__ import annotations
@@ -118,19 +118,21 @@ def _tripwire(name):
 @pytest.mark.asyncio
 async def test_b2b_proposal_post_refuses_before_admission_without_writes(
         tmp_path, monkeypatch, opened):
-    """A valid signed POST gets 503 execution_unavailable BEFORE session-db,
-    store, source, admit, title or spawn -- and repeated POSTs stay that way."""
+    """A valid signed POST whose source exchange refuses gets 503
+    source_unavailable BEFORE admit, title or spawn -- and repeated POSTs
+    stay non-consuming."""
     _profile_home(tmp_path, monkeypatch, "hub")
     adapter = _adapter(tmp_path, monkeypatch, "hub")
     opened.extend([adapter._session_db, adapter._run_idempotency_store])
     session_id, attempt_id, binding, body = _post_body()
     adapter._session_db.create_session(session_id, "api_server")
 
-    for target in ("resolve_source", "_resolve_source_async",
-                   "_launch_b2b_run", "_spawn_run"):
+    async def _unavailable(*a, **k):
+        return None, "source_unavailable"
+
+    monkeypatch.setattr(b2b, "_resolve_source_async", _unavailable)
+    for target in ("resolve_source", "_launch_b2b_run", "_spawn_run"):
         monkeypatch.setattr(b2b, target, _tripwire(f"b2b.{target}"))
-    monkeypatch.setattr(adapter, "_ensure_session_db_async",
-                        _tripwire("_ensure_session_db_async"))
     monkeypatch.setattr(adapter, "_create_agent", _tripwire("_create_agent"))
 
     session_before = adapter._session_db.get_session(session_id)
@@ -146,8 +148,8 @@ async def test_b2b_proposal_post_refuses_before_admission_without_writes(
                          "Idempotency-Key": attempt_id})
             payload = await resp.json()
             assert resp.status == 503, payload
-            assert payload.get("error") == "execution_unavailable"
-            assert payload.get("code") == "execution_unavailable"
+            assert payload.get("error") == "source_unavailable"
+            assert payload.get("code") == "source_unavailable"
 
     # No durable writes of any kind: no run/attempt/binding/artifact rows, no
     # native session mutation (title etc.), no extra store transactions.
@@ -172,8 +174,10 @@ async def test_b2b_proposal_post_resolves_owning_profile(
     opened.extend([adapter._session_db, adapter._run_idempotency_store])
     session_id, attempt_id, binding, body = _post_body()
 
-    monkeypatch.setattr(adapter, "_ensure_session_db_async",
-                        _tripwire("_ensure_session_db_async"))
+    async def _unavailable(*a, **k):
+        return None, "source_unavailable"
+
+    monkeypatch.setattr(b2b, "_resolve_source_async", _unavailable)
 
     async with TestClient(TestServer(_app(adapter))) as client:
         resp = await client.post(
@@ -183,7 +187,7 @@ async def test_b2b_proposal_post_resolves_owning_profile(
                      "Idempotency-Key": attempt_id})
         payload = await resp.json()
         assert resp.status == 503, payload
-        assert payload.get("error") == "execution_unavailable"
+        assert payload.get("error") == "source_unavailable"
         # A foreign prefix still 404s in the middleware before the handler.
         resp = await client.post(
             f"/p/foreign/api/sessions/{session_id}/b2b-proposal",
@@ -251,22 +255,23 @@ class _ProposalRequest:
 
 
 @pytest.mark.asyncio
-async def test_b2b_proposal_post_handler_refuses_before_db_tripwire(
+async def test_b2b_proposal_post_handler_source_denied_before_launch(
         tmp_path, monkeypatch, opened):
-    """Direct-handler boundary: fully valid request under a trusted selector
-    scope -> 503 execution_unavailable BEFORE the session-db seam, independent
-    of any profile-resolution fallback (the selector is set explicitly)."""
+    """Direct-handler boundary: a fully valid request under a trusted selector
+    scope whose source exchange denies -> 403 source_denied BEFORE admission
+    -- independent of any profile-resolution fallback (selector explicit)."""
     _profile_home(tmp_path, monkeypatch, "hub")
     adapter = _adapter(tmp_path, monkeypatch, "hub")
     opened.extend([adapter._session_db, adapter._run_idempotency_store])
     session_id, attempt_id, binding, body = _post_body()
     adapter._session_db.create_session(session_id, "api_server")
 
-    for target in ("resolve_source", "_resolve_source_async",
-                   "_launch_b2b_run", "_spawn_run"):
+    async def _denied(*a, **k):
+        return None, "source_denied"
+
+    monkeypatch.setattr(b2b, "_resolve_source_async", _denied)
+    for target in ("resolve_source", "_launch_b2b_run", "_spawn_run"):
         monkeypatch.setattr(b2b, target, _tripwire(f"b2b.{target}"))
-    monkeypatch.setattr(adapter, "_ensure_session_db_async",
-                        _tripwire("_ensure_session_db_async"))
 
     session_before = adapter._session_db.get_session(session_id)
     counts_before = _store_counts(adapter._run_idempotency_store)
@@ -280,9 +285,9 @@ async def test_b2b_proposal_post_handler_refuses_before_db_tripwire(
     finally:
         _api_request_profile.reset(token)
 
-    assert response.status == 503
+    assert response.status == 403
     payload = json.loads(response.body)
-    assert payload.get("error") == "execution_unavailable"
+    assert payload.get("error") == "source_denied"
     assert adapter._session_db.get_session(session_id) == session_before
     assert _store_counts(adapter._run_idempotency_store) == counts_before
     assert adapter._run_idempotency_store._conn.total_changes == changes_before
@@ -468,3 +473,378 @@ def test_prune_preserves_aged_b2b_and_drops_aged_ordinary(tmp_path, opened):
     assert "run_ord" not in remaining
     assert "run_b2b" in remaining
     assert "run_new" in remaining
+
+
+# ---------------------------------------------------------------------------
+# L2-mw admission gate: signed + session-valid POSTs still refuse. Full
+# preparation is real but execution stays CLOSED (no C1 producer), and any
+# missing preparation is closed identically — either way the single attempt
+# is never consumed: zero durable writes, untouched title, repeated POSTs.
+# ---------------------------------------------------------------------------
+
+class _SourceDouble:
+    """Real signed-source loopback: verifies the Hermes Ed25519 request
+    envelope and answers with a properly signed ``resolved`` envelope over
+    real loopback HTTP. Only the counterparty is doubled — every check the
+    production verifier runs is real (crypto, envelope shape, window)."""
+
+    def __init__(self, *, portal_priv, portal_issuer, hermes_issuer,
+                 hermes_pub_pem, body_for):
+        import base64 as _b64
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        from cryptography.hazmat.primitives.serialization import (
+            load_pem_public_key)
+        from tests.gateway.b2b_process_harness import DOMAIN, canonical
+
+        self._portal_priv = portal_priv
+        self._portal_issuer = portal_issuer
+        self._hermes_issuer = hermes_issuer
+        self._body_for = body_for
+        self._hermes_pub = load_pem_public_key(hermes_pub_pem.encode())
+        self._b64 = _b64
+        self._domain = DOMAIN
+        self._canonical = canonical
+        double = self
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers["Content-Length"]))
+                try:
+                    env = json.loads(raw)
+                    unsigned = {k: v for k, v in env.items()
+                                if k != "signature"}
+                    double._hermes_pub.verify(
+                        double._b64.urlsafe_b64decode(
+                            env["signature"] + "=="),
+                        double._domain + double._canonical(unsigned))
+                    resp = double._envelope(double._body_for(env))
+                except Exception:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+                payload = json.dumps(
+                    resp, separators=(",", ":")).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+        self.source_url = ("http://127.0.0.1:"
+                           f"{self._server.server_address[1]}"
+                           "/internal/dubsar/b2b/source")
+
+    def _envelope(self, body):
+        now = int(time.time())
+        env = {"version": b2b._VERSION, "issuer": self._portal_issuer,
+               "audience": self._hermes_issuer,
+               "operation": b2b._RESPONSE_OPERATION,
+               "request_id": str(uuid.uuid4()), "issued_at": now,
+               "expires_at": now + b2b._REQUEST_TTL_S, "body": body}
+        env["signature"] = _sig(env, self._portal_priv)
+        return env
+
+    def stop(self):
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(5)
+
+
+def _valid_admission_lane(tmp_path, monkeypatch, opened, *, prepared: bool):
+    """Adapter + REAL signed loopback source + a session/binding tuple whose
+    resolved body passes every production check. ``prepared`` mounts the
+    operator inputs (r2 contract root, My Work roots, inert serving config);
+    either way the lane must refuse before admission."""
+    import hashlib
+    from tests.gateway.b2b_process_harness import (
+        canonical, extract_contract_root)
+
+    prof = _profile_home(tmp_path, monkeypatch, "hub")
+    portal_priv, _, portal_pub = make_keypair()
+    _, hermes_priv_pem, hermes_pub = make_keypair()
+    requester_id = "1" * 24
+    project_id = "b2b-bench"
+    mission_id, mission_revision = "DUB-001", 1
+    basis = {"format": "dubsar.b2b-agent-session-binding/1",
+             "requester_id": requester_id, "project_id": project_id,
+             "mission_id": mission_id, "mission_revision": mission_revision}
+    binding = hashlib.sha256(canonical(basis)).hexdigest()
+    session_id = "b2b_" + binding
+    attempt_id = b2b._attempt_id_for(binding)
+
+    project = {"project_id": project_id, "bot_id": "bot", "profile_id": "hub",
+               "allowed_namespaces": ["ns"], "context_contract_root": None,
+               "model": "unit-double", "provider": "custom",
+               "base_url": "http://127.0.0.1:9/v1",
+               "api_mode": "chat_completions",
+               "logical_mission": None, "project_context": None}
+    if prepared:
+        alloc = tmp_path / "mywork-alloc"
+        start = tmp_path / "mywork-start"
+        alloc.mkdir()
+        start.mkdir()
+        project["context_contract_root"] = extract_contract_root(tmp_path)
+        project["project_context"] = {
+            "allocation_root": str(alloc), "project_id": project_id,
+            "start": str(start)}
+        (prof / "config.yaml").write_text(
+            "model:\n  context_length: 256000\n"
+            "compression:\n  enabled: false\n")
+
+    lane = SimpleNamespace()
+
+    def _body_for(request_env):
+        req = request_env["body"]
+        s = lane.db.get_session(req["session_id"])
+        obs = {
+            "id": s["id"], "source": s["source"], "title": s.get("title"),
+            "model": s.get("model"),
+            "parent_session_id": s.get("parent_session_id"),
+            "has_system_prompt": s.get("system_prompt") is not None,
+            "has_model_config": s.get("model_config") is not None,
+            "ended_at": s.get("ended_at"), "end_reason": s.get("end_reason"),
+            "message_count": int(s.get("message_count") or 0),
+            "tool_call_count": int(s.get("tool_call_count") or 0),
+            "api_call_count": int(s.get("api_call_count") or 0),
+            "profile": "hub"}
+        return {
+            "attempt_id": req["attempt_id"], "profile": "hub",
+            "session_id": req["session_id"], "binding_digest": binding,
+            "source_state": "active",
+            "reservation_ref": {"collection": "dubsar_b2b_agent_sessions",
+                                "id": binding},
+            "requester_id": requester_id, "project_id": project_id,
+            "project_binding_id": project_id, "mission_id": mission_id,
+            "mission_revision": mission_revision,
+            "request_digest": "d" * 64, "mission_source_digest": "c" * 64,
+            "ticket_digest": "e" * 64,
+            "authority_basis_digest": "sha256:" + "b" * 64,
+            "authority_digest": "sha256:" + "a" * 64,
+            "observation_genesis": obs,
+            "mission_request": {"title": "m", "objective": "o",
+                                "criteria": ["c"], "source_refs": []},
+            "source_request_id": request_env["request_id"],
+            "source_request_digest": hashlib.sha256(
+                canonical(request_env)).hexdigest()}
+
+    source = _SourceDouble(
+        portal_priv=portal_priv, portal_issuer="portal-hub",
+        hermes_issuer="hermes-hub", hermes_pub_pem=hermes_pub,
+        body_for=_body_for)
+    extra = {"key": _API_KEY, "b2b": {"enabled": True, "profiles": {"hub": {
+        "source_url": source.source_url, "portal_issuer": "portal-hub",
+        "hermes_issuer": "hermes-hub", "portal_public_key_pem": portal_pub,
+        "hermes_private_key_pem": hermes_priv_pem,
+        "projects": {project_id: project}}}}}
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra=extra))
+    adapter.gateway_runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=False))
+    adapter._session_db = SessionDB(prof / "state.db")
+    adapter._session_db.create_session(session_id, "api_server")
+    opened.extend([adapter._session_db, adapter._run_idempotency_store])
+    lane.db = adapter._session_db
+    lane.adapter = adapter
+    lane.source = source
+    lane.session_id = session_id
+    lane.attempt_id = attempt_id
+    lane.binding = binding
+    return lane
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prepared", [False, True],
+                         ids=["missing_inputs", "fully_prepared"])
+async def test_b2b_proposal_post_refuses_execution_unavailable_no_writes(
+        tmp_path, monkeypatch, prepared, opened):
+    """POST refusal E2E: a REAL aiohttp authenticated POST, a REAL signed
+    loopback source resolving a REAL session on a REAL durable store —
+    refused 503 execution_unavailable whether preparation is missing or
+    complete (the C1 producer is not integrated), on REPEATED requests, with
+    zero b2b_binding/attempt/run/artifact rows and an unchanged session."""
+    lane = _valid_admission_lane(
+        tmp_path, monkeypatch, opened, prepared=prepared)
+    adapter = lane.adapter
+    try:
+        for target in ("resolve_source",):
+            monkeypatch.setattr(b2b, target, _tripwire(f"b2b.{target}"))
+        monkeypatch.setattr(
+            adapter, "_create_agent", _tripwire("_create_agent"))
+        session_before = adapter._session_db.get_session(lane.session_id)
+        counts_before = _store_counts(adapter._run_idempotency_store)
+        changes_before = adapter._run_idempotency_store._conn.total_changes
+
+        async with TestClient(TestServer(_app(adapter))) as client:
+            for _ in range(2):
+                resp = await client.post(
+                    f"/p/hub/api/sessions/{lane.session_id}/b2b-proposal",
+                    json={"attempt_id": lane.attempt_id,
+                          "binding_digest": lane.binding},
+                    headers={"Authorization": f"Bearer {_API_KEY}",
+                             "Idempotency-Key": lane.attempt_id})
+                payload = await resp.json()
+                assert resp.status == 503, payload
+                assert payload.get("error") == "execution_unavailable"
+                assert payload.get("code") == "execution_unavailable"
+
+        assert adapter._session_db.get_session(
+            lane.session_id) == session_before
+        counts = _store_counts(adapter._run_idempotency_store)
+        assert counts["b2b_bindings"] == 0
+        assert counts["b2b_attempts"] == 0
+        assert counts["b2b_artifacts"] == 0
+        assert counts["run_idempotency"] == counts_before["run_idempotency"]
+        assert (adapter._run_idempotency_store._conn.total_changes
+                == changes_before)
+        for table in (adapter._run_streams, adapter._run_streams_created,
+                      adapter._active_run_agents, adapter._active_run_tasks,
+                      adapter._run_statuses):
+            assert not table
+    finally:
+        lane.source.stop()
+
+
+@pytest.mark.asyncio
+async def test_b2b_proposal_post_replays_durable_attempt_before_readiness_guard(
+        tmp_path, monkeypatch, opened):
+    """Lost-ACK contract: an already-durable attempt row is ALWAYS served by
+    the idempotent replay — never refused ``execution_unavailable`` by the
+    new-admissions-only readiness guard. POST 1 admits for real under the
+    standard test-only availability lift; POST 2 runs with production
+    readiness (closed) and must get the SAME run_id back as ``replayed``."""
+    from gateway.platforms import api_server_b2b_execution as b2b_exec
+    lane = _valid_admission_lane(
+        tmp_path, monkeypatch, opened, prepared=False)
+    adapter = lane.adapter
+    try:
+        # The attested genesis observation is immutable; the live session's
+        # title moves after admission titling, so the retry's source body
+        # must serve the SAME observation or the fingerprint diverges.
+        underlying = lane.source._body_for
+        frozen = {}
+
+        def _frozen_body(env):
+            body = underlying(env)
+            body["observation_genesis"] = frozen.setdefault(
+                "obs", body["observation_genesis"])
+            return body
+
+        lane.source._body_for = _frozen_body
+
+        async def _stub_spawn(*a, **k):
+            return object()
+
+        monkeypatch.setattr(b2b, "_spawn_run", _stub_spawn)
+        monkeypatch.setattr(
+            adapter, "_create_agent", _tripwire("_create_agent"))
+
+        async with TestClient(TestServer(_app(adapter))) as client:
+            def post():
+                return client.post(
+                    f"/p/hub/api/sessions/{lane.session_id}/b2b-proposal",
+                    json={"attempt_id": lane.attempt_id,
+                          "binding_digest": lane.binding},
+                    headers={"Authorization": f"Bearer {_API_KEY}",
+                             "Idempotency-Key": lane.attempt_id})
+
+            # TEST-ONLY availability lift — the same seam the construction
+            # tests use; production b2b_execution_ready stays False. POST 1
+            # therefore admits durably like a pre-guard deployment did.
+            real_ready = b2b_exec.b2b_execution_ready
+            monkeypatch.setattr(
+                b2b_exec, "b2b_execution_ready", lambda *a, **k: True)
+            resp = await post()
+            assert resp.status == 200, await resp.text()
+            first = await resp.json()
+            assert first["status"] == "admitted"
+            monkeypatch.setattr(b2b_exec, "b2b_execution_ready", real_ready)
+
+            # Lost-ACK retry against the CLOSED lane: replayed, not refused.
+            resp = await post()
+            assert resp.status == 200, await resp.text()
+            second = await resp.json()
+            assert second["status"] == "replayed"
+            assert second["run_id"] == first["run_id"]
+            assert second["attempt_id"] == lane.attempt_id
+            assert second["binding_digest"] == lane.binding
+            assert second["session_id"] == lane.session_id
+            assert second["profile"] == "hub"
+
+        counts = _store_counts(adapter._run_idempotency_store)
+        assert counts["b2b_bindings"] == 1
+        assert counts["b2b_attempts"] == 1
+        assert counts["b2b_artifacts"] >= 1
+    finally:
+        lane.source.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broken", ["scope", "config"],
+                         ids=["scope_entry", "config_load"])
+async def test_b2b_proposal_post_guard_error_refuses_typed_unavailable(
+        tmp_path, monkeypatch, opened, broken):
+    """A failure INSIDE the new-admission readiness guard — profile-scope
+    entry or serving-config read — must still answer the typed
+    ``503 execution_unavailable`` (the lane fails closed), never an untyped
+    500, and must write nothing."""
+    lane = _valid_admission_lane(
+        tmp_path, monkeypatch, opened, prepared=False)
+    adapter = lane.adapter
+    try:
+        if broken == "scope":
+            # The /p/<profile>/ middleware enters the scope FIRST; the
+            # guard's own entry is the second one — fail only that.
+            scope_calls = []
+            real_scope = APIServerAdapter._profile_scope
+
+            def _flaky_scope(profile):
+                scope_calls.append(profile)
+                if len(scope_calls) > 1:
+                    raise RuntimeError("profile scope entry failed")
+                return real_scope(profile)
+
+            monkeypatch.setattr(adapter, "_profile_scope", _flaky_scope)
+        else:
+            import gateway.run as gw_run
+
+            def _boom_config(*a, **k):
+                raise RuntimeError("config read failed")
+            monkeypatch.setattr(
+                gw_run, "_load_gateway_config", _boom_config)
+        monkeypatch.setattr(
+            adapter, "_create_agent", _tripwire("_create_agent"))
+        session_before = adapter._session_db.get_session(lane.session_id)
+        counts_before = _store_counts(adapter._run_idempotency_store)
+        changes_before = adapter._run_idempotency_store._conn.total_changes
+
+        async with TestClient(TestServer(_app(adapter))) as client:
+            resp = await client.post(
+                f"/p/hub/api/sessions/{lane.session_id}/b2b-proposal",
+                json={"attempt_id": lane.attempt_id,
+                      "binding_digest": lane.binding},
+                headers={"Authorization": f"Bearer {_API_KEY}",
+                         "Idempotency-Key": lane.attempt_id})
+            assert resp.status == 503, await resp.text()
+            payload = await resp.json()
+            assert payload.get("error") == "execution_unavailable"
+            assert payload.get("code") == "execution_unavailable"
+
+        assert adapter._session_db.get_session(
+            lane.session_id) == session_before
+        counts = _store_counts(adapter._run_idempotency_store)
+        assert counts["b2b_bindings"] == 0
+        assert counts["b2b_attempts"] == 0
+        assert counts["b2b_artifacts"] == 0
+        assert counts["run_idempotency"] == counts_before["run_idempotency"]
+        assert (adapter._run_idempotency_store._conn.total_changes
+                == changes_before)
+    finally:
+        lane.source.stop()
