@@ -12,13 +12,16 @@ itself and the tripwires that must never run are patched.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import socket
 import time
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
+import aiohttp
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -848,3 +851,288 @@ async def test_b2b_proposal_post_guard_error_refuses_typed_unavailable(
                 == changes_before)
     finally:
         lane.source.stop()
+
+
+# ---------------------------------------------------------------------------
+# C1: the model base_url is loopback-closed at CONSTRUCTION, and connect()
+# must prove the gateway refuses an unauthenticated POST with exactly 401
+# (G2's contract) BEFORE any route is installed. Fail-closed: any other
+# status, a redirect, or an unreachable/hung gateway is a nonretryable
+# startup refusal.
+# ---------------------------------------------------------------------------
+
+_BAD_MODEL_URLS = [
+    "https://integrate.api.nvidia.com/v1",
+    "http://1.1.1.1:443/v1",
+    "http://localhost:8000/v1",
+    "http://127.0.0.2:8000/v1",
+    "http://[::1]:8000/v1",
+    "https://127.0.0.1:8000/v1",
+    "http://user:pass@127.0.0.1:8000/v1",
+    "http://@127.0.0.1:8000/v1",
+    "http://127.0.0.1/v1",
+    "http://127.0.0.1:0/v1",
+    "http://127.0.0.1:65536/v1",
+    "http://127.0.0.1:abc/v1",
+    "http://127.0.0.1:٨٠٠٠/v1",  # unicode digits: port is ASCII [0-9] only
+    "http://127.0.0.1:8000/v1/",
+    "http://127.0.0.1:8000/v2",
+    "http://127.0.0.1:8000/v1?x=y",
+    "http://127.0.0.1:8000/v1#x",
+    "http://127.0.0.1:8000 /v1",
+    " http://127.0.0.1:8000/v1",
+    "http://127.0.0.1:8000/%2fv1",
+    "http://127.0.0.1:8000/v%31",
+]
+
+
+def _extra_with_model_url(url):
+    extra = _b2b_extra("hub")
+    extra["b2b"]["profiles"]["hub"]["projects"]["b2b-bench"]["base_url"] = url
+    return extra
+
+
+@pytest.mark.parametrize("url", _BAD_MODEL_URLS)
+def test_b2b_model_url_refused_at_construction(tmp_path, monkeypatch, url):
+    """Anything but exactly ``http://127.0.0.1:<port>/v1`` (ASCII digits, port
+    1..65535) fails config validation at construction -- the adapter is never
+    built, so no ResponseStore or idempotency store is created either."""
+    _profile_home(tmp_path, monkeypatch, "hub")
+    from gateway.platforms import api_server as api_server_mod
+    touched = []
+
+    def _store_tripwire(*a, **k):
+        touched.append(1)
+        raise AssertionError("store construction must not run on a refused config")
+
+    monkeypatch.setattr(api_server_mod, "ResponseStore", _store_tripwire)
+    monkeypatch.setattr(api_server_mod, "RunIdempotencyStore", _store_tripwire)
+    with pytest.raises(b2b.B2BConfigError) as excinfo:
+        APIServerAdapter(PlatformConfig(
+            enabled=True, extra=_extra_with_model_url(url)))
+    assert type(excinfo.value) is b2b.B2BConfigError
+    # The error never echoes the refused URL back.
+    assert url not in str(excinfo.value)
+    assert not touched
+
+
+@pytest.mark.parametrize("port", [1, 8000, 65535])
+def test_b2b_model_url_loopback_boundary_accepts(port):
+    config = b2b.validate_b2b_config(
+        _extra_with_model_url(f"http://127.0.0.1:{port}/v1"))
+    assert config.enabled
+    project = config.profiles["hub"]["projects"]["b2b-bench"]
+    assert project["base_url"] == f"http://127.0.0.1:{port}/v1"
+
+
+def test_adapter_without_b2b_with_direct_model_routes_constructs(
+        tmp_path, monkeypatch, opened):
+    """An ordinary adapter -- no b2b extra and a direct-provider model_routes
+    entry carrying an HTTPS base_url -- is untouched by the C1 gate."""
+    _profile_home(tmp_path, monkeypatch, "hub")
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={
+        "key": _API_KEY,
+        "model_routes": {"alias": {"model": "m", "provider": "openai",
+                                  "base_url": "https://api.openai.com/v1"}}}))
+    opened.extend([adapter._response_store, adapter._run_idempotency_store])
+    assert adapter._b2b_state.config.enabled is False
+
+
+def _adapter_for_model_url(tmp_path, monkeypatch, url, extra_mut=None):
+    extra = _extra_with_model_url(url)
+    if extra_mut is not None:
+        extra_mut(extra)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra=extra))
+    adapter.gateway_runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=False))
+    adapter._session_db = SessionDB(tmp_path / "state.db")
+    return adapter
+
+
+async def _probe_test_server(status, hits, *, delay=0.0):
+    """Ephemeral test-only gateway: records the unauthenticated POST method,
+    body and Authorization header, then answers ``status`` -- 3xx carrying
+    Location=/redirect-target (whose handler counts hits separately)."""
+    async def chat(request):
+        hits["probe"] += 1
+        hits["body"].append(await request.read())
+        hits["auth"].append(request.headers.get("Authorization"))
+        if delay:
+            await asyncio.sleep(delay)
+        if 300 <= status < 400:
+            return web.Response(status=status,
+                                headers={"Location": "/redirect-target"})
+        return web.Response(status=status)
+
+    async def target(request):
+        hits["target"] += 1
+        return web.Response(text="redirected")
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", chat)
+    app.router.add_route("*", "/redirect-target", target)
+    server = TestServer(app)
+    await server.start_server()
+    return server
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [200, 301, 302, 303, 307, 308, 403, 500])
+async def test_b2b_model_gateway_probe_refuses_startup_on_non_401(
+        tmp_path, monkeypatch, opened, status):
+    """connect() must refuse to expose the B2B lane unless the configured
+    gateway answers the EMPTY unauthenticated POST with EXACTLY 401: any
+    other status -- redirects included, never followed -- is a fatal
+    nonretryable refusal BEFORE the serving seam (web.AppRunner never runs,
+    _app never exists, zero durable writes)."""
+    _profile_home(tmp_path, monkeypatch, "hub")
+    hits = {"probe": 0, "target": 0, "body": [], "auth": []}
+    server = await _probe_test_server(status, hits)
+    try:
+        adapter = _adapter_for_model_url(
+            tmp_path, monkeypatch,
+            f"http://127.0.0.1:{server.port}/v1")
+        opened.extend([adapter._session_db, adapter._run_idempotency_store,
+                       adapter._response_store])
+        runner_calls = []
+
+        def _runner_tripwire(*a, **k):
+            runner_calls.append(1)
+            raise AssertionError(
+                "web.AppRunner must not run: the probe refusal precedes serving")
+
+        monkeypatch.setattr(web, "AppRunner", _runner_tripwire)
+        fatal = []
+        monkeypatch.setattr(
+            adapter, "_set_fatal_error",
+            lambda code, msg, *, retryable: fatal.append((code, retryable)))
+        assert await adapter.connect() is False
+        assert ("b2b_model_gateway_invalid", False) in fatal
+        assert not runner_calls
+        assert adapter._app is None
+        assert hits["probe"] == 1
+        assert hits["body"] == [b""]
+        assert hits["auth"] == [None]
+        assert hits["target"] == 0
+        assert not any(
+            _store_counts(adapter._run_idempotency_store).values())
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_b2b_model_gateway_probe_accepts_exact_401(
+        tmp_path, monkeypatch, opened):
+    """The G2 contract the smoke's model-gateway probe attests: a 401 refusal
+    admits the lane. The helper alone never starts the Hermes listener."""
+    validator = getattr(b2b, "validate_b2b_model_gateway", None)
+    assert callable(validator), "validate_b2b_model_gateway must exist"
+    _profile_home(tmp_path, monkeypatch, "hub")
+    hits = {"probe": 0, "target": 0, "body": [], "auth": []}
+    server = await _probe_test_server(401, hits)
+    try:
+        adapter = _adapter_for_model_url(
+            tmp_path, monkeypatch,
+            f"http://127.0.0.1:{server.port}/v1")
+        opened.extend([adapter._session_db, adapter._run_idempotency_store,
+                       adapter._response_store])
+        await validator(adapter)
+        assert hits["probe"] == 1
+        assert hits["body"] == [b""]
+        assert hits["auth"] == [None]
+        assert adapter._app is None
+        assert not any(
+            _store_counts(adapter._run_idempotency_store).values())
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_b2b_model_gateway_probe_outage_and_timeout_bounded(
+        tmp_path, monkeypatch, opened):
+    """A dead loopback port and a hung gateway both refuse through the same
+    fail-closed path -- and the 1s total probe cap bounds the hang well under
+    the handler's own 5s sleep (the generous 3s assert is for loaded CI)."""
+    validator = getattr(b2b, "validate_b2b_model_gateway", None)
+    assert callable(validator), "validate_b2b_model_gateway must exist"
+    _profile_home(tmp_path, monkeypatch, "hub")
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    closed_port = sock.getsockname()[1]
+    sock.close()
+    adapter = _adapter_for_model_url(
+        tmp_path, monkeypatch, f"http://127.0.0.1:{closed_port}/v1")
+    opened.extend([adapter._session_db, adapter._run_idempotency_store,
+                   adapter._response_store])
+    with pytest.raises(b2b.B2BConfigError):
+        await validator(adapter)
+    assert adapter._app is None
+
+    hits = {"probe": 0, "target": 0, "body": [], "auth": []}
+    server = await _probe_test_server(401, hits, delay=5.0)
+    try:
+        adapter = _adapter_for_model_url(
+            tmp_path, monkeypatch,
+            f"http://127.0.0.1:{server.port}/v1")
+        opened.extend([adapter._session_db, adapter._run_idempotency_store,
+                       adapter._response_store])
+        start = time.monotonic()
+        with pytest.raises(b2b.B2BConfigError):
+            await validator(adapter)
+        assert time.monotonic() - start < 3.0
+        assert hits["probe"] == 1
+    finally:
+        await server.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra", [
+    {"key": _API_KEY},
+    {"key": _API_KEY, "b2b": {"enabled": False, "profiles": {}}},
+], ids=["no_b2b", "disabled"])
+async def test_b2b_model_gateway_probe_never_runs_without_enabled_b2b(
+        tmp_path, monkeypatch, opened, extra):
+    """Zero probes for ordinary adapters: with no enabled b2b lane the
+    validator returns before any aiohttp.ClientSession can exist."""
+    validator = getattr(b2b, "validate_b2b_model_gateway", None)
+    assert callable(validator), "validate_b2b_model_gateway must exist"
+    _profile_home(tmp_path, monkeypatch, "hub")
+
+    def _no_session(*a, **k):
+        raise AssertionError(
+            "aiohttp.ClientSession must not be created without an enabled b2b lane")
+
+    monkeypatch.setattr(aiohttp, "ClientSession", _no_session)
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra=extra))
+    opened.extend([adapter._response_store, adapter._run_idempotency_store])
+    assert adapter._b2b_state.config.enabled is False
+    await validator(adapter)
+
+
+@pytest.mark.asyncio
+async def test_b2b_model_gateway_probe_dedupes_shared_urls(
+        tmp_path, monkeypatch, opened):
+    """Two project bindings pointing at the SAME base_url cost exactly one
+    startup probe."""
+    validator = getattr(b2b, "validate_b2b_model_gateway", None)
+    assert callable(validator), "validate_b2b_model_gateway must exist"
+    _profile_home(tmp_path, monkeypatch, "hub")
+    hits = {"probe": 0, "target": 0, "body": [], "auth": []}
+    server = await _probe_test_server(401, hits)
+    try:
+        def _dup(extra):
+            projects = extra["b2b"]["profiles"]["hub"]["projects"]
+            projects["b2b-bench-two"] = dict(
+                projects["b2b-bench"], project_id="b2b-bench-two")
+
+        adapter = _adapter_for_model_url(
+            tmp_path, monkeypatch,
+            f"http://127.0.0.1:{server.port}/v1", extra_mut=_dup)
+        opened.extend([adapter._session_db, adapter._run_idempotency_store,
+                       adapter._response_store])
+        await validator(adapter)
+        assert hits["probe"] == 1
+        assert hits["body"] == [b""]
+        assert hits["auth"] == [None]
+    finally:
+        await server.close()
