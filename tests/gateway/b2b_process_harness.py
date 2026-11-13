@@ -1031,12 +1031,15 @@ class ProviderDouble:
                 "auth_sha256": hashlib.sha256(auth.encode()).hexdigest() if auth else None,
                 "attempt_id": request.headers.get("X-Dubsar-Attempt-Id"),
                 "request_digest": request.headers.get("X-Dubsar-Request-Digest"),
+                "body_size": len(await request.read()),
             }
             with open(self.journal_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry) + "\n"); fh.flush(); os.fsync(fh.fileno())
             return await handler(request)
 
         async def chat(request):
+            if not request.headers.get("Authorization"):
+                return web.json_response({"error": "unauthorized"}, status=401)
             return web.json_response({
                 "id": "cmpl-unit-double", "object": "chat.completion",
                 "choices": [{"index": 0, "message": {"role": "assistant",

@@ -22,7 +22,6 @@ import time
 import types
 import uuid
 from typing import Any, Dict, Mapping, Optional, Tuple
-from urllib.parse import urlsplit
 
 from agent.b2b_execution import (
     B2BTerminalRefusal, BoundExecution, R2_SCHEMA_PINS, _deep_freeze, _plain_json,
@@ -99,6 +98,10 @@ _ATTEMPT_OPERATION = "proposal-v1"
 
 class B2BConfigError(ValueError):
     pass
+
+
+class B2BModelGatewayUnavailable(RuntimeError):
+    """A transient startup probe failure; the lane stays closed until retry."""
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +248,16 @@ def _validate_source_url(value: Any) -> str:
     return value
 
 
+def _validate_model_url(value: Any) -> str:
+    if not isinstance(value, str):
+        raise B2BConfigError("b2b config: base_url must be a string")
+    match = re.fullmatch(r"http://127\.0\.0\.1:([0-9]{1,5})/v1", value)
+    if not match or not 0 < int(match.group(1)) <= 65535:
+        raise B2BConfigError(
+            "b2b config: base_url must be exactly http://127.0.0.1:<port>/v1")
+    return value
+
+
 def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
     if (not isinstance(entry, Mapping)
             or not set(entry.keys()).issubset(_PROJECT_ENTRY_KEYS)
@@ -262,15 +275,7 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
     root = _req_str(entry.get("context_contract_root"), "project.context_contract_root")
     if root is not None and not _ABS_PATH_RE.match(root):
         raise B2BConfigError(f"b2b config: project {binding_id}: context root must be absolute")
-    base_url = _req_str(entry.get("base_url"), "project.base_url", allow_none=False)
-    try:
-        url = urlsplit(base_url)
-        if (url.scheme not in {"http", "https"} or not url.hostname or url.username is not None or
-                url.password is not None or url.query or url.fragment or base_url != base_url.strip()):
-            raise ValueError
-        _ = url.port
-    except ValueError:
-        raise B2BConfigError(f"b2b config: project {binding_id}: explicit credential-free base_url required") from None
+    _validate_model_url(entry.get("base_url"))
     if entry.get("api_mode") not in _API_MODES:
         raise B2BConfigError(f"b2b config: project {binding_id}: api_mode chat_completions only")
     logical_mission = entry.get("logical_mission")
@@ -652,6 +657,30 @@ def bind_b2b_state(adapter: Any) -> None:
     extra = getattr(adapter, "_extra", None) or getattr(
         getattr(adapter, "config", None), "extra", None) or {}
     adapter._b2b_state = _B2BState(validate_b2b_config(extra))
+
+
+async def validate_b2b_model_gateway(adapter: Any) -> None:
+    """Require G2's unauthenticated refusal before exposing the B2B lane."""
+    state = _state_for(adapter)
+    if state is None or not state.config.enabled:
+        return
+    import aiohttp
+    urls = sorted({project["base_url"]
+                   for entry in state.config.profiles.values()
+                   for project in entry["projects"].values()})
+    try:
+        async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=1.0), trust_env=False,
+                cookie_jar=aiohttp.DummyCookieJar()) as client:
+            for url in urls:
+                async with client.post(
+                        url + "/chat/completions", data=b"",
+                        allow_redirects=False) as response:
+                    if response.status != 401:
+                        raise B2BConfigError(
+                            "b2b config: model gateway must refuse unauthenticated POST with 401; redirects forbidden")
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise B2BModelGatewayUnavailable("b2b model gateway startup probe unavailable") from None
 
 
 def _deny(code: int, reason: str):
