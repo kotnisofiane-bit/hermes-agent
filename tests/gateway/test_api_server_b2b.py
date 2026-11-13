@@ -8,6 +8,11 @@ this whole file. It requires two EXTERNAL checkouts provisioned by the runner �
 MyWork fixture) — and a Node toolchain. Missing fixture envs are an explicit
 FAIL, never a silent PASS. The only doubles are the Node control surface, the
 provider, and the UNIT CONTEXT producer.
+
+Execution remains closed until the C1 producer is integrated. These oracles
+exercise real startup and signed source resolution, then require a typed
+pre-admission refusal without consuming an attempt; they do not qualify an
+admitted model turn or a replay of an existing durable attempt.
 """
 
 from __future__ import annotations
@@ -42,6 +47,13 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 HUB_KEY = "sk-unit-hub-" + uuid.uuid4().hex
 CI_KEY = "sk-unit-ci-" + uuid.uuid4().hex
+
+
+_STARTUP_PROBE = {
+    "method": "POST", "path": "/v1/chat/completions",
+    "auth_sha256": None, "attempt_id": None, "request_digest": None,
+    "body_size": 0,
+}
 
 
 def _require_fixtures():
@@ -97,6 +109,7 @@ class _Flow:
         subdir = self.tmp / ("child" + str(len(list(self.tmp.glob("child*")))))
         allowed = ",".join(str(p) for p in
                            (self.p1.info["source_port"], self.provider.port))
+        provider_before = self.provider.journal()
         await asyncio.to_thread(
             self.hermes.start, subdir, home=home, b2b_config=cfg,
             profile_keys={"hub": HUB_KEY, "ci": CI_KEY},
@@ -104,6 +117,7 @@ class _Flow:
             barriers=barriers, unit_mode=unit_mode,
             unit_template=str(self.tmp / "context-template.json")
             if unit_mode else "", allowed_ports=allowed)
+        assert self.provider.journal() == provider_before + [_STARTUP_PROBE]
 
     async def stop(self):
         if self.hermes:
@@ -183,42 +197,23 @@ def _journal_counts(home: str) -> dict:
 
 
 @pytest.mark.asyncio
-async def test_h1_01_real_p1_native_admission_refuses_at_construction(tmp_path):
-    """Real P1→real L2a session→P1 prepared→typed /p/hub POST. The lane
-    admits (durable attempt), the spawned run reaches construction, and the
-    child's lane — whose operator inputs (``project_context``) are absent —
-    durably refuses ``context_unavailable`` before runtime/provider/CAS. A
-    repeat POST replays non-consuming."""
+async def test_h1_01_real_p1_native_refusal_does_not_consume_attempt(tmp_path):
+    """Real P1 and signed sources reach the closed execution gate, without admission."""
     flow = _Flow(tmp_path)
     try:
         await flow.boot()
         session_id, attempt_id, binding = await asyncio.to_thread(flow.prepare_mission)
-        st, body = await flow.hermes.async_request(
-            "POST", f"/api/sessions/{session_id}/b2b-proposal",
-            profile="hub", key=HUB_KEY,
-            body={"attempt_id": attempt_id, "binding_digest": binding},
-            headers={"Idempotency-Key": attempt_id})
-        assert st == 200, body
-        assert body.get("status") == "admitted"
-        # The admitted run refuses at construction: durable context_unavailable.
-        st, status = await flow.wait_status(session_id, attempt_id)
-        assert st == 200, status
-        assert status.get("phase") == "context_unavailable", status
-        # A repeat POST replays the recorded admission — never a second attempt.
-        st, body = await flow.hermes.async_request(
-            "POST", f"/api/sessions/{session_id}/b2b-proposal",
-            profile="hub", key=HUB_KEY,
-            body={"attempt_id": attempt_id, "binding_digest": binding},
-            headers={"Idempotency-Key": attempt_id})
-        assert st == 200 and body.get("status") == "replayed", body
-        counts_after = _journal_counts(str(tmp_path / "home"))
-        st, body = await flow.hermes.async_request(
-            "POST", f"/api/sessions/{session_id}/b2b-proposal",
-            profile="hub", key=HUB_KEY,
-            body={"attempt_id": attempt_id, "binding_digest": binding},
-            headers={"Idempotency-Key": attempt_id})
-        assert st == 200 and body.get("status") == "replayed", body
-        assert _journal_counts(str(tmp_path / "home")) == counts_after
+        counts_before = _journal_counts(str(tmp_path / "home"))
+        assert not any(counts_before.values())
+        for _ in range(3):
+            st, body = await flow.hermes.async_request(
+                "POST", f"/api/sessions/{session_id}/b2b-proposal",
+                profile="hub", key=HUB_KEY,
+                body={"attempt_id": attempt_id, "binding_digest": binding},
+                headers={"Idempotency-Key": attempt_id})
+            assert st == 503, body
+            assert body == {"error": "execution_unavailable", "code": "execution_unavailable"}
+            assert _journal_counts(str(tmp_path / "home")) == counts_before
         # The refusal never reaches the terminal seam or the run executor:
         # zero terminal trace entries.
         trace = []
@@ -226,8 +221,8 @@ async def test_h1_01_real_p1_native_admission_refuses_at_construction(tmp_path):
             trace = [json.loads(l) for l in
                      open(flow.hermes.trace_path, encoding="utf-8") if l.strip()]
         assert not any(t.get("type") == "terminal_entry" for t in trace), trace
-        # Zero provider HTTP — every inbound request is journalled.
-        assert flow.provider.journal() == []
+        # Exactly one empty unauthenticated startup probe; no proposal traffic.
+        assert flow.provider.journal() == [_STARTUP_PROBE]
         # Zero unexpected egress — the fence journal must be empty/absent.
         denied = []
         if flow.hermes.denial_path and os.path.exists(flow.hermes.denial_path):
@@ -242,11 +237,14 @@ async def test_h1_01_real_p1_native_admission_refuses_at_construction(tmp_path):
 async def test_h1_02_typed_post_rejects_invalid_variants_before_admission(tmp_path):
     """Request validation still runs before admission: wrong binding digest →
     403, wrong idempotency key → 400, missing key → 401; a fully valid request
-    reaches admission (the signed source exchange + durable admit)."""
+    reaches the closed execution lock after the signed source exchange — no
+    durable admit."""
     flow = _Flow(tmp_path)
     try:
         await flow.boot()
         session_id, attempt_id, binding = await asyncio.to_thread(flow.prepare_mission)
+        counts_before = _journal_counts(str(tmp_path / "home"))
+        assert not any(counts_before.values())
         st, body = await flow.hermes.async_request(
             "POST", f"/api/sessions/{session_id}/b2b-proposal",
             profile="hub", key=HUB_KEY,
@@ -270,16 +268,17 @@ async def test_h1_02_typed_post_rejects_invalid_variants_before_admission(tmp_pa
             profile="hub", key=HUB_KEY,
             body={"attempt_id": attempt_id, "binding_digest": binding},
             headers={"Idempotency-Key": attempt_id})
-        assert st == 200 and body.get("status") == "admitted", body
+        assert st == 503, body
+        assert body == {"error": "execution_unavailable", "code": "execution_unavailable"}
+        assert _journal_counts(str(tmp_path / "home")) == counts_before
+        assert flow.provider.journal() == [_STARTUP_PROBE]
     finally:
         await flow.stop()
 
 
 @pytest.mark.asyncio
-async def test_h1_03_replay_stays_non_consuming_across_restart(tmp_path):
-    """Shared SQLite + child restart: the admitted attempt is durable, so a
-    POST after a clean restart replays it — never a second consumed attempt
-    or a re-admission."""
+async def test_h1_03_refusal_stays_non_consuming_across_restart(tmp_path):
+    """A real child restart preserves the pre-admission refusal and empty attempt store."""
     flow = _Flow(tmp_path)
     try:
         await flow.boot()
@@ -289,13 +288,13 @@ async def test_h1_03_replay_stays_non_consuming_across_restart(tmp_path):
             profile="hub", key=HUB_KEY,
             body={"attempt_id": attempt_id, "binding_digest": binding},
             headers={"Idempotency-Key": attempt_id})
-        assert st == 200 and first.get("status") == "admitted", first
-        st, status = await flow.wait_status(session_id, attempt_id)
-        assert st == 200 and status.get("phase") == "context_unavailable", status
+        assert st == 503, first
+        assert first == {"error": "execution_unavailable", "code": "execution_unavailable"}
         flow.hermes.kill()
         flow.hermes.close_logs()
         home = str(tmp_path / "home")
         counts_before = _journal_counts(home)
+        assert not any(counts_before.values())
         flow.hermes = HermesChild(python=PYEXE, repo_root=REPO)
         await flow._start_child(home=home)
         st, second = await flow.hermes.async_request(
@@ -303,8 +302,10 @@ async def test_h1_03_replay_stays_non_consuming_across_restart(tmp_path):
             profile="hub", key=HUB_KEY,
             body={"attempt_id": attempt_id, "binding_digest": binding},
             headers={"Idempotency-Key": attempt_id})
-        assert st == 200 and second.get("status") == "replayed", second
+        assert st == 503, second
+        assert second == first
         assert _journal_counts(home) == counts_before
+        assert flow.provider.journal() == [_STARTUP_PROBE, _STARTUP_PROBE]
     finally:
         await flow.stop()
 
@@ -353,10 +354,8 @@ async def test_h1_04_generic_ingress_denies_protected_session(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_h1_07_read_proof_gates_status_then_refused_snapshot(tmp_path):
-    """GET status/context still require a fresh full-envelope proof — key-only
-    403, foreign tuple 404 — and a VALID proof on the owning tuple reads the
-    durable ``context_unavailable`` snapshot the admitted lane recorded."""
+async def test_h1_07_read_proof_cannot_create_a_refused_attempt(tmp_path):
+    """Status/context need a signed proof, but no read creates a never-admitted attempt."""
     flow = _Flow(tmp_path)
     try:
         await flow.boot()
@@ -366,29 +365,28 @@ async def test_h1_07_read_proof_gates_status_then_refused_snapshot(tmp_path):
             profile="hub", key=HUB_KEY,
             body={"attempt_id": attempt_id, "binding_digest": binding},
             headers={"Idempotency-Key": attempt_id})
-        assert st == 200 and body.get("status") == "admitted", body
-        st, status = await flow.wait_status(session_id, attempt_id)
-        assert st == 200 and status.get("phase") == "context_unavailable", status
-        # Key-only — no proof → 403.
-        st, _ = await flow.hermes.async_request(
-            "GET", f"/api/sessions/{session_id}/b2b-proposal/{attempt_id}",
-            profile="hub", key=HUB_KEY)
-        assert st == 403
-        # Foreign tuple — valid signature on a different attempt → 404.
-        proof = flow.p1.sign_read_proof(actor="alpha", attempt_id=attempt_id)
-        st, _ = await flow.hermes.async_request(
-            "GET", f"/api/sessions/{session_id}/b2b-proposal/b2bp_{'0'*64}",
-            profile="hub", key=HUB_KEY,
-            headers={"X-Dubsar-Read-Proof": _proof_header(proof)})
-        assert st == 404
-        # Valid proof on the owning tuple → typed snapshot of the durable
-        # refusal: the lane is auditable even when it never reached dispatch.
-        st, body = await flow.hermes.async_request(
-            "GET", f"/api/sessions/{session_id}/b2b-proposal/{attempt_id}",
-            profile="hub", key=HUB_KEY,
-            headers={"X-Dubsar-Read-Proof": _proof_header(proof)})
-        assert st == 200, body
-        assert body.get("phase") == "context_unavailable", body
-        assert body.get("historical") is True and body.get("current") is False
+        assert st == 503, body
+        assert body == {"error": "execution_unavailable", "code": "execution_unavailable"}
+        counts_before = _journal_counts(str(tmp_path / "home"))
+        assert not any(counts_before.values())
+        proof = await asyncio.to_thread(flow.p1.sign_read_proof, actor="alpha", attempt_id=attempt_id)
+        for suffix in ("", "/context"):
+            st, _ = await flow.hermes.async_request(
+                "GET", f"/api/sessions/{session_id}/b2b-proposal/{attempt_id}{suffix}",
+                profile="hub", key=HUB_KEY)
+            assert st == 403
+            st, _ = await flow.hermes.async_request(
+                "GET", f"/api/sessions/{session_id}/b2b-proposal/b2bp_{'0'*64}{suffix}",
+                profile="hub", key=HUB_KEY,
+                headers={"X-Dubsar-Read-Proof": _proof_header(proof)})
+            assert st == 404
+            st, body = await flow.hermes.async_request(
+                "GET", f"/api/sessions/{session_id}/b2b-proposal/{attempt_id}{suffix}",
+                profile="hub", key=HUB_KEY,
+                headers={"X-Dubsar-Read-Proof": _proof_header(proof)})
+            assert st == 404, body
+            assert body == {"error": "not_found", "code": "not_found"}
+            assert _journal_counts(str(tmp_path / "home")) == counts_before
+        assert flow.provider.journal() == [_STARTUP_PROBE]
     finally:
         await flow.stop()

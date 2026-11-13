@@ -4270,9 +4270,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.warning("[%s] aiohttp not installed", self.name)
             return False
         from gateway.platforms.api_server_b2b import (
-            B2BConfigError, validate_b2b_model_gateway)
+            B2BConfigError, B2BModelGatewayUnavailable, validate_b2b_model_gateway)
         try:
             await validate_b2b_model_gateway(self)
+        except B2BModelGatewayUnavailable as exc:
+            self._set_fatal_error("b2b_model_gateway_unavailable", str(exc), retryable=True)
+            return False
         except B2BConfigError as exc:
             self._set_fatal_error("b2b_model_gateway_invalid", str(exc), retryable=False)
             return False

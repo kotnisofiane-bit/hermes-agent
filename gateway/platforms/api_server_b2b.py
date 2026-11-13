@@ -100,6 +100,10 @@ class B2BConfigError(ValueError):
     pass
 
 
+class B2BModelGatewayUnavailable(RuntimeError):
+    """A transient startup probe failure; the lane stays closed until retry."""
+
+
 # ---------------------------------------------------------------------------
 # Scalar / wire helpers (exact P1 mirrors)
 # ---------------------------------------------------------------------------
@@ -676,7 +680,7 @@ async def validate_b2b_model_gateway(adapter: Any) -> None:
                         raise B2BConfigError(
                             "b2b config: model gateway must refuse unauthenticated POST with 401; redirects forbidden")
     except (aiohttp.ClientError, asyncio.TimeoutError):
-        raise B2BConfigError("b2b config: model gateway startup probe unavailable") from None
+        raise B2BModelGatewayUnavailable("b2b model gateway startup probe unavailable") from None
 
 
 def _deny(code: int, reason: str):
