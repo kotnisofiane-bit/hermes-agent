@@ -793,6 +793,7 @@ def _genesis_vs_native(session: Mapping[str, Any], session_id: str, profile: str
 _BLOCK_CONTEXT_STALE_REASONS = frozenset({
     "context_schema_invalid", "context_contract_unavailable",
     "context_digest_invalid", "context_identity_source",
+    "context_mission_id",
     "context_identity_mismatch", "context_catalogue_mismatch",
     "context_authority_mismatch", "context_selection_mismatch",
     "context_namespaces", "context_source_unavailable", "context_source_stale",

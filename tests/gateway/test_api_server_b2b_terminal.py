@@ -36,8 +36,8 @@ from agent import chat_completion_helpers as h
 from agent.b2b_execution import (
     BLOCK_REASONS, B2BTerminalRefusal, bind_execution, current_execution,
     execute_terminal, extract_allowed_refs, install_bounded_agent_policy,
-    json_utf8, mission_prompt, provider_request_digest, recheck_context,
-    reset_execution, validate_proposal, validate_terminal_result,
+    json_utf8, mission_prompt, provider_request_digest, qualify_context_view,
+    recheck_context, reset_execution, validate_proposal, validate_terminal_result,
 )
 from agent.b2b_nonstream import _B2BNonStreamRequest
 from gateway.platforms import api_server_b2b as b2b
@@ -46,7 +46,8 @@ from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from tests.gateway import b2b_unit_fixtures
 from tests.gateway.b2b_unit_fixtures import _FakeClock
 from tests.gateway.b2b_process_harness import (
-    UNIT_RENDERED, build_unit_native_oc_view, renew_unit_oc_read)
+    UNIT_RENDERED, build_context_view, build_unit_native_oc_view,
+    renew_unit_oc_read)
 
 
 @pytest.fixture
@@ -129,6 +130,19 @@ def test_emitted_reason_families_match_review_semantics():
     wrong = {r: (expected[r], b2b._BLOCK_STATUS.get(r)) for r in expected
              if b2b._BLOCK_STATUS.get(r) != expected[r]}
     assert not wrong, wrong
+
+
+def test_context_mission_refusal_is_durable_before_dispatch(b2b_dispatch_lane):
+    lane = b2b_dispatch_lane
+    policy = copy.deepcopy(lane.policy)
+    policy["mission_id"] += "\n"
+    view = build_context_view(policy, {"mission_source_digest": "c" * 64})
+    with pytest.raises(B2BTerminalRefusal, match="^context_mission_id$") as exc:
+        qualify_context_view(lane.cap, view)
+    run = types.SimpleNamespace(b2b_execution=lane.cap)
+    bxe.block_failed_run(lane.adapter, run, exc.value)
+    assert lane.store.b2b_attempt(
+        profile=lane.profile, attempt_id=lane.attempt_id)["status"] == "context_stale"
 
 
 @pytest.mark.parametrize(

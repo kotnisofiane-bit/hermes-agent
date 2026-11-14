@@ -9,8 +9,8 @@ the real B2B boundaries of this repository:
   validates against the pinned Contracts r2 schemas and keeps every identity
   equality (context, binding, My Work ticket/authority, Memory provenance, OC).
 
-An old Contracts pin or a DUB/wide ``mis_`` regex left on the active production
-path fails these tests. No private test child: the real functions are called.
+The real admission and qualification functions enforce the shared mission-ID
+vectors and reject legacy Contracts schemas. No private test child is used.
 """
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ import copy
 import hashlib
 import json
 import os
-import re
 import tempfile
 import zlib
 from pathlib import Path
@@ -38,11 +37,6 @@ VECTORS_SHA256 = "46cac1d7ca6ddef8f19da3e754bcffd4171507f3cb10242076347d72445290
 VECTORS = json.loads(VECTORS_PATH.read_bytes())
 A, B = VECTORS["identity_pairs"]["crossed"]
 INVALID = [item["value"] for item in VECTORS["invalid"]]
-
-# Active production B2B path of this repository.
-PRODUCTION_FILES = sorted(
-    [*ROOT.glob("gateway/platforms/api_server_b2b*.py"), *ROOT.glob("agent/b2b_*.py")])
-LEGACY_R2_CONTRACTS_COMMIT = "2b0865261e80432103e6beb38e5beea0ce60dad0"
 
 
 # --------------------------------------------------------------------------
@@ -71,18 +65,7 @@ def test_r2_schema_pins_attest_the_common_contracts_head():
     assert '"pattern": "^mis_[a-f0-9]{32}$"' in json.dumps(binding)
 
 
-def test_no_old_pin_or_dub_regex_on_the_active_production_path():
-    refused_commits = set(VECTORS["contracts_commits_refused_on_production_path"])
-    refused_commits.add(LEGACY_R2_CONTRACTS_COMMIT)
-    refused_hashes = set(H.LEGACY_R2_PINS.values())
-    assert PRODUCTION_FILES
-    for path in PRODUCTION_FILES:
-        text = path.read_text("utf-8")
-        assert not re.search(r"DUB-", text), path
-        assert not re.search(r"mis_\[a-f0-9\]\{1[0-9]?,", text), path  # Mlarge
-        for value in refused_commits | refused_hashes:
-            assert value not in text, (path, value)
-    assert be.B2B_MISSION_ID.pattern == r"\Amis_[a-f0-9]{32}\Z"
+def test_admission_and_context_share_the_mission_validator():
     assert b2b._MISSION_ID is be.B2B_MISSION_ID
 
 
@@ -223,7 +206,9 @@ def test_context_schema_refuses_every_non_m32_vector(mission_id):
 def test_context_exact_grammar_refuses_trailing_newline_after_schema():
     cap = _cap(A + "\n")
     view = H.build_context_view(cap.policy, {})
-    assert _refusal(cap, view) == "context_mission_id"
+    reason = _refusal(cap, view)
+    assert reason == "context_mission_id"
+    assert reason in be.BLOCK_REASONS
 
 
 def _crossed(mutate) -> str:

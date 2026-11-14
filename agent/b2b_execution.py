@@ -419,6 +419,7 @@ BLOCK_REASONS = frozenset({
     "context_memory_malformed_v1_fallback", "context_memory_mission",
     "context_memory_missing", "context_memory_namespace",
     "context_memory_provenance", "context_memory_unqualified",
+    "context_mission_id",
     "context_my_work_authority", "context_my_work_mismatch",
     "context_namespaces", "context_oc_malformed", "context_oc_mismatch",
     "context_oc_projection", "context_oc_read_metadata",
