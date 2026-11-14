@@ -24,7 +24,8 @@ import uuid
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from agent.b2b_execution import (
-    B2BTerminalRefusal, BoundExecution, R2_SCHEMA_PINS, _deep_freeze, _plain_json,
+    B2BTerminalRefusal, BoundExecution, B2B_MISSION_ID, R2_SCHEMA_PINS, _deep_freeze,
+    _plain_json,
     _public_text, canonical_json, is_b2b_attempt_id, is_b2b_session_id, json_utf8,
     assert_source_equivalent, context_proof, qualify_context_view, verify_context_proof,
     mission_prompt, recheck_context, validate_proposal, extract_allowed_refs)
@@ -51,7 +52,7 @@ _SESSION_ID_RE = re.compile(r"^b2b_[0-9a-f]{64}$")
 _ATTEMPT_ID_RE = re.compile(r"^b2bp_[0-9a-f]{64}$")
 _OBJECT_ID = re.compile(r"^[0-9a-f]{24}$")
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
-_MISSION_ID = re.compile(r"^DUB-[0-9]{3}$")
+_MISSION_ID = B2B_MISSION_ID  # AUTORITE-PRODUCTION §6.4, Contracts da9bc826
 _UNPAIRED = re.compile(
     r"[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]")
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")

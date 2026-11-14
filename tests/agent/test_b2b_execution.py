@@ -378,7 +378,7 @@ def _unit_policy():
     return {
         "profile": "p",
         "profile_home": str(get_hermes_home().resolve()),
-        "project_id": "proj-a", "mission_id": "DUB-001", "mission_revision": 1,
+        "project_id": "proj-a", "mission_id": "mis_0123456789abcdef0123456789abcdef", "mission_revision": 1,
         "authority_basis_digest": "sha256:" + "b" * 64,
         "authority_digest": "sha256:" + "a" * 64,
         "requester_id": "req-1",
