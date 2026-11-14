@@ -94,7 +94,7 @@ def build_b2b_dispatch_lane(tmp_path, *,
     policy = {
         "attempt_id": attempt_id, "binding_digest": binding,
         "requester_id": "1" * 24, "project_id": project_id,
-        "project_binding_id": project_id, "mission_id": "DUB-001",
+        "project_binding_id": project_id, "mission_id": "mis_0123456789abcdef0123456789abcdef",
         "mission_revision": 1, "profile": profile, "session_id": sid,
         "profile_home": str(get_hermes_home().resolve()),
         "reservation_ref": {"collection": "dubsar_b2b_agent_sessions", "id": binding},

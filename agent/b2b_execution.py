@@ -54,16 +54,31 @@ _OC_RECEIPT_FORMATS = frozenset({
     "dubsar.my-work-oc-context-view/1", "dubsar.my-work-oc-context-view/2"})
 _OC_READ_REF = re.compile(r"^ocv_[0-9a-f]{32}$")
 _UTC_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$")
+# Lot 7 PIN (AUTORITE-PRODUCTION §6.4): the B2B lane is production. One
+# mission grammar, M32, on every structured mission field it reads; the four
+# AgentContext r2 schemas are the byte-pinned Contracts head below (its raw
+# schemas are the b2b-production profile; the historical Personal overlay is not
+# loaded here).
+B2B_MISSION_ID = re.compile(r"\Amis_[a-f0-9]{32}\Z")
+R2_SCHEMA_CONTRACTS = types.MappingProxyType({
+    "repository": "kotnisofiane-bit/dubsar-contracts",
+    "commit": "da9bc826ea94faeb94f5bfc9a288614c2f8f2eb6",
+    "tree": "6934d669b3d7731918c3041cf029b8d7a4bc5f2d",
+})
 R2_SCHEMA_PINS = types.MappingProxyType({
     "agent-context-r2.schema.json":
-        "8615f3b4730acbabc614cd7cc770730be244888b59cc69957f14d4f520dbd0e2",
+        "6d660839215d71bd60a642dd66040444b8cf8893124620ca59c7a7f36151e7ac",
     "mission-binding.schema.json":
-        "919264ea23b6ef458a8fa5ac49769c2a11fc2dcf5bedbefac30ce56d0d2aab16",
+        "529b8cf0c8612d80c7869574b21f680aed8c36e154828d3462225b15edd89e80",
     "my-work-mission-view.schema.json":
-        "3a8c7eb91e88b3ce0f92335a6bf91731d96a925648351f3187fd30b71621d9fa",
+        "3bddc5581d77127f8a9a7e290a89c30ad646c46b118be321d2a8f82a34dfdd2f",
     "my-work-mission-authority-view.schema.json":
-        "e33b996a46fcc77ce71282140ecf8e9e166d5da2566da355c94a9fa026551933",
+        "5e7f3df35d9651b19a4c7a066da7ffb301134323405d815d64063312ef3d0ea5",
 })
+
+
+def is_b2b_mission_id(value: Any) -> bool:
+    return isinstance(value, str) and B2B_MISSION_ID.fullmatch(value) is not None
 
 
 def b2b_session_id(binding_digest: str) -> str:
@@ -723,6 +738,11 @@ def qualify_context_view(cap: BoundExecution, view: Mapping[str, Any]) -> Dict[s
     if (plain["resolution"] != "governed_bound" or
             plain["identity_source"] != "my_work_mission_authority"):
         raise B2BTerminalRefusal("context_identity_source")
+    # JSON Schema "$" tolerates a trailing newline: the exact M32 grammar is
+    # re-asserted on both the bound policy and the published view.
+    if not (is_b2b_mission_id(cap.policy_get("mission_id")) and
+            is_b2b_mission_id(plain["mission_id"])):
+        raise B2BTerminalRefusal("context_mission_id")
     for key in ("project_id", "mission_id"):
         if plain[key] != cap.policy_get(key):
             raise B2BTerminalRefusal("context_identity_mismatch")
