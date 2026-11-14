@@ -378,7 +378,7 @@ async def test_b2b_get_seeded_historical_attempt_returns_200(
     run_id = "run_" + uuid.uuid4().hex
     requester = "1" * 24
     source_body = {"requester_id": requester, "project_binding_id": "b2b-bench",
-                   "project_id": "b2b-bench", "mission_id": "DUB-001",
+                   "project_id": "b2b-bench", "mission_id": "mis_0123456789abcdef0123456789abcdef",
                    "mission_revision": 1}
     admission = store.b2b_admit(
         profile="hub", session_id=session_id, binding_digest=binding,
@@ -576,7 +576,7 @@ def _valid_admission_lane(tmp_path, monkeypatch, opened, *, prepared: bool):
     _, hermes_priv_pem, hermes_pub = make_keypair()
     requester_id = "1" * 24
     project_id = "b2b-bench"
-    mission_id, mission_revision = "DUB-001", 1
+    mission_id, mission_revision = "mis_0123456789abcdef0123456789abcdef", 1
     basis = {"format": "dubsar.b2b-agent-session-binding/1",
              "requester_id": requester_id, "project_id": project_id,
              "mission_id": mission_id, "mission_revision": mission_revision}

@@ -1,0 +1,108 @@
+{
+  "format": "dubsar.b2b-pin.mission-id-vectors/1",
+  "source": "docs/b2b/AUTORITE-PRODUCTION.md §6.4 et §7 ligne 7 (dubsar-platform@0caf27f16940be6938b4df6fb4c0d8f27771073c) ; diagnostic 16 §5.2",
+  "contracts": {
+    "repository": "kotnisofiane-bit/dubsar-contracts",
+    "ref": "product/dubsar-contracts-v0",
+    "commit": "da9bc826ea94faeb94f5bfc9a288614c2f8f2eb6",
+    "tree": "6934d669b3d7731918c3041cf029b8d7a4bc5f2d"
+  },
+  "pattern": "^mis_[a-f0-9]{32}$",
+  "valid": [
+    "mis_0123456789abcdef0123456789abcdef",
+    "mis_fedcba9876543210fedcba9876543210"
+  ],
+  "invalid": [
+    {
+      "value": "mis_0123456789abcdef",
+      "why": "M16"
+    },
+    {
+      "value": "mis_0123456789abcdef01234567",
+      "why": "M24 (ancien générateur Core)"
+    },
+    {
+      "value": "mis_0123456789abcdef0123456789abcde",
+      "why": "M31"
+    },
+    {
+      "value": "mis_0123456789abcdef0123456789abcdef0",
+      "why": "M33"
+    },
+    {
+      "value": "mis_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "why": "M64"
+    },
+    {
+      "value": "mis_0123456789ABCDEF0123456789abcdef",
+      "why": "majuscules"
+    },
+    {
+      "value": "mis_0123456789abcdeg0123456789abcdef",
+      "why": "non-hex"
+    },
+    {
+      "value": "mid_0123456789abcdef0123456789abcdef",
+      "why": "préfixe différent"
+    },
+    {
+      "value": "MIS_0123456789abcdef0123456789abcdef",
+      "why": "préfixe majuscule"
+    },
+    {
+      "value": "",
+      "why": "vide"
+    },
+    {
+      "value": " mis_0123456789abcdef0123456789abcdef",
+      "why": "espace en tête"
+    },
+    {
+      "value": "mis_0123456789abcdef0123456789abcdef ",
+      "why": "espace en fin"
+    },
+    {
+      "value": "mis_0123456789abcdef0123456789abcdef\n",
+      "why": "saut de ligne final"
+    },
+    {
+      "value": "DUB-001",
+      "why": "DUB historique"
+    },
+    {
+      "value": "DUB-1000",
+      "why": "DUB élargi"
+    },
+    {
+      "value": "mission_alpha_0001",
+      "why": "bail Task ML"
+    },
+    {
+      "value": "mission_mis_0123456789abcdef0123456789abcdef",
+      "why": "conversion mission_mis_"
+    },
+    {
+      "value": "mis_j1c_exact",
+      "why": "fixture ressemblante"
+    }
+  ],
+  "identity_pairs": {
+    "same": [
+      "mis_0123456789abcdef0123456789abcdef",
+      "mis_0123456789abcdef0123456789abcdef"
+    ],
+    "crossed": [
+      "mis_0123456789abcdef0123456789abcdef",
+      "mis_fedcba9876543210fedcba9876543210"
+    ]
+  },
+  "contracts_commits_refused_on_production_path": [
+    "d43e329840c7f52190240d6d90c9568195ce4a67",
+    "448c1c04cf81bc0546eea701cdb1440ce2a291b7",
+    "59e93bb96606aea5be2f7ef5a31e8dc901af9949",
+    "e0d4b463beafe6bcb254d21eb8316f17a366f048",
+    "a7c549dd7d84a6a0ab591305774f2fd2d2c80023",
+    "255676d73e8460324736c4628b746515208bcf13",
+    "011b3ce2778aace654cc40713cda86a60996fe2d"
+  ]
+}

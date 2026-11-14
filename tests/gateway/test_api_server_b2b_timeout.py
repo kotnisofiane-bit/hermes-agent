@@ -72,7 +72,7 @@ def _digest_inputs(*, timeout=600):
              "portal_issuer": "portal-h1", "hermes_issuer": "hermes-h1-hub"}
     resolved = {
         "project_binding_id": "b", "project_id": "proj-a", "requester_id": "1" * 24,
-        "mission_id": "DUB-001", "mission_revision": 1,
+        "mission_id": "mis_0123456789abcdef0123456789abcdef", "mission_revision": 1,
         "binding_digest": "a" * 64, "attempt_id": "b2bp_" + "b" * 64,
         "session_id": "b2b_" + "a" * 64,
         "reservation_ref": {"collection": "c", "id": "r"},
@@ -186,7 +186,7 @@ def _timeout_lane(tmp_path, timeout):
     policy = {
         "attempt_id": attempt_id, "binding_digest": binding,
         "requester_id": "1" * 24, "project_id": project_id,
-        "project_binding_id": project_id, "mission_id": "DUB-001",
+        "project_binding_id": project_id, "mission_id": "mis_0123456789abcdef0123456789abcdef",
         "mission_revision": 1, "profile": profile, "session_id": sid,
         "profile_home": str(get_hermes_home().resolve()),
         "reservation_ref": {"collection": "dubsar_b2b_agent_sessions", "id": binding},
