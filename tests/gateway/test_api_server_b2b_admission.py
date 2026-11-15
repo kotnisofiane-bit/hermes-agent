@@ -764,6 +764,19 @@ async def test_b2b_proposal_post_replays_durable_attempt_before_readiness_guard(
             real_ready = b2b_exec.b2b_execution_ready
             monkeypatch.setattr(
                 b2b_exec, "b2b_execution_ready", lambda *a, **k: True)
+            # UNIT stubs for the two P2 admission gates _prepare consults
+            # before readiness: operator inputs on disk and the per-cap
+            # native preparation. A SimpleNamespace double is enough — the
+            # sink only calls the three assert_* surfaces, never identity.
+            from gateway.platforms import api_server_b2b_context as b2b_ctx
+            monkeypatch.setattr(
+                b2b_exec, "b2b_execution_inputs_ready", lambda *a, **k: True)
+            monkeypatch.setattr(
+                b2b_ctx, "prepare_b2b_context",
+                lambda cap, *, resolved: SimpleNamespace(
+                    cap=cap, assert_current=lambda c: None,
+                    assert_configuration_current=lambda: True,
+                    assert_publication=lambda c, r: None))
             resp = await post()
             assert resp.status == 200, await resp.text()
             first = await resp.json()

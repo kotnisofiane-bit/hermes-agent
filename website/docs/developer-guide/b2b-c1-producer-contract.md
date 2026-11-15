@@ -1,27 +1,65 @@
 ---
 title: "B2B C1 Producer Contract"
-description: "Deferred L2-mw integration and the closed B2B execution boundary"
+description: "P2 governed context admission and the closed B2B execution boundary"
 ---
 
-# B2B C1 producer contract (L2-mw)
+# B2B C1 producer contract (P2)
+
+This is dubsar-platform PR120 (§5 P2) and task L13-D4: the *Hermes* C1 path —
+governed context produced by the installed `dubsar-agent-context` plugin.
+It is not the chemin-modèle C1 of §5's Portal/proposal chain. Scope reference:
+https://github.com/kotnisofiane-bit/dubsar-platform/pull/120
 
 ## Delivery boundary
 
-L2-her does not open B2B execution. Operator files, valid schema hashes and
-an inert constructor are preparation, not evidence that a context producer
-is installed. Enabled lanes remain `not-ready`; complete preparation reports
-`c1_producer_unavailable`. The proposal POST returns
-`503 execution_unavailable` before `b2b_admit`, title changes or worker launch.
-That refusal covers NEW admissions only: an already-durable attempt is always
-served by the idempotent replay (`_replayed_response`) before the readiness
-guard, so a lost-ACK retry recovers its run — and any error entering the
-profile scope or reading the serving config still answers the same typed 503,
-never an untyped 500. No attempt or binding is created by that refusal. There
-is no operator flag that enables C1 in this delivery.
+P2 wires the governed C1 execution path end to end — proven locally by the
+native integration lane, not an installed deployment: admission now requires a
+live, current, mission-scoped context preparation built through the installed
+external `dubsar-agent-context` plugin — real native My Work mission reads
+(`createB2BMissionPorts`), a real native Operational Context kernel read
+(`dubsar.my-work-oc-context-view/2` with a measured state projection), and a
+mission-qualified Memory Plane v2 read. Preparation runs before `b2b_admit`,
+title changes or worker launch; it performs no durable write, no admission,
+no agent construction and no provider call. Actual publication still happens
+only inside the admitted worker's real `pre_llm_call` hook.
 
-The future L2-mw lot must connect per-mission My Work and Operational Context
-to the actual gateway conversation path. Existing plugin factory/publication
-helpers and unit doubles are not proof of that integration.
+Installed configuration, plugin presence, valid schema hashes and an inert
+constructor remain preparation, not evidence of readiness. A lane without a
+current mission-scoped proof reports `not-ready` with a typed code
+(`execution_inputs_unavailable`, `c1_producer_unavailable`, or
+`c1_context_required`) — health evaluation performs no plugin discovery or
+probe and cannot leak ambient execution state. A missing, crossed, stale,
+future-dated, late or otherwise unqualified source fails closed with
+`503 execution_unavailable` before admission. That refusal covers NEW
+admissions only: an already-durable attempt is always served by the
+idempotent replay (`_replayed_response`) before the readiness guard, so a
+lost-ACK retry recovers its run — and any error entering the profile scope
+or reading the serving config still answers the same typed 503, never an
+untyped 500. No attempt or binding is created by that refusal.
+
+## Proof semantics
+
+The preparation binds, immutably: the exact Hermes home (resolved path), the
+frozen policy frame and catalogue project JSON, the loaded plugin module /
+manager / bound-runtime stamp identity, and the native OC `/2` source
+observation —
+`state_projection.candidate.result_kind == "measured"` with explicit
+`source_observed_at` and a positive integer `freshness_max_age_ms`. The
+source window `observed <= now < observed + min(900000, freshness_max_age_ms)`
+is enforced at preparation, publication, configuration and every recheck;
+its deadline is stored in the preparation and is never extended by provider
+delay or another TTL. `/1` OC receipts and view/capture instants are never
+source observation and refuse as `context_oc_unqualified`. Preparation also
+validates the candidate render before admission (UTF-8, nonempty,
+≤ `CONTEXT_MAX_BYTES`, ≤ 9000 chars, `bounds.render_chars` exact); the
+publication receipt then preserves the fresh hook render — not necessarily
+byte-identical to the preflight render, since fresh native view refs differ.
+Publication relies
+on the fresh hook receipt: `assert_current`, `assert_source_equivalent`,
+receipt freshness and source-basis equality — no second unbounded native
+read. Replay of the same run/attempt returns the durable result and never
+dispatches again, even after the Memory Plane later becomes unavailable
+(the signed Portal source must still resolve for the replay request).
 
 ## Ownership and inputs
 
@@ -97,16 +135,40 @@ provenance is preserved, not replaced by a fabricated Hermes signature.
 Any future detached C1 signature requires a separately agreed wire contract,
 signer/key ownership and verifier; it is not implemented or assumed here.
 
-## Gate for a later opening
+## P2 evidence and scope
 
-L2-mw must first demonstrate the real authenticated POST, capability creation,
-real construction and `run_conversation`, native per-mission source reads,
-publication, bounded terminal dispatch to a loopback provider double and
-sealed proposal. It must also demonstrate A-B-A profile isolation, stale or
-missing source refusal, middleware short-circuit/rewrite refusal before
-response intake, and that unavailable preparation does not consume admission.
-No real model call is needed for this proof.
+The native integration lane (`tests/gateway/test_api_server_b2b_native.py`,
+integration-marked, gated on `B2B_TEST_MY_WORK_ROOT`) demonstrates the full
+path in one subprocessed host: real `APIServerAdapter.connect` with the
+unauthenticated model-gateway probe, real authenticated POST, Ed25519-signed
+source envelopes in both directions, durable admission, plugin discovery of
+the installed external producer, bound runtime composition, real My Work
+mission read through `createB2BMissionPorts`, real OC kernel against
+task-owned PostgreSQL (state journal + ordered projection), real `AIAgent`
+construction and `run_conversation`, `pre_llm_call` publication,
+source-bounded terminal dispatch CAS to a loopback provider double, and the
+sealed `dubsar.b2b-proposal/1`. It also demonstrates A-B-A profile isolation
+(two homes, two missions, two projects — no shared context), replay served
+from durable state with no redispatch even after the Memory Plane becomes
+unavailable, and fail-closed refusal before
+admission for absent plugin, missing, stale, crossed and late memory
+context, each leaving no attempt or binding rows and zero provider calls.
 
-Only a separate reviewed change with that producer and evidence may remove
-the current pre-admission C1-unavailable gate. Merely supplying all operator
-inputs or changing health status cannot open execution.
+Boundaries honestly labelled as doubles: the Portal source service, the
+Memory Plane v2 HTTP endpoint and the model endpoint are local HTTP doubles;
+the OC authority is the fixture's simulated authority; the stdio test host
+composes the production My Work ports (`createB2BMissionPorts` + bound
+`handleMessage`) because the regular `hermes-mywork-service.mjs` does not
+serve `mis_` B2B mission views. This is not an installed MW-O bound child,
+not Portal browser proof, and not a qualification of deployment or network
+policy.
+
+Out of scope for P2 (explicitly not claimed): P3/P4 and any C1-C6 claims not
+exercised here; the remainder of PR120 §5 — Portal/proposal chain, projects,
+approver, mail, Composio, ticket and profile deployment, and any end-to-end
+installed-environment proof; MW-O orchestration or installed-UID proof; real
+model tokens or any external network; production bypass paths for legacy
+tests; and any readiness claim from installed plugins, ambient capability or
+operator inputs alone. Merely supplying all operator inputs or changing
+health status cannot open execution — only a current, mission-scoped,
+source-fresh native proof bound to the attempt's own capability can.

@@ -158,25 +158,33 @@ def b2b_execution_inputs_ready(project: Any, config: Optional[Mapping]) -> bool:
 def b2b_execution_unavailable_code(project: Any, config: Optional[Mapping]) -> Optional[str]:
     """THE execution-unavailability classification for ONE project — the
     single source the POST admission gate and ``/health/detailed`` both
-    consult. ``None`` only when ``b2b_execution_ready`` opens the lane
-    (impossible until the C1 producer ships); ``execution_inputs_unavailable``
-    for a preparation hole; ``c1_producer_unavailable`` when preparation is
-    complete and only the missing producer keeps the lane closed."""
+    consult. ``None`` only when ``b2b_execution_ready`` opens the lane for
+    THIS attempt's bound capability. Codes: ``execution_inputs_unavailable``
+    for a preparation hole, ``c1_producer_unavailable`` when the installed
+    producer itself is absent/disabled, ``c1_context_required`` when the
+    producer is present but no CURRENT mission-scoped context proof is bound
+    to this capability — the ordinary state for health checks, which carry
+    no mission binding and can never turn ``ready`` on presence alone."""
     if b2b_execution_ready(project, config):
         return None
-    if b2b_execution_inputs_ready(project, config):
-        return "c1_producer_unavailable"
-    return "execution_inputs_unavailable"
+    if not b2b_execution_inputs_ready(project, config):
+        return "execution_inputs_unavailable"
+    from gateway.platforms.api_server_b2b_context import producer_available
+    return "c1_context_required" if producer_available() else "c1_producer_unavailable"
 
 
 def b2b_execution_ready(project: Any, config: Optional[Mapping]) -> bool:
-    """EXECUTION readiness for ONE validated project entry — CLOSED in this
-    delivery: the C1 context producer is not integrated, so no input set opens
-    execution and no config/env switch reopens it. Deliberately a single
-    predicate: the producer integration lands HERE (and only here), so every
-    caller — the pre-admission gate, the admitted-cap guard, health — fails
-    closed by construction until then."""
-    return False
+    """EXECUTION readiness for ONE validated project entry — proof-driven in
+    this delivery: operator inputs on disk AND a live, current, mission-scoped
+    context preparation attached to the CURRENT bound capability's sink
+    (``_context_preparation``, written by ``_launch_b2b_run`` before
+    admission). No bound capability — health checks, ordinary sessions —
+    answers False on any input set; no config/env switch reopens the lane."""
+    if not b2b_execution_inputs_ready(project, config):
+        return False
+    from agent.b2b_execution import current_execution
+    from gateway.platforms.api_server_b2b_context import prepared_context_ready
+    return prepared_context_ready(current_execution(), project)
 
 
 def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
@@ -197,6 +205,12 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
     if state is None or not state.config.enabled:
         return {"b2b_execution": "not-configured", "b2b_execution_code": None,
                 "b2b_execution_profiles": {}}
+    # Fail-closed ordering: a preparation hole beats a missing producer, a
+    # missing producer beats "no current mission proof" — health carries no
+    # capability binding, so ``ready``/``None`` codes are unreachable here by
+    # construction (no source/model probe is performed either).
+    severity = {"execution_inputs_unavailable": 0, "c1_producer_unavailable": 1,
+                "c1_context_required": 2}
     profiles: Dict[str, Any] = {}
     for name, entry in state.config.profiles.items():
         code = "execution_inputs_unavailable"
@@ -206,22 +220,28 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
             # (``get_profile_dir("default")``), never the request's ambient
             # home a prefixed ``/p/<other>/`` request bound.
             with adapter._profile_scope(name):
-                from gateway.run import _load_gateway_config
-                config = _load_gateway_config()
-                projects = entry.get("projects") or {}
-                if projects and all(
-                        b2b_execution_unavailable_code(project, config)
-                        == "c1_producer_unavailable"
-                        for project in projects.values()):
-                    code = "c1_producer_unavailable"
+                # Health carries NO mission binding: an ambient bound
+                # execution must never leak a ``ready`` verdict into a
+                # status query. Clear it for the evaluation; restore after.
+                from agent.b2b_execution import _execution_var
+                token = _execution_var.set(None)
+                try:
+                    from gateway.run import _load_gateway_config
+                    config = _load_gateway_config()
+                    projects = entry.get("projects") or {}
+                    if projects:
+                        code = min(
+                            (b2b_execution_unavailable_code(project, config) or "ready"
+                             for project in projects.values()),
+                            key=lambda c: severity.get(c, 3))
+                finally:
+                    _execution_var.reset(token)
         except Exception:
             code = "execution_inputs_unavailable"
         profiles[name] = {"state": "not-ready", "code": code}
-    aggregate = ("execution_inputs_unavailable"
-                 if not profiles or any(
-                     p["code"] == "execution_inputs_unavailable"
-                     for p in profiles.values())
-                 else "c1_producer_unavailable")
+    aggregate = min((p["code"] for p in profiles.values()),
+                    key=lambda c: severity.get(c, 3),
+                    default="execution_inputs_unavailable")
     return {"b2b_execution": "not-ready", "b2b_execution_code": aggregate,
             "b2b_execution_profiles": profiles}
 

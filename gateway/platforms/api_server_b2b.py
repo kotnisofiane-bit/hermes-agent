@@ -893,6 +893,9 @@ class _AttemptSink:
         self._fingerprint = _policy_digest(profile, entry, self.policy["project"], self.policy)
         self._before_provider = None
         self.context_receipt = None
+        # The frozen context preparation attached by _launch_b2b_run before
+        # admission; None on every sink the launch path did not prepare.
+        self._context_preparation = None
 
     def assert_current_policy(self) -> bool:
         state = _state_for(self._adapter)
@@ -908,8 +911,20 @@ class _AttemptSink:
                 entry.get("hermes_private_key_pem") != self.entry.get("hermes_private_key_pem")):
             return False
         project = entry.get("projects", {}).get(self.policy["project_binding_id"])
-        return (project is not None and
-                _policy_digest(self.profile, entry, project, self.policy) == self._fingerprint)
+        if not (project is not None and
+                _policy_digest(self.profile, entry, project, self.policy) == self._fingerprint):
+            return False
+        # P2: when a preparation is attached, the producer's live configuration
+        # (roots/mappings/origin/version/read-ports/module) must still match the
+        # stamp it read under — config drift revokes the lane like policy drift.
+        preparation = self._context_preparation
+        if preparation is not None:
+            try:
+                if not preparation.assert_configuration_current():
+                    return False
+            except Exception:
+                return False
+        return True
 
     def _matches_source(self, resolved: Mapping[str, Any]) -> bool:
         fields = (
@@ -1050,6 +1065,12 @@ class _AttemptSink:
 
     def put_context(self, receipt: Any) -> None:
         """Persist the published context (view + rendered bytes + digest) once."""
+        # The accepted receipt must BE the attached preparation's mission —
+        # same cap, same stamp, same source basis, still inside both windows.
+        preparation = self._context_preparation
+        if preparation is not None:
+            from agent.b2b_execution import current_execution
+            preparation.assert_publication(current_execution(), receipt)
         proof = context_proof(receipt.view)
         if (proof["context_digest"] != receipt.digest or
                 proof["source_basis_digest"] != receipt.source_basis_digest):
@@ -1177,32 +1198,19 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
-    # L2-mw admission gate: the project identity is proven by the signed
-    # source, but execution stays CLOSED until the C1 producer ships. The
-    # refusal covers NEW admissions only — an already-durable attempt row is
-    # always served by the idempotent replay below (b2b_admit ->
-    # _replayed_response), so a lost-ACK retry never hears
-    # "execution_unavailable" for a committed lane. Readiness is classified
-    # by the single source (b2b_execution_unavailable_code — the same one
-    # /health/detailed reports) under the OWNING profile's scope against ITS
-    # serving config, off the event loop, BEFORE any admission/title/spawn
-    # durable write consumes the single attempt; any error entering the
-    # scope or reading the config is itself a typed execution_unavailable,
-    # never an untyped 500.
+    # P2 admission gate: NEW work proves its mission context BEFORE the single
+    # durable attempt is consumed — the sink/cap are built in memory first,
+    # then prepare_b2b_context does the real native read (already-loaded
+    # dubsar-agent-context plugin, bound to THIS cap) inside the owning
+    # profile scope, attaches the frozen preparation to the sink, and only
+    # then is readiness (the same single classifier /health/detailed reports)
+    # consulted. Any source/producer error is 503 execution_unavailable with
+    # NO binding/attempt/run/title/provider side effects — the in-memory
+    # sink/cap are simply dropped. An already-durable attempt row is always
+    # served by the idempotent replay below (b2b_admit -> _replayed_response),
+    # so a lost-ACK retry never hears "execution_unavailable" for a committed
+    # lane and never pays a context read.
     existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
-
-    def _execution_ready() -> bool:
-        try:
-            with adapter._profile_scope(profile):
-                from gateway.run import _load_gateway_config
-                config = _load_gateway_config()
-            from gateway.platforms.api_server_b2b_execution import (
-                b2b_execution_unavailable_code)
-            return b2b_execution_unavailable_code(project, config) is None
-        except Exception:
-            return False
-    if existing_attempt is None and not await _a.to_thread(_execution_ready):
-        return _deny(503, "execution_unavailable")
     policy = {
         "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
         "attempt_id": attempt_id, "profile_home": str(home),
@@ -1221,8 +1229,44 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     fingerprint = _policy_digest(profile, entry, project, policy)
     scope = _run_scope(profile, resolved["requester_id"], binding_digest)
     initial_status = {"status": "queued", "session_id": session_id, "created_at": time.time()}
+    sink = None
+    cap = None
     # Lost-ACK replay is allowed even while the original holds the final native worker slot.
     if existing_attempt is None:
+        # The sink + cap exist ONLY in memory until b2b_admit commits the
+        # attempt — a failed preparation drops them with zero durable trace.
+        sink = _AttemptSink(adapter, store, profile=profile, entry=entry, keys=keys,
+                            attempt_id=attempt_id, session_id=session_id,
+                            binding_digest=binding_digest, run_id=run_id, policy=policy)
+        cap = BoundExecution(
+            profile=profile, session_id=session_id, binding_digest=binding_digest,
+            attempt_id=attempt_id, run_id=run_id, policy=dict(policy),
+            sink=sink, created_at=time.time())
+
+        def _prepare() -> Optional[str]:
+            """Off-loop: owning profile scope + the bound execution, THEN
+            config/inputs/producer/readiness — the ContextVar is always reset."""
+            from agent.b2b_execution import bind_execution, reset_execution
+            from gateway.platforms.api_server_b2b_execution import (
+                b2b_execution_inputs_ready, b2b_execution_unavailable_code)
+            from gateway.platforms.api_server_b2b_context import prepare_b2b_context
+            try:
+                with adapter._profile_scope(profile):
+                    token = bind_execution(cap)
+                    try:
+                        from gateway.run import _load_gateway_config
+                        config = _load_gateway_config()
+                        if not b2b_execution_inputs_ready(project, config):
+                            return "execution_inputs_unavailable"
+                        sink._context_preparation = prepare_b2b_context(
+                            cap, resolved=resolved)
+                        return b2b_execution_unavailable_code(project, config)
+                    finally:
+                        reset_execution(token)
+            except Exception:
+                return "execution_unavailable"
+        if await _a.to_thread(_prepare) is not None:
+            return _deny(503, "execution_unavailable")
         limited = adapter._concurrency_limited_response()
         if limited is not None:
             return limited
@@ -1259,13 +1303,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     except Exception:
         store.b2b_update_attempt(profile=profile, attempt_id=attempt_id, status="failed")
         return _deny(500, "title_commit_failed")
-    sink = _AttemptSink(adapter, store, profile=profile, entry=entry, keys=keys,
-                        attempt_id=attempt_id, session_id=session_id,
-                        binding_digest=binding_digest, run_id=stored_run_id, policy=policy)
-    cap = BoundExecution(
-        profile=profile, session_id=session_id, binding_digest=binding_digest,
-        attempt_id=attempt_id, run_id=stored_run_id, policy=dict(policy),
-        sink=sink, created_at=time.time())
+    # The admitted winner's run_id is the chosen one — the sink/cap built
+    # pre-admission already carry it (a replayed outcome returned above).
     launched = await _spawn_run(adapter, request, cap=cap, resolved=resolved,
                                 session_id=session_id, run_id=stored_run_id, profile=profile)
     if launched is None:

@@ -520,6 +520,7 @@ class P1Node:
             "SystemRoot": os.environ.get("SystemRoot", ""),
             "P1_PORTAL_ROOT": self.portal_root,
             "P1_MYWORK_ROOT": self.mywork_root,
+            "B2B_TEST_CORE_ROOT": os.environ.get("B2B_TEST_CORE_ROOT", ""),
             "TEMP": str(node_tmp), "TMP": str(node_tmp),
             "TMPDIR": str(node_tmp),
         }
