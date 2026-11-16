@@ -1412,6 +1412,10 @@ async def _spawn_run(adapter: Any, request: Any, *, cap, resolved, session_id, r
     adapter._run_owners[run_id] = _run_scope(profile, resolved["requester_id"], cap.binding_digest)
     adapter._set_run_status(run_id, "queued", created_at=created_at,
                             session_id=session_id, model=None)
+    # The scheduled run task holds ONE ref of the launch's capacity unit — the
+    # task is already covered by the lease, so it is excluded from the count
+    # (no double count); the ref releases on done, even cancelled pre-tick.
+    work_lease = getattr(getattr(cap, "sink", None), "_work_lease", None)
     launch = _runs._RunLaunch(
         adapter, run_id, q, session_id, None, False, prompt, [],
         False, dict(ephemeral_system_prompt=None, session_id=session_id,
@@ -1421,12 +1425,8 @@ async def _spawn_run(adapter: Any, request: Any, *, cap, resolved, session_id, r
                     confirmed_runtime_lock=True),
         request_profile=profile if profile != "default" else None,
         browser_control_principal=None, browser_control_transport_family=None,
-        turn_author=None, b2b_execution=cap)
+        turn_author=None, b2b_execution=cap, work_lease=work_lease)
     adapter._activate_admitted_request()
-    # The scheduled run task holds ONE ref of the launch's capacity unit — the
-    # task is already covered by the lease, so it is excluded from the count
-    # (no double count); the ref releases on done, even cancelled pre-tick.
-    work_lease = getattr(getattr(cap, "sink", None), "_work_lease", None)
     ref = None
     if work_lease is not None:
         ref = work_lease.retain()

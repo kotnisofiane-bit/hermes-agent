@@ -493,6 +493,7 @@ class _RunLaunch:
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
     b2b_execution: Any = None  # frozen BoundExecution, bound at admission; never request-derived
+    work_lease: Any = None  # neutral capacity metadata; set only by the B2B launch path
 
     @property
     def approval_session_key(self) -> str:
@@ -969,8 +970,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(
             loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server),
-            work_lease=getattr(
-                getattr(getattr(run, "b2b_execution", None), "sink", None), "_work_lease", None))
+            work_lease=getattr(run, "work_lease", None))
         if not isinstance(result, dict):
             result = {}
         status, fields = terminal_run_status(result)
