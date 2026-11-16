@@ -104,7 +104,7 @@ def test_inputs_ready_when_all_inputs_on_disk(tmp_path):
 
 
 def test_execution_ready_never_opens_without_c1(tmp_path):
-    """No input set opens execution in this delivery: fully prepared and
+    """Without a bound native preparation, fully configured and
     unprepared projects both leave ``b2b_execution_ready`` False."""
     lane = _ready_lane(tmp_path)
     assert b2b_execution_ready(lane.project, _INERT_CONFIG) is False
@@ -1640,23 +1640,12 @@ def test_execution_status_ignores_ambient_bound_execution(tmp_path, monkeypatch)
     _write_serving_config(_profile_config_dir("hub"))
     state = _state({"hub": _lane_entry(lane)})
 
-    class _FakePreparation:
-        cap = None
-        project_utf8 = b""
-
-        def __init__(self, cap):
-            self.cap = cap
-
-        def assert_current(self, cap):
-            return None
-
-        def assert_configuration_current(self):
-            return True
-
-    lane.sink._context_preparation = _FakePreparation(lane.cap)
+    lane.sink._context_preparation = _UnitPreparation(lane.cap)
     token = bind_execution(lane.cap)
     try:
+        assert b2b_execution_ready(lane.project, _INERT_CONFIG) is True
         status = b2b_execution_status(_status_adapter(state))
+        assert _execution_var.get() is lane.cap
     finally:
         reset_execution(token)
     assert status["b2b_execution"] == "not-ready"

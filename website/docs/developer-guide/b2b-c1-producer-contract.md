@@ -7,7 +7,7 @@ description: "P2 governed context admission and the closed B2B execution boundar
 
 This is dubsar-platform PR120 (§5 P2) and task L13-D4: the *Hermes* C1 path —
 governed context produced by the installed `dubsar-agent-context` plugin.
-It is not the chemin-modèle C1 of §5's Portal/proposal chain. Scope reference:
+It is distinct from the operational model-path criterion C1 in L13-D4. Scope reference:
 https://github.com/kotnisofiane-bit/dubsar-platform/pull/120
 
 ## Delivery boundary
@@ -148,7 +148,8 @@ task-owned PostgreSQL (state journal + ordered projection), real `AIAgent`
 construction and `run_conversation`, `pre_llm_call` publication,
 source-bounded terminal dispatch CAS to a loopback provider double, and the
 sealed `dubsar.b2b-proposal/1`. It also demonstrates A-B-A profile isolation
-(two homes, two missions, two projects — no shared context), replay served
+(two homes and two missions with separate native roots under the same
+project label — no shared context), replay served
 from durable state with no redispatch even after the Memory Plane becomes
 unavailable, and fail-closed refusal before
 admission for absent plugin, missing, stale, crossed and late memory
@@ -172,3 +173,67 @@ tests; and any readiness claim from installed plugins, ambient capability or
 operator inputs alone. Merely supplying all operator inputs or changing
 health status cannot open execution — only a current, mission-scoped,
 source-fresh native proof bound to the attempt's own capability can.
+
+## Recorded verification — 15–16 November 2026
+
+Baseline: `82fee98f75a65fc508d76ef88d31fe0aa4e8a39b`. Resumed work:
+`fe2a14af9bce18f8aa661936e20b7776064af8f2`. No real provider was called: the
+native lane uses synthetic data and local doubles, with task-owned PostgreSQL.
+
+| P2 proof | Result |
+|---|---|
+| Native tests copied onto main, production unchanged | **RED: 3 failed, 5 passed**. The nominal and two post-admission drift scenarios stop at `503 execution_unavailable`, rather than an import/setup error |
+| Same native tests on P2 | **GREEN: 8 passed**. Valid publication/seal/replay across two homes; OC/config drift refuses before model dispatch; absent plugin and missing/stale/crossed/late context leave no admission |
+| Execution lane, admission, runtime, terminal, hot-path isolation | **432 passed**, zero failed |
+
+The main worktree received only the native test files and the runner's
+`TMPDIR` forwarding adjustment. Each worktree used its own editable Python
+environment. The corrected health test first proves that the ambient
+capability is ready, then proves that health ignores and restores it.
+
+The broad campaign used 32 **frozen** file lists, 149 files each. Every
+command had `timeout --kill-after=10s 890s`, a log and an exit receipt.
+The first four slices reached their time limit; subsequent slices used
+three concurrent runners instead of four. Completed outputs were counted
+once per file, without adding repeated failure summaries or targeted reruns.
+
+| Broad suite | Recorded result and limit |
+|---|---|
+| Python | 4,757 of 4,768 selected files returned results: **46,675 passed, 61 failed, 33 pytest errors, 631 skipped, 1 xfailed**. 101 files were non-green; 59 files reported no test-count outcome. Eleven files have no result after the four timeouts |
+| Python comparison to main | Same selection/markers on the 101 non-green files: **1,221 passed, 50 failed, 33 errors, 9 skipped**; 78 files also non-green on main. The other 23 files were rerun on P2: 506 passed, 3 failed, 1 skipped and one file timeout; the three remaining files then passed serially (**32 passed**). That serial comparison also reproduced the MCP watcher failure on main (**31 passed, 1 failed**). Thus 79 original non-green files were also non-green on main at least once; the other 22 passed their targeted P2 rerun |
+| TUI | **1,579 passed, 1 failed**; the affected file subsequently passed **17/17 on main and P2** |
+| Web | **352 passed** |
+| tests-js | **46 passed** |
+| Desktop Vitest | Timeout; no complete count claimed. Three printed failure files compared on main: **56 passed, 1 failed**. The Electron installation failure reproduced on main; the other two files passed their targeted P2 rerun (**56 passed**) |
+| Desktop package validation | `test:desktop:all` passed with an isolated HOME; local package built and validated, no updater or application-install flow launched |
+| Desktop Playwright / Rust | Blocked before executable tests: missing `libgtk-3.so.0`; missing Cargo/Rust/system build dependencies. Same host prerequisites on main |
+
+Docker's 25 test files were excluded by the explicit no-Docker instruction.
+The broad Python marker expression was `not integration and not live`;
+provider/service opt-ins stayed off. P2's native integration suite was run
+separately and explicitly. These skips, timeouts and prerequisite blocks are
+not passes, and the broad campaign is **not globally green**. The intermittent
+failures are reported without asserting that CPU load is their proven cause.
+No unrelated production code was changed to make those suites green.
+
+Raw logs, immutable file lists, baseline comparisons and count scripts are
+retained in `/srv/dubsar-lots/b2b-l13-p2r/evidence/`; the final task report is
+`/srv/dubsar-lots/b2b-l13-p2r/REPORT.md`.
+
+## Vision delta for P2
+
+| Principle | P2 status and evidence |
+|---|---|
+| 1 — Agent proposes | Preserved: one iteration, no tools, no recovery/fallback (`api_server_b2b_execution.py:320-334`; `agent/b2b_execution.py:627-654`) |
+| 3 — No direct business action | Preserved: existing proposal-only terminal and dispatch CAS; no Tool/Composio surface added (`agent/b2b_execution.py:1185-1224`; `api_server_run_idempotency.py:445-479`) |
+| 4 — Changed situation invalidates | Advanced locally: native source observation window is not renewed, and OC drift blocks dispatch (`api_server_b2b_context.py:155-192,238-245`; native drift tests). Installed Core approval remains a separate qualification |
+| 5 — Decisions have evidence | Advanced for context/proposal: exact render, view, digests and fresh rechecks persist with the attempt (`api_server_b2b.py:1066-1093`; native artifact assertions) |
+| 6 — Approver sees AI inputs | Exact AI input is preserved (`agent/turn_context.py:745-851`; native render equality assertion). The complete approver UI and model/token display remain outside P2 |
+| 9 — One interchangeable model gateway | Existing pinned runtime and refusal of alternate routes preserved (`api_server_b2b_execution.py:247-334`; `agent/b2b_execution.py:1102-1136`). Installed G2 routing is not qualified here |
+| 10 — Chosen model/data only | Synthetic local proof only; host test egress fence (`tests/gateway/native_b2b/host.py:18-32`). Production network isolation and data policy remain P1/P3/P4/P15 requirements |
+| 11 — Claims match code | Health is not mission readiness; real components, doubles, incomplete suites and installation limits are identified above |
+
+Principles 2, 7, 8 and 12 have no changed product surface in P2. Approval,
+global stop, cost tracking and the real Portal journey retain their separate
+delivery/qualification requirements. This is no deployment, network C1–C6
+qualification or authorization for a real model, email or GitHub business action.

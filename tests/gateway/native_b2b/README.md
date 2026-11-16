@@ -52,7 +52,7 @@ tests — the tests download nothing and spawn no package manager.
 ```bash
 B2B_TEST_MY_WORK_ROOT=<dir containing .p2-native-runtime.json> \
 TMPDIR=<task tmp> \
-timeout 1100 scripts/run_tests.sh -j 1 --file-retries 0 \
+timeout --kill-after=10s 890s scripts/run_tests.sh -j 1 --file-retries 0 \
   --include-integration -m 'integration or not integration' \
   tests/gateway/test_api_server_b2b_native.py
 ```

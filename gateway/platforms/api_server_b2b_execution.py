@@ -83,12 +83,10 @@ def guard_agent_construction(
             requested_model not in (None, project["model"]) or
             requested_provider not in (None, project["provider"])):
         raise B2BTerminalRefusal("b2b_policy_override")
-    # L2: governed construction is open only when the operator's real
-    # execution context for THIS project is in place AND the C1 producer has
-    # published it — b2b_execution_ready stays False until the producer is
-    # integrated, so every stale admitted cap keeps the same durable terminal
-    # refusal — before run_agent import, runtime/credential/tool resolution
-    # or memory checkout.
+    # P2: construction requires this capability's current native context
+    # preparation under its owning profile. Publication follows in the
+    # admitted worker's pre_llm_call hook. Missing or stale preparation
+    # refuses before run_agent import and runtime/credential/tool resolution.
     from gateway.run import _load_gateway_config
     if not b2b_execution_ready(project, _load_gateway_config()):
         cap.sink.block("context_unavailable")
@@ -197,10 +195,10 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
     every profile is evaluated under its OWN profile scope against its OWN
     serving config (A→B→A), and reported ``not-ready`` — never ``ready`` —
     with a typed code: ``execution_inputs_unavailable`` for any preparation
-    hole (including empty profiles/projects and evaluation errors) and
-    ``c1_producer_unavailable`` when preparation is complete and only the
-    missing C1 producer holds the lane closed. The aggregate is the fail-closed
-    combination: any ``execution_inputs_unavailable`` wins."""
+    hole (including empty profiles/projects and evaluation errors),
+    ``c1_producer_unavailable`` when the producer is absent, and
+    ``c1_context_required`` when it is present without a current mission
+    proof. The aggregate uses that fail-closed order."""
     state = _state_for(adapter)
     if state is None or not state.config.enabled:
         return {"b2b_execution": "not-configured", "b2b_execution_code": None,
