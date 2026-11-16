@@ -955,6 +955,12 @@ def _admit_api_agent_request(handler):
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
+        capacity = getattr(self, "_capacity", None)
+        if capacity is not None:
+            with suppress(Exception):
+                from gateway.platforms.api_server_capacity import capacity_home_key
+                reservation["home_key"] = capacity_home_key()
+            capacity.note_pending(+1, reservation.get("home_key"))
         try:
             return await handler(self, request, *args, **kwargs)
         finally:
@@ -963,11 +969,14 @@ def _admit_api_agent_request(handler):
     return _wrapped
 
 
-def _release_pending_api_work(adapter, reservation: dict[str, bool]) -> None:
+def _release_pending_api_work(adapter, reservation: dict) -> None:
     """Release a pending-work reservation exactly once."""
     if reservation["active"]:
         reservation["active"] = False
         adapter._pending_agent_requests = max(0, adapter._pending_agent_requests - 1)
+        capacity = getattr(adapter, "_capacity", None)
+        if capacity is not None:
+            capacity.note_pending(-1, reservation.get("home_key"))
 
 
 def _require_auth(handler):
@@ -987,6 +996,12 @@ def _reserve_pending_api_work(adapter):
     the reservation to a task whose done callback then owns release."""
     reservation = {"active": True, "detached": False}
     adapter._pending_agent_requests += 1
+    capacity = getattr(adapter, "_capacity", None)
+    if capacity is not None:
+        with suppress(Exception):
+            from gateway.platforms.api_server_capacity import capacity_home_key
+            reservation["home_key"] = capacity_home_key()
+        capacity.note_pending(+1, reservation.get("home_key"))
     try:
         yield reservation
     finally:
@@ -1227,6 +1242,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self.gateway_runner: Optional[Any] = None  # set by gateway/run.py
         # Admitted requests not yet in agent bookkeeping, so shutdown drain counts them.
         self._pending_agent_requests: int = 0
+        # Profile-keyed work ledger shared by the run limiter, shutdown drain and
+        # B2B launch leases (api_server_capacity); per canonical hermes_home_key.
+        from gateway.platforms.api_server_capacity import _CapacityLedger, register_adapter
+        from hermes_constants import hermes_home_key as _launch_home_key
+        self._capacity = _CapacityLedger(self, _launch_home_key())
+        register_adapter(self)
         # Shared broker; this adapter maps HTTP registration + controller WS onto it.
         self._browser_control_broker = get_browser_control_broker()
         # One-shot artifact transport: lazy per-profile stores + limiter (tests inject).
@@ -1236,13 +1257,18 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # _artifact_store_for_async(); a lost race would strand receipts (in-memory index).
         self._browser_control_artifact_locks: Dict[str, asyncio.Lock] = {}
 
-    def active_agent_work_count(self) -> int:
+    def active_agent_work_count(self, home_key: Optional[str] = None) -> int:
         """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
-        (task-based, since ``_active_run_agents`` has a queued-before-agent gap)."""
+        + live B2B launch leases — process-wide, or scoped to one canonical
+        ``hermes_home_key`` when *home_key* is given (task-based, since
+        ``_active_run_agents`` has a queued-before-agent gap)."""
         try:
-            return (int(getattr(self, "_pending_agent_requests", 0))
-                    + int(self._inflight_agent_runs)
-                    + sum(not task.done() for task in self._active_run_tasks.values()))
+            ledger = getattr(self, "_capacity", None)
+            if ledger is None:
+                return (int(getattr(self, "_pending_agent_requests", 0))
+                        + int(self._inflight_agent_runs)
+                        + sum(not task.done() for task in self._active_run_tasks.values()))
+            return ledger.work_count(home_key)
         except Exception:
             return 0
 
@@ -1776,7 +1802,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
 
-    async def _ensure_session_db_async(self):
+    async def _ensure_session_db_async(self, work_lease=None):
         """Async variant: the profile home is captured on the loop thread (its scope is invisible
         inside ``to_thread``), only the blocking open runs in the worker, single-flight locked."""
         if self._session_db is not None:
@@ -1796,7 +1822,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     cached = self._session_dbs.get(key)
                 if cached is not None:
                     return cached
-                return await asyncio.to_thread(self._open_and_cache_session_db, home)
+                from gateway.platforms.api_server_capacity import lease_to_thread
+                return await lease_to_thread(
+                    self._open_and_cache_session_db, home, work_lease=work_lease)
         except Exception as e:
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
@@ -3915,21 +3943,30 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
+    def _concurrency_limit_response(self, limit: int) -> "web.Response":
+        """The limiter's exact refusal — reused by B2B launch reservation."""
+        return _error_response(
+            f"Too many concurrent runs (max {limit})", 429, err_type="rate_limit_error",
+            code="rate_limit_exceeded", headers={"Retry-After": "1"})
+
     def _concurrency_limited_response(self) -> Optional["web.Response"]:
-        """429 when the concurrent-run cap is reached (0 disables), else None. Uses the same
-        adapter-owned work count as shutdown draining (admitted requests included)."""
+        """429 when the concurrent-run cap is reached for THIS request's profile home
+        (0 disables), else None. Uses the same per-home ledger as shutdown draining
+        (admitted requests and B2B launch leases included)."""
         limit = self._max_concurrent_runs
         if limit <= 0:
             return None
-        inflight = self.active_agent_work_count()
+        from gateway.platforms.api_server_capacity import capacity_home_key
+        home_key = capacity_home_key()
+        inflight = self.active_agent_work_count(home_key)
         # The current request's own reservation must not consume its last available slot.
         reservation = _api_agent_request_reservation.get()
-        if reservation and reservation["active"]:
+        if (reservation and reservation["active"]
+                and (reservation.get("home_key") or getattr(
+                    getattr(self, "_capacity", None), "launch_home_key", home_key)) == home_key):
             inflight -= 1
         if inflight >= limit:
-            return _error_response(
-                f"Too many concurrent runs (max {limit})", 429, err_type="rate_limit_error",
-                code="rate_limit_exceeded", headers={"Retry-After": "1"})
+            return self._concurrency_limit_response(limit)
         return None
 
     @staticmethod
@@ -4160,12 +4197,21 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     clear_session_vars(tokens)
         self._activate_admitted_request()
         self._inflight_agent_runs += 1
+        capacity = getattr(self, "_capacity", None)
+        inflight_home = None
+        if capacity is not None:
+            with suppress(Exception):
+                from gateway.platforms.api_server_capacity import capacity_home_key
+                inflight_home = capacity_home_key()
+            capacity.note_inflight(+1, inflight_home)
         try:
             # Worker-scoped count rides along so the shutdown close gate still sees the thread
             # after this handler task is cancelled (#116535); released in the worker's finally.
             return await _api_runs._submit_api_worker(loop, _run)
         finally:
             self._inflight_agent_runs -= 1
+            if capacity is not None:
+                capacity.note_inflight(-1, inflight_home)
 
     # -- /v1/runs, room grants, room dispatch: thin delegators (real methods: tests assert
     # __dict__ membership and patch the module-level implementations) ---------------------

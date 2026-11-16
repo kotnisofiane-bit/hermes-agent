@@ -371,3 +371,131 @@ def test_bedrock_reasoning_delta_reaches_plugin_only_observer(monkeypatch):
 
     assert calls[0]["kind"] == "reasoning"
     assert calls[0]["delta"] == "bedrock reasoning"
+
+
+def test_stream_failure_reports_to_enqueuing_profile_manager(
+        monkeypatch, tmp_path):
+    """The warn-once failure report must land on the ENQUEUING profile's
+    manager (the captured context), never the ambient/launch home's — and the
+    dedup set must be that manager's."""
+    import hermes_cli.plugins as plugins_mod
+    from agent.plugin_stream_hooks import (
+        enqueue_plugin_stream_hook, shutdown_plugin_stream_hook_dispatcher)
+    from hermes_cli.plugins import PluginManager
+    from hermes_constants import (
+        get_hermes_home, reset_hermes_home_override, set_hermes_home_override)
+
+    shutdown_plugin_stream_hook_dispatcher()
+    home_a = tmp_path / "home-a"
+    home_b = tmp_path / "home-b"
+    home_a.mkdir()
+    home_b.mkdir()
+    manager_a = PluginManager("a")
+    manager_b = PluginManager("b")
+    managers = {home_a: manager_a, home_b: manager_b}
+
+    monkeypatch.setattr(
+        plugins_mod, "get_plugin_manager",
+        lambda: managers.get(get_hermes_home(), manager_a))
+
+    def _failing(**_kwargs):
+        raise RuntimeError("stream boom")
+
+    for manager in (manager_a, manager_b):
+        manager._hooks = {"on_stream_delta": [_failing]}
+        manager._dispatch_hook_callbacks = (
+            lambda _name: (_failing,))
+
+    reports = []
+    real_report = PluginManager._report_hook_failure
+    monkeypatch.setattr(
+        PluginManager, "_report_hook_failure",
+        lambda self, *a, **k: (
+            reports.append(self), real_report(self, *a, **k))[0])
+
+    token = set_hermes_home_override(home_b)
+    try:
+        assert enqueue_plugin_stream_hook("on_stream_delta", delta="x")
+    finally:
+        reset_hermes_home_override(token)
+    _wait_for(lambda: len(reports) >= 1)
+
+    # Same failure again: still reported to B (dedup is B's set — one entry).
+    token = set_hermes_home_override(home_b)
+    try:
+        assert enqueue_plugin_stream_hook("on_stream_delta", delta="x2")
+    finally:
+        reset_hermes_home_override(token)
+    _wait_for(lambda: len(reports) >= 2)
+    shutdown_plugin_stream_hook_dispatcher()
+
+    assert reports == [manager_b, manager_b]
+    assert len(manager_b._hook_failures_reported) == 1
+    assert not manager_a._hook_failures_reported
+
+
+def test_stop_dispatcher_blocked_callback_still_exits_and_frees_refs(
+        monkeypatch):
+    """A dispatcher whose callback is still blocked at shutdown timeout must
+    keep its _STOP sentinel queued (the old post-join drain removed it and
+    parked the worker forever). Already-queued event refs are refunded by
+    the pre-stop drain; the running callback's ref is held until it exits."""
+    import agent.b2b_execution as bexec
+    import agent.plugin_stream_hooks as psh
+
+    class _FakeLease:
+        def __init__(self):
+            self.held = 0
+
+        def retain(self):
+            self.held += 1
+            lease = self
+
+            class _Ref:
+                released = False
+
+                def release(self):
+                    if not self.released:
+                        self.released = True
+                        lease.held -= 1
+
+            return _Ref()
+
+    lease = _FakeLease()
+    monkeypatch.setattr(bexec, "current_launch_lease", lambda: lease)
+
+    cb_gate = threading.Event()
+    cb_entered = threading.Event()
+
+    def _blocking(**_kwargs):
+        cb_entered.set()
+        cb_gate.wait(timeout=30.0)
+
+    monkeypatch.setattr(psh, "_dispatch_callbacks", lambda _name: (_blocking,))
+    monkeypatch.setattr(psh, "_registered_callbacks", lambda _name: (_blocking,))
+    psh.shutdown_plugin_stream_hook_dispatcher()
+
+    assert psh.enqueue_plugin_stream_hook("on_stream_delta", delta="one")
+    assert cb_entered.wait(timeout=10.0)
+    dispatcher = next(iter(psh._dispatchers.values()))
+    worker = dispatcher.thread
+    # A second event parks behind the blocked callback — its ref must be
+    # refunded by the pre-stop drain, never left for a dead queue.
+    assert psh.enqueue_plugin_stream_hook("on_stream_delta", delta="two")
+    assert lease.held == 2
+
+    # Short stop timeout: the join expires while the callback is blocked,
+    # but _STOP stays queued — the worker exits once the callback returns.
+    psh._stop_dispatcher(dispatcher, timeout=0.2)
+    assert worker.is_alive()
+    assert lease.held == 1  # only the in-flight callback's ref remains
+
+    cb_gate.set()
+    deadline = time.monotonic() + 10.0
+    while worker.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not worker.is_alive()
+    deadline = time.monotonic() + 10.0
+    while lease.held and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert lease.held == 0

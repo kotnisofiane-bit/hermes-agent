@@ -20,30 +20,18 @@ no preflight publish and reads no provider credentials.
 
 from __future__ import annotations
 
-import contextvars
-import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 from agent.b2b_execution import (
     B2BTerminalRefusal, BoundExecution, CONTEXT_MAX_BYTES, _deep_freeze,
     _native_oc_read_metadata, _reject_bad_unicode, _utc_milliseconds,
     assert_source_equivalent, json_utf8, qualify_context_view, source_basis,
 )
-from gateway.platforms.api_server_b2b import _SOURCE_DEADLINE_S
 
 
 _SOURCE_OBSERVED_MAX_AGE_MS = 900_000
-
-# Fixed process-wide resource bound on in-flight native preparations: at most
-# ONE discovery+read worker may run at a time, for every profile this process
-# serves. A worker keeps its slot until it actually finishes — a caller
-# deadline expiring releases nothing — so a wedged producer pins the bound and
-# later launches (including other profiles') fail closed on saturation instead
-# of stacking unbounded discovery/provider threads behind it.
-_MAX_CONCURRENT_PREPARATIONS = 1
-_preparation_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_PREPARATIONS)
 
 
 def _context_provider(*, discover: bool = False):
@@ -71,66 +59,41 @@ def _context_provider(*, discover: bool = False):
     return manager, prepare
 
 
-def producer_available() -> bool:
+def producer_available(adapter: Any = None) -> bool:
     """Registration introspection for diagnostics (health/health-detailed):
-    is exactly one ``prepare_context`` callback registered in THIS home?
-    Says nothing about any mission's readiness — an available producer still
-    admits nothing without a current per-capability preparation."""
+    is exactly one ``prepare_context`` callback registered in THIS home, AND
+    does the shared per-home capacity ledger still admit work? Saturation
+    reports False — a full lane cannot serve a new launch. Says nothing about
+    any mission's readiness: an available producer still admits nothing
+    without a current per-capability preparation, and a held lease never
+    makes its OWN launch's readiness False."""
     try:
-        return _context_provider(discover=False) is not None
+        if _context_provider(discover=False) is None:
+            return False
+        from gateway.platforms.api_server_capacity import capacity_saturated
+        return not capacity_saturated(adapter)
     except Exception:
         return False
 
 
 def _bounded_native_read(cap: BoundExecution):
-    """The preparation's native read, bounded off-loop by the standing source
-    budget (pattern: ``recheck_context``). The callback runs on a daemon
-    thread under ``copy_context``; the caller Event-waits the budget and is
-    the ONLY attacher — a late completion can never admit anything.
-
-    The worker is admitted against the process-wide
-    ``_MAX_CONCURRENT_PREPARATIONS`` bound BEFORE any discovery/provider work
-    starts: a saturated bound refuses ``context_unavailable`` without spawning
-    a thread. The slot is held until the worker completes (producer exceptions
-    included) — never released by the caller's deadline expiring."""
-    budget = _SOURCE_DEADLINE_S
-    outcome: Dict[str, Any] = {}
-    done = threading.Event()
-    invoke_context = contextvars.copy_context()
-
-    def _invoke() -> None:
-        try:
-            found = _context_provider(discover=True)
-            if found is None:
-                raise B2BTerminalRefusal("context_unavailable")
-            manager, prepare = found
-            result = prepare(execution=cap)
-            if (not isinstance(result, Mapping)
-                    or not callable(result.get("validate_configuration"))):
-                raise B2BTerminalRefusal("context_unavailable")
-            outcome["value"] = result, manager, prepare
-        except BaseException as exc:  # noqa: BLE001 -- normalized below
-            outcome["error"] = exc
-        finally:
-            done.set()
-            _preparation_slots.release()
-
-    if not _preparation_slots.acquire(blocking=False):
+    """The preparation's native read — synchronous INSIDE the launch's single
+    bounded worker. The caller (``_launch_b2b_run``'s preparation worker)
+    already holds the source budget AND the home's capacity unit: a second
+    thread here would only double the worker lifetime the lease must cover.
+    A wedged producer therefore blocks THAT worker; the bounded wait at the
+    worker boundary still gives the original requester
+    ``execution_unavailable`` while the lease stays held until the worker's
+    real finally."""
+    found = _context_provider(discover=True)
+    if found is None:
         raise B2BTerminalRefusal("context_unavailable")
-    try:
-        threading.Thread(
-            target=lambda: invoke_context.run(_invoke), daemon=True).start()
-    except BaseException:
-        _preparation_slots.release()
-        raise
-    if not done.wait(budget):
+    manager, prepare = found
+    result = prepare(execution=cap)
+    if (not isinstance(result, Mapping)
+            or not callable(result.get("validate_configuration"))):
         raise B2BTerminalRefusal("context_unavailable")
-    exc = outcome.get("error")
-    if exc is not None:
-        if isinstance(exc, B2BTerminalRefusal):
-            raise exc
-        raise B2BTerminalRefusal("context_unavailable") from None
-    return outcome["value"]
+    return result, manager, prepare
 
 
 def _source_observed_ms(plain: Mapping[str, Any]) -> Tuple[int, int]:

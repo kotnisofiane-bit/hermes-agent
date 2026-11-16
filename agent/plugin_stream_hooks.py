@@ -12,6 +12,7 @@ import contextvars
 import logging
 import queue
 import threading
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -28,7 +29,7 @@ _STOP = object()
 class _ConsumerDispatcher:
     hook_name: str
     callback: Callable[..., Any]
-    events: "queue.Queue[tuple[contextvars.Context, dict[str, Any]] | object]"
+    events: "queue.Queue[tuple[contextvars.Context, dict[str, Any], Any] | object]"
     thread: threading.Thread | None = None
 
 
@@ -43,6 +44,14 @@ def _callback_name(callback: Callable[..., Any]) -> str:
     return getattr(callback, "__name__", repr(callback))
 
 
+def _release_item_ref(item: Any) -> None:
+    """Drop the launch-lease ref one queued event carried — idle dispatcher
+    threads hold nothing; each EVENT does, until consumed, dropped or drained."""
+    if isinstance(item, tuple) and len(item) == 3 and item[2] is not None:
+        with suppress(Exception):
+            item[2].release()
+
+
 def _put_drop_oldest(events: "queue.Queue[Any]", item: Any) -> bool:
     """put_nowait; on a full queue evict the oldest pending event and retry once."""
     try:
@@ -50,7 +59,8 @@ def _put_drop_oldest(events: "queue.Queue[Any]", item: Any) -> bool:
         return True
     except queue.Full:
         try:
-            events.get_nowait()
+            evicted = events.get_nowait()
+            _release_item_ref(evicted)
             events.task_done()
         except queue.Empty:
             pass
@@ -66,8 +76,17 @@ def _worker(dispatcher: _ConsumerDispatcher) -> None:
         item = dispatcher.events.get()
         try:
             if item is _STOP:
+                # Anything enqueued behind the sentinel is unreachable once
+                # this worker exits — free those refs before returning.
+                while True:
+                    try:
+                        leftover = dispatcher.events.get_nowait()
+                    except queue.Empty:
+                        break
+                    _release_item_ref(leftover)
+                    dispatcher.events.task_done()
                 return
-            context, payload = item
+            context, payload, ref = item
             payload = dict(payload)
             payload.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
             try:
@@ -83,11 +102,15 @@ def _worker(dispatcher: _ConsumerDispatcher) -> None:
                 context.copy().run(invoke_if_registered)
             except Exception as exc:
                 # Fires once per streaming delta: a mis-declared callback fails identically every
-                # time, so it goes through the manager's warn-once reporter (#111922).
+                # time, so it goes through the manager's warn-once reporter (#111922) — through
+                # the ENQUEUING profile's context so the report lands on the owning manager,
+                # not the launch/default home's.
                 from hermes_cli.plugins import get_plugin_manager
 
-                get_plugin_manager()._report_hook_failure(dispatcher.hook_name, dispatcher.callback, payload, exc)
+                context.copy().run(lambda: get_plugin_manager()._report_hook_failure(
+                    dispatcher.hook_name, dispatcher.callback, payload, exc))
         finally:
+            _release_item_ref(item)
             dispatcher.events.task_done()
 
 
@@ -110,9 +133,28 @@ def _dispatch_callbacks(hook_name: str) -> tuple[Callable[..., Any], ...]:
 
 
 def _stop_dispatcher(dispatcher: _ConsumerDispatcher, timeout: float = 1.0) -> None:
+    # Free queued event refs BEFORE the sentinel: the drain must never remove
+    # a live worker's _STOP (a callback still blocked at join timeout would
+    # then park the worker on an empty queue forever).
+    while True:
+        try:
+            leftover = dispatcher.events.get_nowait()
+        except queue.Empty:
+            break
+        _release_item_ref(leftover)
+        dispatcher.events.task_done()
     _put_drop_oldest(dispatcher.events, _STOP)
     if dispatcher.thread is not None:
         dispatcher.thread.join(timeout=timeout)
+    if dispatcher.thread is None or not dispatcher.thread.is_alive():
+        # Worker exited: events that raced in behind _STOP are unreachable.
+        while True:
+            try:
+                leftover = dispatcher.events.get_nowait()
+            except queue.Empty:
+                break
+            _release_item_ref(leftover)
+            dispatcher.events.task_done()
 
 
 def _start_dispatcher(hook_name: str, callback: Callable[..., Any]) -> _ConsumerDispatcher:
@@ -157,11 +199,26 @@ def _dispatchers_for(hook_name: str) -> list[_ConsumerDispatcher]:
 def enqueue_plugin_stream_hook(hook_name: str, **payload: Any) -> bool:
     """Queue an observer hook for each consumer without running plugin code inline."""
     queued = False
-    item = (contextvars.copy_context(), dict(payload))
+    item_context = contextvars.copy_context()
+    try:
+        from agent.b2b_execution import current_launch_lease
+        lease = current_launch_lease()
+    except Exception:
+        lease = None
     for dispatcher in _dispatchers_for(hook_name):
-        if _put_drop_oldest(dispatcher.events, item):
+        # Each queued event retains the enqueuing launch's unit until the
+        # callback actually completes, the event is drop-evicted, or the
+        # dispatcher is drained — an outliving queued callback never frees
+        # the launch's capacity early.
+        ref = None
+        if lease is not None:
+            ref = lease.retain()
+        if _put_drop_oldest(dispatcher.events, (item_context, dict(payload), ref)):
             queued = True
         else:
+            if ref is not None:
+                with suppress(Exception):
+                    ref.release()
             logger.debug(
                 "plugin stream hook queue full after drop-oldest: %s callback=%s",
                 hook_name, _callback_name(dispatcher.callback),

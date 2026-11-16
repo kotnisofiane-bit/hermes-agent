@@ -815,10 +815,11 @@ async def test_b2b_proposal_post_replays_durable_attempt_before_readiness_guard(
 @pytest.mark.parametrize("when", ["before_prepare", "during_prepare"])
 async def test_b2b_proposal_post_refuses_429_when_capacity_full(
         tmp_path, monkeypatch, opened, when):
-    """Concurrency-cap race: the cap is checked BEFORE the native
-    preparation AND again after it. A full adapter must 429 (Retry-After)
-    whether capacity was exhausted before POST or mid-preparation — with
-    zero durable writes and without ever creating an agent or run."""
+    """Capacity race: a NEW attempt reserves its ONE unit on the shared
+    per-home ledger BEFORE preparation. A home already full at POST gets the
+    limiter's exact 429 (Retry-After) with zero durable writes and no agent
+    or run. Capacity that fills MID-preparation is never charged back to the
+    holder — its reserved unit is irrevocable, the launch still admits."""
     from gateway.platforms import api_server_b2b_execution as b2b_exec
     from gateway.platforms import api_server_b2b_context as b2b_ctx
 
@@ -832,7 +833,17 @@ async def test_b2b_proposal_post_refuses_429_when_capacity_full(
             b2b_exec, "b2b_execution_inputs_ready", lambda *a, **k: True)
         monkeypatch.setattr(
             b2b_exec, "b2b_execution_unavailable_code", lambda *a, **k: None)
-        monkeypatch.setattr(b2b, "_spawn_run", _tripwire("b2b._spawn_run"))
+        spawned = []
+
+        async def _spawn(adapter, request, *, cap, resolved, session_id,
+                         run_id, profile):
+            spawned.append(run_id)
+            return SimpleNamespace(done=lambda: True)
+
+        if when == "before_prepare":
+            monkeypatch.setattr(b2b, "_spawn_run", _tripwire("b2b._spawn_run"))
+        else:
+            monkeypatch.setattr(b2b, "_spawn_run", _spawn)
         monkeypatch.setattr(
             adapter, "_create_agent", _tripwire("_create_agent"))
 
@@ -842,7 +853,8 @@ async def test_b2b_proposal_post_refuses_429_when_capacity_full(
             prepare_calls.append(cap)
             if when == "during_prepare":
                 # A competing admission filled the last slot while this
-                # preparation ran — the post-prepare cap check must catch it.
+                # preparation ran — the holder's own reserved unit is never
+                # charged back to it; the launch still admits.
                 adapter._inflight_agent_runs = 1
             return SimpleNamespace(
                 cap=cap, assert_current=lambda c: None,
@@ -865,20 +877,26 @@ async def test_b2b_proposal_post_refuses_429_when_capacity_full(
                 headers={"Authorization": f"Bearer {_API_KEY}",
                          "Idempotency-Key": lane.attempt_id})
             payload = await resp.json()
-            assert resp.status == 429, payload
-            assert resp.headers.get("Retry-After") == "1"
-            # OpenAI-style error envelope: {"error": {..., "code": ...}}.
-            assert payload["error"]["code"] == "rate_limit_exceeded"
+            if when == "before_prepare":
+                assert resp.status == 429, payload
+                assert resp.headers.get("Retry-After") == "1"
+                # OpenAI-style error envelope: {"error": {..., "code": ...}}.
+                assert payload["error"]["code"] == "rate_limit_exceeded"
+            else:
+                assert resp.status == 200, payload
+                assert payload["status"] == "admitted"
 
         if when == "before_prepare":
             assert prepare_calls == []
+            assert adapter._session_db.get_session(
+                lane.session_id) == session_before
+            assert _store_counts(
+                adapter._run_idempotency_store) == counts_before
+            assert (adapter._run_idempotency_store._conn.total_changes
+                    == changes_before)
         else:
             assert len(prepare_calls) == 1
-        assert adapter._session_db.get_session(
-            lane.session_id) == session_before
-        assert _store_counts(adapter._run_idempotency_store) == counts_before
-        assert (adapter._run_idempotency_store._conn.total_changes
-                == changes_before)
+            assert len(spawned) == 1
     finally:
         lane.source.stop()
 

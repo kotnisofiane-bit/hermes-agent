@@ -54,8 +54,9 @@ only inside the admitted worker's real `pre_llm_call` hook.
 Installed configuration, plugin presence, valid schema hashes and an inert
 constructor remain preparation, not evidence of readiness. A lane without a
 current mission-scoped proof reports `not-ready` with a typed code
-(`execution_inputs_unavailable`, `c1_producer_unavailable`, or
-`c1_context_required`) — health evaluation performs no plugin discovery or
+(`execution_inputs_unavailable`, `c1_producer_unavailable`,
+`c1_context_required`, or `capacity_exhausted`) — health evaluation performs
+no plugin discovery or
 probe and cannot leak ambient execution state. A missing, crossed, stale,
 future-dated, late or otherwise unqualified source fails closed with
 `503 execution_unavailable` before admission. That refusal covers NEW
@@ -84,8 +85,15 @@ admission. Their short expiry does not govern preparation or publication after
 admission. Source authority is renewed by `before_provider`; the OC observation
 bound is never renewed. Typed preparation refusals reach the durable attempt
 classification without being replaced by a fixed `context_unavailable` reason.
-New attempts check capacity before native preparation and again afterwards,
-without reserving a slot; durable replay keeps its existing bypass.
+New attempts reserve exactly ONE unit on their own canonical home's shared
+work ledger — the same per-home accounting the run limiter reads — before
+the first native read, and hold it until the last host-created worker
+actually exits. A saturated home refuses with the limiter's exact
+`429 rate_limit_exceeded` (`Retry-After: 1`), never a preparation-specific
+refusal, and a preparation timeout still answers `503 execution_unavailable`
+while the abandoned worker keeps the unit until it exits. Health reports a
+saturated lane `capacity_exhausted` with `producer_available: false`.
+Durable replay keeps its existing bypass — it never touches the ledger.
 
 `/1` OC receipts and view/capture instants are never
 source observation and refuse as `context_oc_unqualified`. Preparation also

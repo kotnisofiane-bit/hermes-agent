@@ -211,14 +211,18 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
         return {"b2b_execution": "not-configured", "b2b_execution_code": None,
                 "b2b_execution_profiles": {}}
     # Fail-closed ordering: a preparation hole beats a missing producer, a
-    # missing producer beats "no current mission proof" — health carries no
-    # capability binding, so ``ready``/``None`` codes are unreachable here by
-    # construction (no source/model probe is performed either).
+    # missing producer beats "no current mission proof", which beats a full
+    # but otherwise healthy lane — health carries no capability binding, so
+    # ``ready``/``None`` codes are unreachable here by construction (no
+    # source/model probe is performed either). ``capacity_exhausted`` comes
+    # from the SHARED per-home work ledger — a transient state, hence least
+    # severe.
     severity = {"execution_inputs_unavailable": 0, "c1_producer_unavailable": 1,
-                "c1_context_required": 2}
+                "c1_context_required": 2, "capacity_exhausted": 3}
     profiles: Dict[str, Any] = {}
     for name, entry in state.config.profiles.items():
         code = "execution_inputs_unavailable"
+        available = None
         try:
             # Every profile is judged under ITS OWN home — including
             # ``default``, which must resolve to the canonical default home
@@ -231,19 +235,29 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
                 from agent.b2b_execution import _execution_var
                 token = _execution_var.set(None)
                 try:
-                    from gateway.run import _load_gateway_config
-                    config = _load_gateway_config()
-                    projects = entry.get("projects") or {}
-                    if projects:
-                        code = min(
-                            (b2b_execution_unavailable_code(project, config) or "ready"
-                             for project in projects.values()),
-                            key=lambda c: severity.get(c, 3))
+                    from gateway.platforms.api_server_capacity import capacity_saturated
+                    from hermes_constants import hermes_home_key
+                    available = not capacity_saturated(
+                        adapter, home_key=hermes_home_key())
+                    if not available:
+                        code = "capacity_exhausted"
+                    else:
+                        from gateway.run import _load_gateway_config
+                        config = _load_gateway_config()
+                        projects = entry.get("projects") or {}
+                        if projects:
+                            code = min(
+                                (b2b_execution_unavailable_code(project, config) or "ready"
+                                 for project in projects.values()),
+                                key=lambda c: severity.get(c, 3))
                 finally:
                     _execution_var.reset(token)
         except Exception:
             code = "execution_inputs_unavailable"
+            available = None
         profiles[name] = {"state": "not-ready", "code": code}
+        if available is False:
+            profiles[name]["producer_available"] = False
     aggregate = min((p["code"] for p in profiles.values()),
                     key=lambda c: severity.get(c, 3),
                     default="execution_inputs_unavailable")
@@ -367,7 +381,9 @@ async def construct_run_agent(adapter: Any, run: Any, construct_agent: Callable[
         from contextvars import copy_context
         from gateway.platforms.api_server_runs import _submit_api_worker
         ctor_context = copy_context()
-        return await _submit_api_worker(loop, lambda: ctor_context.run(construct_agent))
+        return await _submit_api_worker(
+            loop, lambda: ctor_context.run(construct_agent),
+            work_lease=getattr(getattr(cap, "sink", None), "_work_lease", None))
     finally:
         reset_execution(cap_token)
 
@@ -488,9 +504,11 @@ async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[s
             # The rechecker runs in the copied profile/capability scope; original context stays immutable.
             # Bounded like the provider-boundary C1s: a blocking callback must
             # refuse on the prospective before_seal window, never hang sealing.
-            fresh = await asyncio.to_thread(
+            from gateway.platforms.api_server_capacity import lease_to_thread
+            fresh = await lease_to_thread(
                 recheck_context, cap, receipt,
-                deadline=sink.seal_recheck_deadline())
+                deadline=sink.seal_recheck_deadline(),
+                work_lease=getattr(sink, "_work_lease", None))
             source = await sink.resolve_before_seal()
             if source is None:
                 return blocked("source_before_seal_denied")
