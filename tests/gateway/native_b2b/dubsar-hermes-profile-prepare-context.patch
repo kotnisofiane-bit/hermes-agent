@@ -1,0 +1,93 @@
+# Test-only reconstruction for the Hermes native B2B lane (lot b2b-l13-p2v).
+# Registers the producer plugin prepare_context hook on dubsar-hermes-profile
+# @ 05d7394c78f9761f1d4c6f2d4805e6e9a0042e18. Rebuilt from the pinned clone;
+# NO equality with any external/historical patch is claimed or certified.
+# Apply-only artifact: never push to dubsar-hermes-profile.
+diff --git a/plugins/dubsar-agent-context/dubsar_agent_context/b2b_runtime.py b/plugins/dubsar-agent-context/dubsar_agent_context/b2b_runtime.py
+index 565b164..2bc5741 100644
+--- a/plugins/dubsar-agent-context/dubsar_agent_context/b2b_runtime.py
++++ b/plugins/dubsar-agent-context/dubsar_agent_context/b2b_runtime.py
+@@ -198,3 +198,32 @@ def bound_context(
+             receipt.rendered != rendered.encode("utf-8")):
+         raise ConfigError("b2b_context_receipt")
+     return view, rendered
++
++
++def prepare_context(runtime: RuntimeAdapter, *, execution: Any) -> dict[str, Any]:
++    """Bounded admission preparation for one bound execution.
++
++    Stamps the source configuration into ``bound``, builds the native view
++    once, and returns a revalidation closure the admission boundary calls
++    before trusting the preparation. Nothing is published and no context
++    recheck is registered here: publication stays with ``bound_context``.
++    """
++    host = _host()
++    if host.current_execution() is not execution:
++        raise ConfigError("b2b_capability")
++    entry = execution.policy_get("project")
++    bound = RuntimeAdapter.for_bound_execution(runtime, execution, entry)
++    stamp = bound._bound_stamp
++
++    def validate_configuration() -> bool:
++        fresh = RuntimeAdapter.for_bound_execution(runtime, execution, entry)
++        if fresh._bound_stamp != stamp:
++            raise ConfigError("b2b_source_configuration_changed")
++        return True
++
++    view, rendered = build_agent_context_view_v2(
++        bound, preserve_native_oc_receipt=True,
++        include_automation_results=bound._bound_include_automation_results)
++    validate_configuration()
++    return {"view": view, "rendered": rendered,
++            "validate_configuration": validate_configuration}
+diff --git a/plugins/dubsar-agent-context/dubsar_agent_context/plugin.py b/plugins/dubsar-agent-context/dubsar_agent_context/plugin.py
+index 72b81ae..5ff21cd 100644
+--- a/plugins/dubsar-agent-context/dubsar_agent_context/plugin.py
++++ b/plugins/dubsar-agent-context/dubsar_agent_context/plugin.py
+@@ -8,7 +8,7 @@ from typing import Any, Callable, TYPE_CHECKING
+ 
+ from .assembly import build_agent_context_view
+ from .assembly_v2 import build_agent_context_view_v2
+-from .b2b_runtime import bound_context
++from .b2b_runtime import bound_context, prepare_context
+ from .history_guard import ConversationHistoryGuard
+ from .memory_v2 import MemoryPlaneV2Client, UrllibV2Transport, V2_READ_VERBS
+ from .runtime import RuntimeAdapter
+@@ -98,6 +98,11 @@ def register(
+         return {"context": rendered}
+ 
+     ctx.register_hook("pre_llm_call", on_pre_llm_call)
++
++    def on_prepare_context(*, execution: Any) -> dict[str, Any]:
++        return prepare_context(runtime, execution=execution)
++
++    ctx.register_hook("prepare_context", on_prepare_context)
+     if runtime.readonly:
+         read_tools = {
+             "memory_plane_" + verb.replace("-", "_") for verb in V2_READ_VERBS
+diff --git a/plugins/dubsar-agent-context/hermes-plugin.json b/plugins/dubsar-agent-context/hermes-plugin.json
+index f2aa8e6..b795a86 100644
+--- a/plugins/dubsar-agent-context/hermes-plugin.json
++++ b/plugins/dubsar-agent-context/hermes-plugin.json
+@@ -4,7 +4,8 @@
+   "entrypoint": "dubsar_agent_context.plugin",
+   "discovery_manifest": "plugin.yaml",
+   "hooks": [
+-    "pre_llm_call"
++    "pre_llm_call",
++    "prepare_context"
+   ],
+   "middleware": [
+     "llm_execution"
+diff --git a/plugins/dubsar-agent-context/plugin.yaml b/plugins/dubsar-agent-context/plugin.yaml
+index f40edd4..8267513 100644
+--- a/plugins/dubsar-agent-context/plugin.yaml
++++ b/plugins/dubsar-agent-context/plugin.yaml
+@@ -3,6 +3,7 @@ version: 0.1.0
+ description: Profile-scoped AgentContextView and Memory Plane v2 tools for Hub, CI, and Deploy.
+ provides_hooks:
+   - pre_llm_call
++  - prepare_context
+ provides_middleware:
+   - llm_execution
+ provides_tools:

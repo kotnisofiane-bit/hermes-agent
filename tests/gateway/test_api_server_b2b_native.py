@@ -9,7 +9,10 @@ child, Portal browser proof, or qualification of deployment/network policy.
 
 Select explicitly with --include-integration. B2B_TEST_MY_WORK_ROOT must contain
 .p2-native-runtime.json naming explicit mywork/contracts/profile/node/pg_bin and
-postgres_url. No runtime dependency is downloaded by the tests.
+postgres_url — both profile keys point at UNMODIFIED 05d7394c checkouts; the
+session fixture materializes the patched and unpatched copies itself via
+tests/gateway/native_b2b/profile_fixture.py. No runtime dependency is
+downloaded by the tests.
 """
 from __future__ import annotations
 
@@ -38,6 +41,7 @@ import yaml
 from agent.b2b_execution import canonical_json, mission_prompt
 from gateway.platforms import api_server_b2b as b2b
 from tests.gateway.b2b_process_harness import extract_contract_root, make_keypair, _sig
+from tests.gateway.native_b2b.profile_fixture import materialize_test_profile
 
 pytestmark = pytest.mark.integration
 HERE = Path(__file__).parent / "native_b2b"
@@ -380,11 +384,29 @@ class NativeLane:
                         self.database], timeout=30, env=self.env, check=True)
 
 
-@pytest.fixture
-def native_lane(tmp_path, request):
+@pytest.fixture(scope="session")
+def native_runtime(tmp_path_factory):
     root = os.environ.get("B2B_TEST_MY_WORK_ROOT")
-    assert root, "select this integration suite with B2B_TEST_MY_WORK_ROOT provisioned"
+    if not root:
+        pytest.skip("B2B_TEST_MY_WORK_ROOT is not provisioned; "
+                    "see tests/gateway/native_b2b/README.md")
     runtime = json.loads((Path(root) / ".p2-native-runtime.json").read_text(encoding="utf-8"))
+    # The runtime keys name UNMODIFIED 05d7394c checkouts (one pinned source
+    # suffices: unpatched_profile falls back to profile). The lane
+    # materializes its own copies: a pinned-clean unpatched one and the
+    # SHA-256-verified patched one — no hand-applied source is ever trusted.
+    work = tmp_path_factory.mktemp("b2b-native-profiles")
+    runtime["unpatched_profile"] = str(materialize_test_profile(
+        runtime.get("unpatched_profile", runtime["profile"]),
+        work / "profile-unpatched", patched=False))
+    runtime["profile"] = str(materialize_test_profile(
+        runtime["profile"], work / "profile-patched", patched=True))
+    return runtime
+
+
+@pytest.fixture
+def native_lane(tmp_path, request, native_runtime):
+    runtime = native_runtime
     # Keep AF_UNIX paths below Linux's 108-byte limit.
     import tempfile
     short = Path(tempfile.mkdtemp(prefix="c1-", dir=os.environ.get("TMPDIR")))

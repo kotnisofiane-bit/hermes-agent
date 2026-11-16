@@ -211,6 +211,7 @@ def reset_for_tests() -> None:
 def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
     """Normalise ``hooks:`` into specs; malformed entries warn-and-skip, never raise."""
     from hermes_cli.plugins import SHELL_UNSUPPORTED_HOOKS, VALID_HOOKS
+    supported_hooks = sorted(VALID_HOOKS - SHELL_UNSUPPORTED_HOOKS)
     if not isinstance(hooks_cfg, dict):
         return []
     specs: List[ShellHookSpec] = []
@@ -222,11 +223,11 @@ def _parse_hooks_block(hooks_cfg: Any) -> List[ShellHookSpec]:
                            "so this registration is refused rather than silently ignored", event_name)
             continue
         if event_name not in VALID_HOOKS:
-            suggestion = difflib.get_close_matches(str(event_name), VALID_HOOKS, n=1, cutoff=0.6)
+            suggestion = difflib.get_close_matches(str(event_name), supported_hooks, n=1, cutoff=0.6)
             if suggestion:
                 logger.warning("unknown hook event %r in hooks: config — did you mean %r?", event_name, suggestion[0])
             else:
-                logger.warning("unknown hook event %r in hooks: config (valid: %s)", event_name, ", ".join(sorted(VALID_HOOKS)))
+                logger.warning("unknown hook event %r in hooks: config (valid: %s)", event_name, ", ".join(supported_hooks))
             continue
         if entries is None:
             continue

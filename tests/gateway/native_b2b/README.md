@@ -10,8 +10,27 @@ tests — the tests download nothing and spawn no package manager.
 |---|---|---|
 | My Work | `mywork` | `526f2c76` (`dubsar-my-work`, deps linked per its `deps.lock.json`) |
 | Contracts | `contracts` | `9044b1b1` (`dubsar-contracts`; the OC kernel fixture `git rev-parse`-verifies this exact HEAD via `OC_CONTRACTS_CHECKOUT`) |
-| Producer profile | `profile` | `05d7394c` + prepare-context patch (`dubsar-hermes-profile`; supplies `plugins/dubsar-agent-context`, `profile-mappings.json`, the `2.r2` contract root). The base pin does NOT register `prepare_context`: every native positive (admission/publication/drift) needs the P3 patch applied to the checkout used for tests — never pushed. |
-| Unpatched producer profile | `unpatched_profile` | `05d7394c` unmodified (`dubsar-hermes-profile`; used only by the `legacy_plugin` negative case, which must 503 like `no_plugin`) |
+| Producer profile | `profile` | `05d7394c` UNMODIFIED (`dubsar-hermes-profile`; supplies `plugins/dubsar-agent-context`, `profile-mappings.json`, the `2.r2` contract root). The pin does NOT register `prepare_context`: the test-only patch below is applied by `profile_fixture.materialize_test_profile` to a local clone at session-fixture time — never to this source and never pushed. |
+| Unpatched producer profile | `unpatched_profile` | `05d7394c` UNMODIFIED (`dubsar-hermes-profile`; re-materialized clean by the same fixture and used only by the `legacy_plugin` negative case, which must 503 like `no_plugin`) |
+
+## Versioned prepare-context patch
+
+`dubsar-hermes-profile-prepare-context.patch` is a test-only reconstruction
+authored for this harness: it registers `prepare_context` on the pinned
+profile plugin (`b2b_runtime.prepare_context`, the `register()` hook wiring,
+and both manifest hook lists). It does **not** claim or certify equality
+with any historical patch produced outside this lot. `profile_fixture.py`
+verifies the file's SHA-256 (`PATCH_SHA256`) before every `git apply`, so a
+tampered or regenerated file fails before any clone/apply side effect
+(`PATCH_SHA256` =
+`a5d90e16b0af9012a1db8bff21b6f80bc461f343f6db1ec4b2f43b063bec6fff`).
+The shipped (unpatched) lane keeps returning 503 until P3 lands the real
+`prepare_context` registration in `dubsar-hermes-profile`.
+
+`unpatched_profile` in the runtime JSON is optional: when absent, the
+`profile` source is reused (both keys must name UNMODIFIED pins). When
+`B2B_TEST_MY_WORK_ROOT` is unset the whole suite skips with the explicit
+reason "B2B_TEST_MY_WORK_ROOT is not provisioned" — it never errors.
 
 ## Runtime file
 
@@ -20,8 +39,8 @@ tests — the tests download nothing and spawn no package manager.
 ```json
 {"mywork": "<abs path to the pinned My Work checkout>",
  "contracts": "<abs path to dubsar-contracts @ 9044b1b1>",
- "profile": "<abs path to dubsar-hermes-profile @ 05d7394c WITH the prepare_context patch applied>",
- "unpatched_profile": "<abs path to dubsar-hermes-profile @ 05d7394c unmodified>",
+ "profile": "<abs path to dubsar-hermes-profile @ 05d7394c unmodified>",
+ "unpatched_profile": "<abs path to a second dubsar-hermes-profile @ 05d7394c unmodified>",
  "node": "<abs path to a Node >= 20 executable>",
  "pg_bin": "<dir containing createdb/dropdb binaries>",
  "postgres_url": "<admin DSN, e.g. postgresql://postgres@127.0.0.1:PORT/postgres>"}
