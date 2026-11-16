@@ -867,7 +867,8 @@ async def test_b2b_proposal_post_refuses_429_when_capacity_full(
             payload = await resp.json()
             assert resp.status == 429, payload
             assert resp.headers.get("Retry-After") == "1"
-            assert payload.get("code") == "rate_limit_exceeded"
+            # OpenAI-style error envelope: {"error": {..., "code": ...}}.
+            assert payload["error"]["code"] == "rate_limit_exceeded"
 
         if when == "before_prepare":
             assert prepare_calls == []
