@@ -17,7 +17,7 @@ import subprocess
 
 PROFILE_COMMIT = "05d7394c78f9761f1d4c6f2d4805e6e9a0042e18"
 PATCH_FILE = Path(__file__).with_name("dubsar-hermes-profile-prepare-context.patch")
-PATCH_SHA256 = "a5d90e16b0af9012a1db8bff21b6f80bc461f343f6db1ec4b2f43b063bec6fff"
+PATCH_SHA256 = "0d629ee15c0b2a37c02e831b803efb7393e3ef97e5efcfd4c47457340216c611"
 _GIT_TIMEOUT_S = 60
 
 

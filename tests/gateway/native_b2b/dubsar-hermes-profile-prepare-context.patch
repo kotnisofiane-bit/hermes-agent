@@ -1,13 +1,17 @@
-# Test-only reconstruction for the Hermes native B2B lane (lot b2b-l13-p2v).
+# Test-only reconstruction for the Hermes native B2B lane (lot b2b-l13-p2v,
+# corrected by lot b2b-l13-p2w: the validate_configuration closure answers
+# False on source-configuration drift so the gateway classifies the durable
+# cause as policy_changed — a bind failure still raises ConfigError and
+# classifies as context_unavailable).
 # Registers the producer plugin prepare_context hook on dubsar-hermes-profile
 # @ 05d7394c78f9761f1d4c6f2d4805e6e9a0042e18. Rebuilt from the pinned clone;
 # NO equality with any external/historical patch is claimed or certified.
 # Apply-only artifact: never push to dubsar-hermes-profile.
 diff --git a/plugins/dubsar-agent-context/dubsar_agent_context/b2b_runtime.py b/plugins/dubsar-agent-context/dubsar_agent_context/b2b_runtime.py
-index 565b164..2bc5741 100644
+index 565b164..79cc2f7 100644
 --- a/plugins/dubsar-agent-context/dubsar_agent_context/b2b_runtime.py
 +++ b/plugins/dubsar-agent-context/dubsar_agent_context/b2b_runtime.py
-@@ -198,3 +198,32 @@ def bound_context(
+@@ -198,3 +198,33 @@ def bound_context(
              receipt.rendered != rendered.encode("utf-8")):
          raise ConfigError("b2b_context_receipt")
      return view, rendered
@@ -29,10 +33,11 @@ index 565b164..2bc5741 100644
 +    stamp = bound._bound_stamp
 +
 +    def validate_configuration() -> bool:
++        # A changed source configuration yields a changed stamp: answer
++        # False so the caller classifies the drift as policy-changed; a
++        # bind failure still raises and classifies as context_unavailable.
 +        fresh = RuntimeAdapter.for_bound_execution(runtime, execution, entry)
-+        if fresh._bound_stamp != stamp:
-+            raise ConfigError("b2b_source_configuration_changed")
-+        return True
++        return fresh._bound_stamp == stamp
 +
 +    view, rendered = build_agent_context_view_v2(
 +        bound, preserve_native_oc_receipt=True,

@@ -23,7 +23,7 @@ with any historical patch produced outside this lot. `profile_fixture.py`
 verifies the file's SHA-256 (`PATCH_SHA256`) before every `git apply`, so a
 tampered or regenerated file fails before any clone/apply side effect
 (`PATCH_SHA256` =
-`a5d90e16b0af9012a1db8bff21b6f80bc461f343f6db1ec4b2f43b063bec6fff`).
+`0d629ee15c0b2a37c02e831b803efb7393e3ef97e5efcfd4c47457340216c611`).
 The shipped (unpatched) lane keeps returning 503 until P3 lands the real
 `prepare_context` registration in `dubsar-hermes-profile`.
 
