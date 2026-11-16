@@ -184,13 +184,16 @@ _DEFAULT_PAYLOADS = {
 
 def _cmd_test(args) -> None:
     from hermes_cli.config import load_config
-    from hermes_cli.plugins import VALID_HOOKS
+    from hermes_cli.plugins import SHELL_UNSUPPORTED_HOOKS, VALID_HOOKS
     from agent import shell_hooks
 
     event = args.event
+    if event in SHELL_UNSUPPORTED_HOOKS:
+        print(f"Event '{event}' requires a Python plugin registered via PluginContext.register_hook")
+        return
     if event not in VALID_HOOKS:
         print(f"Unknown event: {event!r}")
-        print(f"Valid events: {', '.join(sorted(VALID_HOOKS))}")
+        print(f"Valid events: {', '.join(sorted(VALID_HOOKS - SHELL_UNSUPPORTED_HOOKS))}")
         return
 
     # Synthetic kwargs merged with --for-tool (overrides tool_name) and --payload-file (extra kwargs).

@@ -156,7 +156,7 @@ def reset_for_tests() -> None:
 
 
 def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
-    from hermes_cli.plugins import VALID_HOOKS
+    from hermes_cli.plugins import PLUGIN_ONLY_HOOKS, VALID_HOOKS
 
     def warn(msg: str, *args: Any) -> None:
         logger.warning("hooks.outbound[%d]" + msg, index, *args)
@@ -175,11 +175,17 @@ def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
     if url.lower().startswith("http://"):
         warn(".url uses plain http:// — payloads (including tool inputs) travel unencrypted. Prefer https.")
     events_raw = raw.get("events")
-    valid_list = ", ".join(sorted(VALID_HOOKS))
+    valid_list = ", ".join(sorted(VALID_HOOKS - PLUGIN_ONLY_HOOKS))
     if not isinstance(events_raw, list) or not events_raw:
         warn(" needs a non-empty 'events' list (valid: %s)", valid_list)
         return None
-    events: List[str] = [ev for ev in events_raw if ev in VALID_HOOKS]
+    if any(ev in PLUGIN_ONLY_HOOKS for ev in events_raw):
+        logger.error(
+            "hooks.outbound[%d]: prepare_context requires a Python plugin "
+            "registered via PluginContext.register_hook; target rejected",
+            index)
+        return None
+    events: List[str] = [ev for ev in events_raw if ev in VALID_HOOKS and ev not in PLUGIN_ONLY_HOOKS]
     for ev in events_raw:
         if ev not in VALID_HOOKS:
             warn(": unknown event %r ignored (valid: %s)", ev, valid_list)

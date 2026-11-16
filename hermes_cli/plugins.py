@@ -205,12 +205,18 @@ VALID_HOOKS: Set[str] = {
     "prepare_context",
 }
 
+# Hooks only a Python plugin may supply through PluginContext.register_hook: they carry
+# mission-scoped capabilities no configured shell/outbound surface may ever receive. VALID_HOOKS
+# keeps admitting the name so register_hook accepts it; every non-plugin entry point refuses it.
+PLUGIN_ONLY_HOOKS: Set[str] = {
+    "prepare_context",
+}
+
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
     "transform_api_error_classification",
-    "prepare_context",
-}
+} | PLUGIN_ONLY_HOOKS
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 _UNSET = object()
@@ -916,7 +922,9 @@ class PluginContext:
 
     def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
         """Register a lifecycle hook callback (unknown names warn but are still stored)."""
-        return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
+        handle = self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
+        handle.callback = callback
+        return handle
 
     def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
         """Register behavior-changing middleware (request kinds rewrite the payload, execution kinds

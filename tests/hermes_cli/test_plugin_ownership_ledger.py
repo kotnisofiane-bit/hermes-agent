@@ -1362,3 +1362,81 @@ def test_on_unload_exception_does_not_block_other_teardown():
     # Reverse acquisition order, exception isolated.
     assert order == ["last", "boom", "first"]
     assert "boom_probe" not in manager._ownership_ledger
+
+
+def test_context_provider_selects_only_plugin_owned_prepare_with_same_owner_publisher(
+        monkeypatch):
+    """``api_server_b2b_context._context_provider`` admits exactly one
+    ``PluginContext.register_hook`` ``prepare_context`` whose SAME plugin
+    also registered ``pre_llm_call``. Raw ``manager._hooks`` entries (the
+    shape a configured outbound webhook or any non-plugin source takes)
+    never qualify — alone, dressed up with forged registration attributes,
+    or mixed beside the real callback — and disposing either leg, or
+    unloading the plugin, closes the provider again."""
+    from gateway.platforms.api_server_b2b_context import _context_provider
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    manager = PluginManager()
+    monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.discover_plugins", lambda *a, **k: None)
+    context_a = PluginContext(PluginManifest(name="ctx_provider_a"), manager)
+    context_b = PluginContext(PluginManifest(name="ctx_provider_b"), manager)
+
+    def raw_prepare(**kwargs):
+        raise AssertionError("a raw _hooks entry must never be selected")
+
+    # Forged plugin-registration-looking attributes do not launder a
+    # config-owned entry into a plugin-owned one.
+    raw_prepare.plugin_key = "ctx_provider_a"
+    raw_prepare.callback = raw_prepare
+    manager._hooks.setdefault("prepare_context", []).append(raw_prepare)
+    try:
+        assert _context_provider() is None
+
+        def prepare(**kwargs):
+            return None
+
+        def publish(**kwargs):
+            return None
+
+        prepare_handle = context_a.register_hook("prepare_context", prepare)
+        try:
+            # A plugin prepare alone is not a producer — no publisher yet.
+            assert _context_provider() is None
+            # A publisher owned by a DIFFERENT plugin does not qualify.
+            foreign_handle = context_b.register_hook("pre_llm_call", publish)
+            try:
+                assert _context_provider() is None
+            finally:
+                foreign_handle.dispose()
+            publisher_handle = context_a.register_hook("pre_llm_call", publish)
+            try:
+                found = _context_provider()
+                assert found is not None
+                assert found[0] is manager and found[1] is prepare
+                # The raw entry does not count toward ambiguity either.
+                manager._hooks["prepare_context"].append(raw_prepare)
+                assert _context_provider() == found
+                manager._hooks["prepare_context"].remove(raw_prepare)
+                # Disposing the publisher closes the provider again.
+                publisher_handle.dispose()
+                assert _context_provider() is None
+                publisher_handle = context_a.register_hook(
+                    "pre_llm_call", publish)
+                assert _context_provider() is not None
+            finally:
+                publisher_handle.dispose()
+            # With the prepare registration gone, nothing is selectable.
+            prepare_handle.dispose()
+            assert _context_provider() is None
+            prepare_handle = context_a.register_hook("prepare_context", prepare)
+            context_a.register_hook("pre_llm_call", publish)
+            # Unloading the plugin drops both legs: provider closed.
+            assert manager.unload("ctx_provider_a") is True
+            assert _context_provider() is None
+        finally:
+            if prepare_handle.active:
+                prepare_handle.dispose()
+    finally:
+        manager.unload()

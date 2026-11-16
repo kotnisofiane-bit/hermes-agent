@@ -522,6 +522,18 @@ class PluginDispatchMixin:
         """Return a stable snapshot of callbacks registered for a hook."""
         return tuple(self._hooks.get(hook_name, ()))
 
+    def iter_plugin_hook_callbacks(self, hook_name: str) -> tuple[tuple[str, Callable], ...]:
+        """Snapshot active hooks registered through PluginContext, with their owners."""
+        callbacks = self.iter_hook_callbacks(hook_name)
+        return tuple(
+            (registration.plugin_key, registration.callback)
+            for owned in self._ownership_ledger.values()
+            for registration in owned
+            if registration.active and registration.kind == "hook"
+            and registration.key == hook_name and callable(registration.callback)
+            and any(callback is registration.callback for callback in callbacks)
+        )
+
     def render_system_prompt_sections(
         self, session_info: Mapping[str, Any]
     ) -> List[RenderedPluginSystemPromptSection]:

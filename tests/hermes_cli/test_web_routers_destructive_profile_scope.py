@@ -457,3 +457,38 @@ def test_memory_provider_setup_runs_in_the_named_profiles_home(client, homes, mo
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["home"] == str(homes["worker_beta"])
+
+
+# --- plugin-only hooks can never be armed as shell hooks -------------------
+
+@pytest.mark.parametrize("event", [
+    "prepare_context", "transform_api_error_classification"])
+def test_plugin_only_hook_event_is_refused_at_configuration(
+        client, homes, event):
+    """``prepare_context`` (and the other shell-unsupported events) can only
+    be produced by a Python plugin through ``PluginContext.register_hook`` —
+    the dashboard refuses to write a shell hook for them (400, explicit
+    message), and the refusal happens BEFORE any config/allowlist write."""
+    resp = client.post(
+        "/api/ops/hooks?profile=worker_beta",
+        json={"event": event, "command": "/bin/armed", "approve": True})
+
+    assert resp.status_code == 400, resp.text
+    detail = resp.json()["detail"]
+    assert "Python plugin" in detail
+    assert "PluginContext.register_hook" in detail
+    for home in homes.values():
+        assert _hooks(home) == {"pre_tool_call": [{"command": "/bin/true"}]}
+        assert not (home / "shell-hooks-allowlist.json").exists()
+
+
+def test_hooks_form_does_not_advertise_plugin_only_events(client, homes):
+    """The valid-event list the form offers is shell-usable only: plugin-only
+    hooks are not advertised (the user could only ever write dead config)."""
+    resp = client.get("/api/ops/hooks?profile=worker_beta")
+
+    assert resp.status_code == 200, resp.text
+    valid = resp.json()["valid_events"]
+    assert "pre_tool_call" in valid
+    assert "prepare_context" not in valid
+    assert "transform_api_error_classification" not in valid

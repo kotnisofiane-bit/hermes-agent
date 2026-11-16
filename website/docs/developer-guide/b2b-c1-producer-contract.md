@@ -13,9 +13,19 @@ https://github.com/kotnisofiane-bit/dubsar-platform/pull/120
 The original native evidence below records `dde57dec` and its preceding P2
 implementation. The pass-2 interface now requires a Python `prepare_context`
 hook. The external producer at `dubsar-hermes-profile@05d7394c` does not yet
-register it: admission with that unchanged plugin fails closed. This repository
+register it: admission with that unchanged plugin fails closed (`503
+execution_unavailable`, no durable rows — the native `legacy_plugin` case
+proves exactly this). This repository
 proves the generic contract with an unrelated directory plugin; enabling the
 native producer again requires the separate plugin change, not a core fallback.
+The native positive path therefore runs against a task-local checkout of the
+same pin with the external `prepare_context` patch applied for tests only
+(`unpatched_profile` in `.p2-native-runtime.json` keeps an unmodified copy for
+the negative case). Only a callback registered through
+`PluginContext.register_hook` counts — configured outbound webhooks, shell
+hooks and the dashboard hook form refuse `prepare_context` at configuration,
+and the producer's own plugin must also register `pre_llm_call` under the same
+owner, or admission fails closed before any durable write.
 
 ## Delivery boundary
 
@@ -208,7 +218,7 @@ source-fresh native proof bound to the attempt's own capability can.
 
 ## Recorded verification — 15–16 November 2026 (historical, before pass 2)
 
-Current pass-2 results are recorded in the task report; the counts below
+Current pass-3 results are recorded in the task report and PR description; the counts below
 predate the `prepare_context` interface.
 
 Baseline: `82fee98f75a65fc508d76ef88d31fe0aa4e8a39b`. Resumed work:
@@ -265,8 +275,8 @@ retained in `/srv/dubsar-lots/b2b-l13-p2r/evidence/`; the final task report is
 | 5 — Decisions have evidence | Advanced for context/proposal: exact render, view, digests and fresh rechecks persist with the attempt (`put_context` + `b2b_commit_context` persisted artifacts; typed durable refusal causes reach the durable attempt status; native artifact assertions) |
 | 6 — Approver sees AI inputs | Exact AI input is preserved (`agent/turn_context.py:745-851`; native render equality assertion). The complete approver UI and model/token display remain outside P2 |
 | 9 — One interchangeable model gateway | Existing pinned runtime and refusal of alternate routes preserved (`api_server_b2b_execution.py:247-334`; `agent/b2b_execution.py:1102-1136`). Installed G2 routing is not qualified here |
-| 10 — Chosen model/data only | Synthetic local proof only; host test egress fence (`tests/gateway/native_b2b/host.py:18-32`). Production network isolation and data policy remain P1/P3/P4/P15 requirements |
-| 11 — Claims match code | Health is not mission readiness; real components, doubles, incomplete suites and installation limits are identified above. Pass-2 proof uses an unrelated generic fake plugin; the external native producer's `prepare_context` update is pending |
+| 10 — Chosen model/data only | Configuration rejects `prepare_context` webhooks and shell hooks; owner-aware selection never calls a non-plugin producer. The real HTTP regression proves zero outbound mission payload. Native evidence remains synthetic and local; installed production network isolation remains outside P2. |
+| 11 — Claims match code | Health is not mission readiness. Native tests distinguish the patched test-only external producer (positive path) from unchanged `05d7394c` or no plugin (`503 execution_unavailable`, no durable admission). Real components, doubles and installation limits are explicit; delivery of the external patch belongs to P3. |
 
 Principles 2, 7, 8 and 12 have no changed product surface in P2. Approval,
 global stop, cost tracking and the real Portal journey retain their separate

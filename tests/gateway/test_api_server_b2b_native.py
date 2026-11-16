@@ -274,7 +274,8 @@ class NativeLane:
             home = self.home / "profiles" / name
             (home / "plugins").mkdir(parents=True)
             (home / "plugins/dubsar-agent-context").symlink_to(
-                Path(runtime["profile"]) / "plugins/dubsar-agent-context")
+                Path(runtime["unpatched_profile"] if self.mode == "legacy_plugin"
+                     else runtime["profile"]) / "plugins/dubsar-agent-context")
             settings = {
                 "agent_context_readonly": True, "agent_context_version": "v2.r2",
                 "b2b_context_automation_results": False, "mission_id": logical + "-default",
@@ -402,7 +403,8 @@ def test_native_post_publishes_seals_and_replays_across_profiles(native_lane):
     lane = native_lane
     for profile in ("hub", "ci"):
         status, result = lane.post(profile)
-        assert status == 200, result
+        assert status == 200, (
+            result, "prepare_context plugin patch required for native admission")
         row = lane.wait_attempt(profile)
         assert row["status"] == "proposal_ready", (row, (lane.root / "host.log").read_text(encoding="utf-8")[-8000:])
         replay_status, replay = lane.post(profile)
@@ -457,13 +459,15 @@ def test_native_post_publishes_seals_and_replays_across_profiles(native_lane):
     # Second OC observation between publication and dispatch: the recheck
     # refuses context_stale inside the conversation loop -> run failure.
     ("oc_changed", "failed"),
-    # Rewritten plugin read-port: the live-policy gate inside _matches_source
-    # refuses the before_provider exchange -> source_denied.
-    ("config_changed", "source_denied")], indirect=["native_lane"])
+    # The signed before_provider exchange rewrites the plugin read-port.
+    # _matches_source revalidates the preparation: the plugin raises
+    # b2b_policy_changed, durably classified as policy_changed before dispatch.
+    ("config_changed", "policy_changed")], indirect=["native_lane"])
 def test_native_drift_blocks_dispatch_without_model_calls(native_lane, expected):
     lane = native_lane
     status, result = lane.post("hub")
-    assert status == 200, result
+    assert status == 200, (
+        result, "prepare_context plugin patch required for native admission")
     row = lane.wait_attempt("hub")
     assert row["status"] == expected, (row, (lane.root / "host.log").read_text(encoding="utf-8")[-8000:])
     assert lane.doubles.provider_calls == []
@@ -480,7 +484,12 @@ def test_native_drift_blocks_dispatch_without_model_calls(native_lane, expected)
     assert lane.doubles.provider_calls == []
 
 
-@pytest.mark.parametrize("native_lane", ["no_plugin", "missing", "stale", "crossed", "late"], indirect=True)
+@pytest.mark.parametrize("native_lane", [
+    pytest.param("no_plugin", id="no-plugin-503"),
+    # The shipped producer at 05d7394c does not register prepare_context:
+    # same fail-closed 503 as no plugin at all, zero durable rows.
+    pytest.param("legacy_plugin", id="unchanged-plugin-without-prepare-context-503"),
+    "missing", "stale", "crossed", "late"], indirect=True)
 def test_native_bad_context_never_consumes_admission(native_lane):
     lane = native_lane
     status, result = lane.post()

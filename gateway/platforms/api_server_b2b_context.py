@@ -38,20 +38,28 @@ _SOURCE_OBSERVED_MAX_AGE_MS = 900_000
 
 
 def _context_provider(*, discover: bool = False):
-    """The single registered ``prepare_context`` callback under the CURRENT
-    home's plugin manager — ``(manager, callback)`` or ``None``. Exactly one
-    callable must be registered: zero is "no producer", two or more is
-    ambiguity — both fail closed. Health/diagnostics pass ``discover=False``:
-    plugin ``register()`` may do IO, so a status query must never trigger a
-    load; only bounded preparation may discover."""
+    """The single plugin-owned ``prepare_context`` callback under the CURRENT
+    home's plugin manager — ``(manager, callback)`` or ``None``. Only a
+    callback registered through ``PluginContext.register_hook`` qualifies, and
+    only when the SAME plugin also registered ``pre_llm_call`` (preparer and
+    publisher share one owner). Exactly one owned callable must be registered:
+    zero is "no producer", two or more is ambiguity — both fail closed, and a
+    raw ``manager._hooks`` entry is neither owned nor counted. Health/
+    diagnostics pass ``discover=False``: plugin ``register()`` may do IO, so a
+    status query must never trigger a load; only bounded preparation may
+    discover."""
     from hermes_cli.plugins import discover_plugins, get_plugin_manager
     if discover:
         discover_plugins()
     manager = get_plugin_manager()
-    callbacks = manager.iter_hook_callbacks("prepare_context")
-    if len(callbacks) != 1 or not callable(callbacks[0]):
+    callbacks = manager.iter_plugin_hook_callbacks("prepare_context")
+    if len(callbacks) != 1:
         return None
-    return manager, callbacks[0]
+    owner, prepare = callbacks[0]
+    if not any(plugin == owner for plugin, _ in
+               manager.iter_plugin_hook_callbacks("pre_llm_call")):
+        return None
+    return manager, prepare
 
 
 def producer_available() -> bool:

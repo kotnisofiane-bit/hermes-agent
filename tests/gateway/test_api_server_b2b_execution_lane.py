@@ -1554,6 +1554,89 @@ async def test_launch_prepare_refusal_denies_with_no_writes(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("scenario", [
+    # The producer registers prepare_context but never pre_llm_call: it can
+    # never publish, so no admission is consumed.
+    "missing_publisher",
+    # pre_llm_call registered — but by a DIFFERENT plugin: preparer and
+    # publisher must share one owner.
+    "other_owner_publisher",
+    # A callback appended straight to manager._hooks (the shape a configured
+    # outbound webhook takes): not plugin-owned, never a producer — even when
+    # it would return a fully qualifying preparation.
+    "raw_direct_callback"])
+async def test_launch_refuses_producer_without_plugin_owned_pair(
+        tmp_path, monkeypatch, opened, scenario):
+    """REAL plugin discovery (no stubbed prepare_b2b_context): only a
+    ``prepare_context`` registered through ``PluginContext.register_hook``
+    whose SAME plugin also registered ``pre_llm_call`` may produce. Every
+    other shape refuses 503 execution_unavailable BEFORE admission — no
+    attempt row, no binding, no title, no run."""
+    from tests.gateway import test_api_server_b2b_admission as adm
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    prof = adm._profile_home(tmp_path, monkeypatch, "hub")
+    _write_serving_config(prof)
+    adapter = adm._adapter(tmp_path, monkeypatch, "hub")
+    adapter._session_db = SessionDB(prof / "state.db")
+    opened.extend([adapter._session_db, adapter._run_idempotency_store])
+    lane = _ready_lane(tmp_path)
+    entry = _lane_entry(
+        lane, portal_issuer="portal-hub", hermes_issuer="hermes-hub")
+    session_id = "b2b_" + "b" * 64
+    adapter._session_db.create_session(session_id, "api_server")
+    resolved = _launch_resolved(lane, session_id=session_id)
+    obs = dict(resolved["observation_genesis"])
+    obs["id"], obs["profile"] = session_id, "hub"
+    resolved["observation_genesis"] = obs
+    resolved["session_id"] = session_id
+    resolved["binding_digest"] = session_id[4:]
+    resolved["attempt_id"] = b2b._attempt_id_for(session_id[4:])
+    # The unit view's source_observed_at is a fixed instant; freeze the
+    # source clock so a would-be producer (the RED side) really qualifies —
+    # the refusal must come from ownership, never a stale window.
+    monkeypatch.setattr(
+        b2b_ctx, "time", SimpleNamespace(time=lambda: 1793361605.0))
+
+    if scenario == "raw_direct_callback":
+        from tests.gateway.b2b_process_harness import (
+            UNIT_RENDERED, build_unit_native_oc_view)
+
+        def _raw_prepare(*, execution):
+            return {"view": build_unit_native_oc_view(
+                        execution.policy,
+                        {"mission_source_digest": "c" * 64}, ordered=True),
+                    "rendered": UNIT_RENDERED,
+                    "validate_configuration": lambda: True}
+
+        from hermes_cli.plugins import get_plugin_manager
+        get_plugin_manager()._hooks.setdefault(
+            "prepare_context", []).append(_raw_prepare)
+    else:
+        names = [_FAKE_PLUGIN_NAME]
+        _write_fake_plugin(prof, init=_FAKE_PLUGIN_PREPARE_ONLY_INIT)
+        if scenario == "other_owner_publisher":
+            _write_fake_plugin(prof, name="unitctx-publisher",
+                               init=_FAKE_PLUGIN_PUBLISHER_ONLY_INIT)
+            names.append("unitctx-publisher")
+        _plugin_config(prof, names=tuple(names))
+    for target in ("_spawn_run",):
+        monkeypatch.setattr(b2b, target, _adm_tripwire(target))
+    monkeypatch.setattr(adapter, "_create_agent", _adm_tripwire("_create_agent"))
+    store = adapter._run_idempotency_store
+    before = adm._store_counts(store)
+    response = await b2b._launch_b2b_run(
+        adapter, None, profile="hub", entry=entry, keys=b2b._KeyRing(entry),
+        session_id=session_id, binding_digest=session_id[4:],
+        attempt_id=resolved["attempt_id"], resolved=resolved,
+        store=store, db=adapter._session_db)
+    assert response.status == 503
+    assert json.loads(response.body)["error"] == "execution_unavailable"
+    assert adm._store_counts(store) == before
+    assert adapter._session_db.get_session(session_id)["title"] is None
+    lane.store.close()
+
+
+@pytest.mark.asyncio
 async def test_launch_attaches_preparation_to_winning_cap(
         tmp_path, monkeypatch, opened):
     """UNIT: the SAME cap/sink that survive the durable admit carry the
@@ -1762,6 +1845,19 @@ def register(ctx):
         return {"view": view, "rendered": UNIT_RENDERED,
                 "validate_configuration": validate_configuration}
     ctx.register_hook("prepare_context", prepare_context)
+    ctx.register_hook("pre_llm_call", lambda **kwargs: None)
+'''
+
+# A producer that prepares but never publishes: prepare_context without the
+# SAME plugin's pre_llm_call — the contract refuses it before admission.
+_FAKE_PLUGIN_PREPARE_ONLY_INIT = _FAKE_PLUGIN_INIT.replace(
+    '    ctx.register_hook("pre_llm_call", lambda **kwargs: None)\n', '')
+
+# A publisher with no preparation of its own: owned by a DIFFERENT plugin, it
+# cannot complete another plugin's producer contract.
+_FAKE_PLUGIN_PUBLISHER_ONLY_INIT = '''\
+def register(ctx):
+    ctx.register_hook("pre_llm_call", lambda **kwargs: None)
 '''
 
 _FAKE_PLUGIN_TRIPWIRE_INIT = '''\
@@ -1769,6 +1865,7 @@ def register(ctx):
     def prepare_context(*, execution):
         raise AssertionError("callback must not run for a foreign-home cap")
     ctx.register_hook("prepare_context", prepare_context)
+    ctx.register_hook("pre_llm_call", lambda **kwargs: None)
 '''
 
 
@@ -1969,9 +2066,8 @@ def _bare_prepared(cap, *, source_deadline_ms):
     from hermes_constants import get_hermes_home
     prep = object.__new__(b2b_ctx._PreparedContext)
     for name, value in {
-            "cap": cap, "view": None, "stamp": None, "module_name": "",
-            "module": None, "manager": None, "loaded": None, "prepare": None,
-            "validate_configuration": lambda: True, "deadline": 0.0,
+            "cap": cap, "view": None, "manager": None, "prepare": None,
+            "validate_configuration": lambda: True,
             "source_deadline_ms": source_deadline_ms,
             "project_utf8": json_utf8(cap.policy_get("project")),
             "profile": cap.profile,
@@ -2004,7 +2100,6 @@ def test_prepared_context_governed_by_oc_deadline_not_post_ttl(
     fresh = qualify_context_view(lane.cap, renew_unit_oc_read(raw, read_id=2))
     prep = _bare_prepared(lane.cap, source_deadline_ms=1793361610000)
     object.__setattr__(prep, "view", plain)
-    object.__setattr__(prep, "deadline", now[0] + 1)  # POST TTL still open
     monkeypatch.setattr(
         b2b_ctx._PreparedContext, "_assert_stamp", lambda *a, **k: None)
     prep.assert_current(lane.cap)
@@ -2021,8 +2116,9 @@ def test_prepared_context_governed_by_oc_deadline_not_post_ttl(
     lane.store.close()
 
 
-@pytest.mark.parametrize("cause", ["source_window_closed",
-                                   "context_oc_source_stale"])
+@pytest.mark.parametrize("cause", ["context_oc_source_stale",
+                                   "b2b_policy_changed",
+                                   "context_unavailable"])
 def test_preparation_typed_cause_reaches_durable_block(tmp_path, cause):
     """A typed refusal from the configuration gate must NOT be flattened to
     a boolean: it propagates out of assert_current_policy AND the durable
@@ -2039,8 +2135,9 @@ def test_preparation_typed_cause_reaches_durable_block(tmp_path, cause):
     lane.store.close()
 
 
-@pytest.mark.parametrize("cause", ["source_window_closed",
-                                   "context_oc_source_stale"])
+@pytest.mark.parametrize("cause", ["context_oc_source_stale",
+                                   "b2b_policy_changed",
+                                   "context_unavailable"])
 def test_prepared_context_assert_propagates_typed_cause(
         tmp_path, monkeypatch, cause):
     """The typed assertion (not the boolean readiness wrapper) preserves the
@@ -2059,8 +2156,9 @@ def test_prepared_context_assert_propagates_typed_cause(
     lane.store.close()
 
 
-@pytest.mark.parametrize("cause", ["source_window_closed",
-                                   "context_oc_source_stale"])
+@pytest.mark.parametrize("cause", ["context_oc_source_stale",
+                                   "b2b_policy_changed",
+                                   "context_unavailable"])
 def test_construction_guard_blocks_with_typed_cause(
         tmp_path, monkeypatch, cause):
     """guard_agent_construction's final readiness check blocks the attempt

@@ -10,7 +10,8 @@ tests — the tests download nothing and spawn no package manager.
 |---|---|---|
 | My Work | `mywork` | `526f2c76` (`dubsar-my-work`, deps linked per its `deps.lock.json`) |
 | Contracts | `contracts` | `9044b1b1` (`dubsar-contracts`; the OC kernel fixture `git rev-parse`-verifies this exact HEAD via `OC_CONTRACTS_CHECKOUT`) |
-| Producer profile | `profile` | `05d7394c` (`dubsar-hermes-profile`; supplies `plugins/dubsar-agent-context`, `profile-mappings.json`, the `2.r2` contract root) |
+| Producer profile | `profile` | `05d7394c` + prepare-context patch (`dubsar-hermes-profile`; supplies `plugins/dubsar-agent-context`, `profile-mappings.json`, the `2.r2` contract root). The base pin does NOT register `prepare_context`: every native positive (admission/publication/drift) needs the P3 patch applied to the checkout used for tests — never pushed. |
+| Unpatched producer profile | `unpatched_profile` | `05d7394c` unmodified (`dubsar-hermes-profile`; used only by the `legacy_plugin` negative case, which must 503 like `no_plugin`) |
 
 ## Runtime file
 
@@ -19,7 +20,8 @@ tests — the tests download nothing and spawn no package manager.
 ```json
 {"mywork": "<abs path to the pinned My Work checkout>",
  "contracts": "<abs path to dubsar-contracts @ 9044b1b1>",
- "profile": "<abs path to dubsar-hermes-profile @ 05d7394c>",
+ "profile": "<abs path to dubsar-hermes-profile @ 05d7394c WITH the prepare_context patch applied>",
+ "unpatched_profile": "<abs path to dubsar-hermes-profile @ 05d7394c unmodified>",
  "node": "<abs path to a Node >= 20 executable>",
  "pg_bin": "<dir containing createdb/dropdb binaries>",
  "postgres_url": "<admin DSN, e.g. postgresql://postgres@127.0.0.1:PORT/postgres>"}
