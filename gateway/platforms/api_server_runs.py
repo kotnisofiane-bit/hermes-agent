@@ -46,7 +46,7 @@ def api_worker_live_count() -> int:
         return _API_WORKER_LIVE
 
 
-def _submit_api_worker(loop, fn, work_lease=None):
+def _submit_api_worker(loop, fn):
     """``loop.run_in_executor(None, fn)`` with the worker-lifetime count held for the submission.
 
     Increment on the submitting (handler) thread so the count is live before the worker can
@@ -54,55 +54,25 @@ def _submit_api_worker(loop, fn, work_lease=None):
     it early. When submission itself fails (default executor already shut down during quiesce
     -> RuntimeError) the worker never runs, so the count is released here instead — a leaked
     count would make the shutdown close gate skip the SessionDB close for the process lifetime.
-    When the returned future is cancelled while the job is still queued the executor drops it
-    without ever calling the worker — the queued-cancel callback releases the count the same
-    way, and a worker that somehow still starts skips its payload via the atomic submission
-    state rather than running uncounted.
-
-    ``work_lease``: an admitted B2B launch's capacity unit — a ref rides the worker's real
-    lifetime with the same retain-before-submit / release-in-finally discipline; this is
-    lifetime tracking of the launch's ONE unit, never a second capacity gate.
     """
-    from gateway.platforms.api_server_capacity import _WorkerSubmission
-
     global _API_WORKER_LIVE
-    ref = work_lease.retain() if work_lease is not None else None
     with _API_WORKER_LOCK:
         _API_WORKER_LIVE += 1
 
-    def _release():
-        global _API_WORKER_LIVE
-        with _API_WORKER_LOCK:
-            _API_WORKER_LIVE -= 1
-        if ref is not None:
-            with suppress(Exception):
-                ref.release()
-
-    submission = _WorkerSubmission(_release)
-
     def _counted():
-        if not submission.begin():
-            return None  # cancelled while queued — never run uncounted
         try:
             return fn()
         finally:
-            submission.finish()
+            global _API_WORKER_LIVE
+            with _API_WORKER_LOCK:
+                _API_WORKER_LIVE -= 1
 
     try:
-        future = loop.run_in_executor(None, _counted)
+        return loop.run_in_executor(None, _counted)
     except BaseException:
-        submission.cancel()
+        with _API_WORKER_LOCK:
+            _API_WORKER_LIVE -= 1
         raise
-
-    def _queued_cancel(done_future):
-        # The executor job was cancelled while still queued: ``_counted``
-        # never runs, so release the count (and any lease ref) here — a leak
-        # would hold capacity and the shutdown close gate forever.
-        if done_future.cancelled():
-            submission.cancel()
-
-    future.add_done_callback(_queued_cancel)
-    return future
 _ROOM_RETENTION_REQUEST_KEY = (
     RequestKey("hermes.room_run_retention_until", float) if RequestKey is not None
     else "hermes.room_run_retention_until")
@@ -493,7 +463,6 @@ class _RunLaunch:
     browser_control_transport_family: Any
     turn_author: Optional[Dict[str, Any]] = None  # memory-attribution label only; grants nothing
     b2b_execution: Any = None  # frozen BoundExecution, bound at admission; never request-derived
-    work_lease: Any = None  # neutral capacity metadata; set only by the B2B launch path
 
     @property
     def approval_session_key(self) -> str:
@@ -517,9 +486,6 @@ def _retire_live_run(self, run_id: str) -> None:
     """Retire agent/task/approval control state once the executor-backed task is done."""
     _forget_run(self, run_id, self._active_run_agents, self._active_run_tasks, self._run_approval_sessions,
                 self._stopping_run_ids, self._shutdown_interrupted_run_ids)
-    capacity = getattr(self, "_capacity", None)
-    if capacity is not None:
-        capacity.drop_task(run_id)
 
 
 def _drop_run_transport(self, run_id: str) -> None:
@@ -736,11 +702,6 @@ async def _handle_runs(self, request: "web.Request", *, _api_server) -> "web.Res
             _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
     else:
         task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
-    capacity = getattr(self, "_capacity", None)
-    if capacity is not None:
-        with suppress(Exception):
-            from gateway.platforms.api_server_capacity import capacity_home_key
-            capacity.note_task(run_id, capacity_home_key(), covered=False)
     with suppress(TypeError):
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
@@ -969,8 +930,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
         result, usage, served_runtime = await _submit_api_worker(
-            loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server),
-            work_lease=getattr(run, "work_lease", None))
+            loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
         if not isinstance(result, dict):
             result = {}
         status, fields = terminal_run_status(result)

@@ -2199,11 +2199,10 @@ def test_construction_guard_blocks_with_typed_cause(
 @pytest.mark.parametrize("position", ["early", "post_prepare"])
 async def test_launch_concurrency_check_order(
         tmp_path, monkeypatch, opened, position):
-    """A NEW attempt reserves its ONE capacity unit BEFORE the native
-    preparation on the shared per-home ledger: an already-full home gets the
-    limiter's real 429 with zero prepares and zero durable writes. Capacity
-    that fills DURING preparation is never re-charged to the holder — its
-    reserved unit is irrevocable, the launch still admits."""
+    """A NEW attempt checks capacity BEFORE the native preparation (early
+    limit -> real 429, zero prepares) and again after it (first call None ->
+    prepare runs once -> second call 429). Neither path writes the store,
+    titles the session, or spawns a worker."""
     from aiohttp import web
     from tests.gateway import test_api_server_b2b_admission as adm
     from gateway.platforms import api_server_b2b_context as b2b_ctx
@@ -2229,26 +2228,14 @@ async def test_launch_concurrency_check_order(
 
     def _prepare(cap, *, resolved):
         prepares.append(cap)
-        if position == "post_prepare":
-            # Capacity fills while THIS launch prepares — its own reserved
-            # unit must never be charged back to it.
-            adapter._inflight_agent_runs = 1
         return _UnitPreparation(cap)
 
     monkeypatch.setattr(b2b_ctx, "prepare_b2b_context", _prepare)
-    spawned = []
-
-    async def _spawn(adapter, request, *, cap, resolved, session_id, run_id,
-                     profile):
-        spawned.append(run_id)
-        return SimpleNamespace(done=lambda: True)
-
-    adapter._max_concurrent_runs = 1
-    if position == "early":
-        monkeypatch.setattr(b2b, "_spawn_run", _adm_tripwire("_spawn_run"))
-        adapter._inflight_agent_runs = 1
-    else:
-        monkeypatch.setattr(b2b, "_spawn_run", _spawn)
+    monkeypatch.setattr(b2b, "_spawn_run", _adm_tripwire("_spawn_run"))
+    limited = web.Response(status=429, text="capacity")
+    calls = iter([limited] if position == "early" else [None, limited])
+    monkeypatch.setattr(
+        adapter, "_concurrency_limited_response", lambda: next(calls))
     store = adapter._run_idempotency_store
     before = adm._store_counts(store)
     response = await b2b._launch_b2b_run(
@@ -2256,13 +2243,11 @@ async def test_launch_concurrency_check_order(
         session_id=session_id, binding_digest=session_id[4:],
         attempt_id=resolved["attempt_id"], resolved=resolved,
         store=store, db=adapter._session_db)
+    assert response.status == 429
     if position == "early":
-        assert response.status == 429
         assert prepares == []
-        assert adm._store_counts(store) == before
-        assert adapter._session_db.get_session(session_id)["title"] is None
     else:
-        assert response.status == 200
         assert len(prepares) == 1
-        assert len(spawned) == 1
+    assert adm._store_counts(store) == before
+    assert adapter._session_db.get_session(session_id)["title"] is None
     lane.store.close()

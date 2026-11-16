@@ -97,23 +97,6 @@ def _reserve_abandoned_loader_slot() -> None:
     )
 
 
-def _retain_launch_lease_ref() -> Any:
-    """One ref of the bound B2B launch's capacity unit for a worker that may
-    outlive its caller (generic lifetime plumbing — None when no launch lease
-    is bound, so ordinary plugin loads are untouched; a bound lease's retain
-    error propagates rather than running the loader uncounted)."""
-    from agent.b2b_execution import retain_launch_lease
-    return retain_launch_lease()
-
-
-def _release_launch_lease_ref(ref: Any) -> None:
-    if ref is not None:
-        try:
-            ref.release()
-        except Exception:
-            pass
-
-
 def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[], Any]) -> Any:
     """Run ``fn`` (a plugin's import + ``register()``) under the per-plugin deadline.
 
@@ -126,10 +109,6 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
     if timeout <= 0:
         return fn()
     _reserve_abandoned_loader_slot()
-    # The loader daemon may outlive this wait (abandoned on timeout): retain
-    # the bound launch's capacity unit until its real finally, so a parent
-    # timeout can never free the unit while a loader still runs.
-    lease_ref = _retain_launch_lease_ref()
     outcome: List[Any] = []
     failure: List[BaseException] = []
 
@@ -139,17 +118,11 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
             outcome.append(fn())
         except BaseException as exc:  # re-raised on the loading thread, KeyboardInterrupt included
             failure.append(exc)
-        finally:
-            _release_launch_lease_ref(lease_ref)
 
     worker = threading.Thread(
         target=contextvars.copy_context().run, args=(_worker,), name=f"plugin-load:{plugin_key}", daemon=True,
     )
-    try:
-        worker.start()
-    except BaseException:
-        _release_launch_lease_ref(lease_ref)
-        raise
+    worker.start()
     worker.join(timeout)
     if worker.is_alive():
         ctx._abandon_load()

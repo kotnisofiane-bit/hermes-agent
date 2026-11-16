@@ -14,7 +14,6 @@ AgentContext builder invocation in H1.
 from __future__ import annotations
 
 import contextvars
-from contextlib import suppress
 import dataclasses
 import hashlib
 import json
@@ -426,6 +425,7 @@ BLOCK_REASONS = frozenset({
     "context_oc_projection", "context_oc_read_metadata",
     "context_oc_read_replayed", "context_oc_source_stale",
     "context_oc_unavailable", "context_oc_unqualified",
+    "context_preparation_stuck",
     "context_proof_invalid", "context_proof_missing",
     "context_publication_conflict", "context_recheck_already_registered",
     "context_recheck_unavailable", "context_relation_bounds",
@@ -597,27 +597,6 @@ def current_execution(profile: str = "", session_id: str = "") -> Optional[Bound
     if profile and cap.profile != profile:
         return None
     return cap
-
-
-def current_launch_lease() -> Any:
-    """The capacity unit of the launch owning the bound execution, else None —
-    the generic accessor every host-created outliving worker uses to retain
-    the launch's ONE ledger unit instead of running unaccounted."""
-    cap = _execution_var.get()
-    if cap is None:
-        return None
-    return getattr(getattr(cap, "sink", None), "_work_lease", None)
-
-
-def retain_launch_lease() -> Any:
-    """One held unit-ref for a worker that may outlive its caller, or None when
-    no launch lease is bound (ordinary lanes — always a no-op there). A bound
-    but released lease propagates the retain error — running such work
-    uncounted would silently break the launch's capacity accounting."""
-    lease = current_launch_lease()
-    if lease is None:
-        return None
-    return lease.retain()
 
 
 def require_execution(agent: Any) -> Optional[BoundExecution]:
@@ -906,10 +885,6 @@ def recheck_context(cap: BoundExecution, receipt: ContextReceipt, *,
             outcome: Dict[str, Any] = {}
             done = threading.Event()
             invoke_context = contextvars.copy_context()
-            # The recheck daemon may outlive this bounded wait (and even the
-            # run): retain the launch's unit until its real finally — released
-            # BEFORE done.set so a caller deadline frees nothing early.
-            lease_ref = retain_launch_lease()
 
             def _invoke() -> None:
                 try:
@@ -917,19 +892,10 @@ def recheck_context(cap: BoundExecution, receipt: ContextReceipt, *,
                 except BaseException as exc:  # noqa: BLE001 -- normalized below
                     outcome["error"] = exc
                 finally:
-                    if lease_ref is not None:
-                        with suppress(Exception):
-                            lease_ref.release()
                     done.set()
 
-            try:
-                threading.Thread(target=lambda: invoke_context.run(_invoke),
-                                 daemon=True).start()
-            except BaseException:
-                if lease_ref is not None:
-                    with suppress(Exception):
-                        lease_ref.release()
-                raise
+            threading.Thread(target=lambda: invoke_context.run(_invoke),
+                             daemon=True).start()
             if (not done.wait(max(0.0, deadline - time.monotonic())) or
                     time.monotonic() >= deadline):
                 _context_recheck_window_closed(cap)

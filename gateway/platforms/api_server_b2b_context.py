@@ -20,18 +20,48 @@ no preflight publish and reads no provider credentials.
 
 from __future__ import annotations
 
+import contextvars
+import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from agent.b2b_execution import (
     B2BTerminalRefusal, BoundExecution, CONTEXT_MAX_BYTES, _deep_freeze,
     _native_oc_read_metadata, _reject_bad_unicode, _utc_milliseconds,
     assert_source_equivalent, json_utf8, qualify_context_view, source_basis,
 )
+from gateway.platforms.api_server_b2b import _SOURCE_DEADLINE_S
+from hermes_constants import hermes_home_key
 
 
 _SOURCE_OBSERVED_MAX_AGE_MS = 900_000
+
+# Abandoned-preparation bound: only reads whose caller already walked away
+# count (a late result can never attach). At the bound, NEW preparations on
+# the same canonical ``hermes_home_key`` are refused until an orphan exits;
+# healthy reads never count and ``max_concurrent_runs`` is never consulted —
+# the bound bites identically at 0. It gates new work only: already-started
+# reads are never killed or serialized, so concurrent stragglers can push
+# the count past the cap.
+_MAX_ABANDONED_PREPARATIONS = 2
+
+_ABANDONED_LOCK = threading.Lock()
+_ABANDONED_PREPARATIONS: Dict[str, int] = {}
+
+
+def abandoned_preparation_count() -> int:
+    """Orphaned native-read workers still running for the CURRENT canonical
+    ``hermes_home_key`` — diagnostic surface for health and tests."""
+    home = hermes_home_key()
+    with _ABANDONED_LOCK:
+        return _ABANDONED_PREPARATIONS.get(home, 0)
+
+
+def context_preparation_stuck() -> bool:
+    """True once the CURRENT home's abandoned-preparation count reaches the
+    bound — NEW preparations are refused until an orphan exits."""
+    return abandoned_preparation_count() >= _MAX_ABANDONED_PREPARATIONS
 
 
 def _context_provider(*, discover: bool = False):
@@ -59,41 +89,79 @@ def _context_provider(*, discover: bool = False):
     return manager, prepare
 
 
-def producer_available(adapter: Any = None) -> bool:
+def producer_available() -> bool:
     """Registration introspection for diagnostics (health/health-detailed):
-    is exactly one ``prepare_context`` callback registered in THIS home, AND
-    does the shared per-home capacity ledger still admit work? Saturation
-    reports False — a full lane cannot serve a new launch. Says nothing about
-    any mission's readiness: an available producer still admits nothing
-    without a current per-capability preparation, and a held lease never
-    makes its OWN launch's readiness False."""
+    is exactly one ``prepare_context`` callback registered in THIS home?
+    Says nothing about any mission's readiness — an available producer still
+    admits nothing without a current per-capability preparation."""
     try:
-        if _context_provider(discover=False) is None:
-            return False
-        from gateway.platforms.api_server_capacity import capacity_saturated
-        return not capacity_saturated(adapter)
+        return _context_provider(discover=False) is not None
     except Exception:
         return False
 
 
 def _bounded_native_read(cap: BoundExecution):
-    """The preparation's native read — synchronous INSIDE the launch's single
-    bounded worker. The caller (``_launch_b2b_run``'s preparation worker)
-    already holds the source budget AND the home's capacity unit: a second
-    thread here would only double the worker lifetime the lease must cover.
-    A wedged producer therefore blocks THAT worker; the bounded wait at the
-    worker boundary still gives the original requester
-    ``execution_unavailable`` while the lease stays held until the worker's
-    real finally."""
-    found = _context_provider(discover=True)
-    if found is None:
+    """The preparation's native read, bounded off-loop by the standing source
+    budget (pattern: ``recheck_context``). The callback runs on a daemon
+    thread under ``copy_context``; the caller Event-waits the budget and is
+    the ONLY attacher — a late completion can never admit anything. A caller
+    whose budget expires marks its worker abandoned against this home's
+    bounded count; a home already at ``_MAX_ABANDONED_PREPARATIONS`` orphans
+    refuses NEW reads ``context_preparation_stuck`` before any thread is
+    spawned."""
+    budget = _SOURCE_DEADLINE_S
+    home = hermes_home_key()
+    # Per-call bookkeeping shared with the worker's finally, always under the
+    # module lock: the worker frees this call's slot only if the caller
+    # abandoned it.
+    state: Dict[str, bool] = {"finished": False, "abandoned": False}
+    with _ABANDONED_LOCK:
+        if _ABANDONED_PREPARATIONS.get(home, 0) >= _MAX_ABANDONED_PREPARATIONS:
+            raise B2BTerminalRefusal("context_preparation_stuck")
+    outcome: Dict[str, Any] = {}
+    done = threading.Event()
+    invoke_context = contextvars.copy_context()
+
+    def _invoke() -> None:
+        try:
+            found = _context_provider(discover=True)
+            if found is None:
+                raise B2BTerminalRefusal("context_unavailable")
+            manager, prepare = found
+            result = prepare(execution=cap)
+            if (not isinstance(result, Mapping)
+                    or not callable(result.get("validate_configuration"))):
+                raise B2BTerminalRefusal("context_unavailable")
+            outcome["value"] = result, manager, prepare
+        except BaseException as exc:  # noqa: BLE001 -- normalized below
+            outcome["error"] = exc
+        finally:
+            # Free this call's abandoned slot BEFORE signalling completion —
+            # the worker's real exit is the gate's only release.
+            with _ABANDONED_LOCK:
+                state["finished"] = True
+                if state["abandoned"]:
+                    remaining = _ABANDONED_PREPARATIONS.get(home, 0) - 1
+                    if remaining > 0:
+                        _ABANDONED_PREPARATIONS[home] = remaining
+                    else:
+                        _ABANDONED_PREPARATIONS.pop(home, None)
+            done.set()
+
+    threading.Thread(target=lambda: invoke_context.run(_invoke), daemon=True).start()
+    if not done.wait(budget):
+        with _ABANDONED_LOCK:
+            if not state["finished"]:
+                state["abandoned"] = True
+                _ABANDONED_PREPARATIONS[home] = (
+                    _ABANDONED_PREPARATIONS.get(home, 0) + 1)
         raise B2BTerminalRefusal("context_unavailable")
-    manager, prepare = found
-    result = prepare(execution=cap)
-    if (not isinstance(result, Mapping)
-            or not callable(result.get("validate_configuration"))):
-        raise B2BTerminalRefusal("context_unavailable")
-    return result, manager, prepare
+    exc = outcome.get("error")
+    if exc is not None:
+        if isinstance(exc, B2BTerminalRefusal):
+            raise exc
+        raise B2BTerminalRefusal("context_unavailable") from None
+    return outcome["value"]
 
 
 def _source_observed_ms(plain: Mapping[str, Any]) -> Tuple[int, int]:

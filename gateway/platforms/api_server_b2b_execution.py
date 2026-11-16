@@ -166,16 +166,23 @@ def b2b_execution_unavailable_code(project: Any, config: Optional[Mapping]) -> O
     consult. ``None`` only when ``b2b_execution_ready`` opens the lane for
     THIS attempt's bound capability. Codes: ``execution_inputs_unavailable``
     for a preparation hole, ``c1_producer_unavailable`` when the installed
-    producer itself is absent/disabled, ``c1_context_required`` when the
-    producer is present but no CURRENT mission-scoped context proof is bound
-    to this capability — the ordinary state for health checks, which carry
-    no mission binding and can never turn ``ready`` on presence alone."""
+    producer itself is absent/disabled, ``context_preparation_stuck`` when the
+    producer is present but the home's abandoned native reads already hit the
+    bound, ``c1_context_required`` when the producer is present but no
+    CURRENT mission-scoped context proof is bound to this capability — the
+    ordinary state for health checks, which carry no mission binding and can
+    never turn ``ready`` on presence alone."""
     if b2b_execution_ready(project, config):
         return None
     if not b2b_execution_inputs_ready(project, config):
         return "execution_inputs_unavailable"
-    from gateway.platforms.api_server_b2b_context import producer_available
-    return "c1_context_required" if producer_available() else "c1_producer_unavailable"
+    from gateway.platforms.api_server_b2b_context import (
+        context_preparation_stuck, producer_available)
+    if not producer_available():
+        return "c1_producer_unavailable"
+    if context_preparation_stuck():
+        return "context_preparation_stuck"
+    return "c1_context_required"
 
 
 def b2b_execution_ready(project: Any, config: Optional[Mapping]) -> bool:
@@ -203,26 +210,24 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
     serving config (A→B→A), and reported ``not-ready`` — never ``ready`` —
     with a typed code: ``execution_inputs_unavailable`` for any preparation
     hole (including empty profiles/projects and evaluation errors),
-    ``c1_producer_unavailable`` when the producer is absent, and
-    ``c1_context_required`` when it is present without a current mission
-    proof. The aggregate uses that fail-closed order."""
+    ``c1_producer_unavailable`` when the producer is absent,
+    ``context_preparation_stuck`` when the home's abandoned reads hit the
+    bound, and ``c1_context_required`` when it is present without a current
+    mission proof. The aggregate uses that fail-closed order."""
     state = _state_for(adapter)
     if state is None or not state.config.enabled:
         return {"b2b_execution": "not-configured", "b2b_execution_code": None,
                 "b2b_execution_profiles": {}}
     # Fail-closed ordering: a preparation hole beats a missing producer, a
-    # missing producer beats "no current mission proof", which beats a full
-    # but otherwise healthy lane — health carries no capability binding, so
+    # missing producer beats a stuck preparation gate, and that beats "no
+    # current mission proof" — health carries no capability binding, so
     # ``ready``/``None`` codes are unreachable here by construction (no
-    # source/model probe is performed either). ``capacity_exhausted`` comes
-    # from the SHARED per-home work ledger — a transient state, hence least
-    # severe.
+    # source/model probe is performed either).
     severity = {"execution_inputs_unavailable": 0, "c1_producer_unavailable": 1,
-                "c1_context_required": 2, "capacity_exhausted": 3}
+                "context_preparation_stuck": 2, "c1_context_required": 3}
     profiles: Dict[str, Any] = {}
     for name, entry in state.config.profiles.items():
         code = "execution_inputs_unavailable"
-        available = None
         try:
             # Every profile is judged under ITS OWN home — including
             # ``default``, which must resolve to the canonical default home
@@ -235,29 +240,19 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
                 from agent.b2b_execution import _execution_var
                 token = _execution_var.set(None)
                 try:
-                    from gateway.platforms.api_server_capacity import capacity_saturated
-                    from hermes_constants import hermes_home_key
-                    available = not capacity_saturated(
-                        adapter, home_key=hermes_home_key())
-                    if not available:
-                        code = "capacity_exhausted"
-                    else:
-                        from gateway.run import _load_gateway_config
-                        config = _load_gateway_config()
-                        projects = entry.get("projects") or {}
-                        if projects:
-                            code = min(
-                                (b2b_execution_unavailable_code(project, config) or "ready"
-                                 for project in projects.values()),
-                                key=lambda c: severity.get(c, 3))
+                    from gateway.run import _load_gateway_config
+                    config = _load_gateway_config()
+                    projects = entry.get("projects") or {}
+                    if projects:
+                        code = min(
+                            (b2b_execution_unavailable_code(project, config) or "ready"
+                             for project in projects.values()),
+                            key=lambda c: severity.get(c, 3))
                 finally:
                     _execution_var.reset(token)
         except Exception:
             code = "execution_inputs_unavailable"
-            available = None
         profiles[name] = {"state": "not-ready", "code": code}
-        if available is False:
-            profiles[name]["producer_available"] = False
     aggregate = min((p["code"] for p in profiles.values()),
                     key=lambda c: severity.get(c, 3),
                     default="execution_inputs_unavailable")
@@ -381,9 +376,7 @@ async def construct_run_agent(adapter: Any, run: Any, construct_agent: Callable[
         from contextvars import copy_context
         from gateway.platforms.api_server_runs import _submit_api_worker
         ctor_context = copy_context()
-        return await _submit_api_worker(
-            loop, lambda: ctor_context.run(construct_agent),
-            work_lease=getattr(getattr(cap, "sink", None), "_work_lease", None))
+        return await _submit_api_worker(loop, lambda: ctor_context.run(construct_agent))
     finally:
         reset_execution(cap_token)
 
@@ -504,11 +497,9 @@ async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[s
             # The rechecker runs in the copied profile/capability scope; original context stays immutable.
             # Bounded like the provider-boundary C1s: a blocking callback must
             # refuse on the prospective before_seal window, never hang sealing.
-            from gateway.platforms.api_server_capacity import lease_to_thread
-            fresh = await lease_to_thread(
+            fresh = await asyncio.to_thread(
                 recheck_context, cap, receipt,
-                deadline=sink.seal_recheck_deadline(),
-                work_lease=getattr(sink, "_work_lease", None))
+                deadline=sink.seal_recheck_deadline())
             source = await sink.resolve_before_seal()
             if source is None:
                 return blocked("source_before_seal_denied")

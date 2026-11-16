@@ -314,12 +314,6 @@ class PluginDispatchMixin:
         done = threading.Event()
         outcome: Dict[str, Any] = {}
         failure: Dict[str, BaseException] = {}
-        # The bounded worker may outlive this wait: retain the bound launch's
-        # capacity unit until the worker's real finally (released BEFORE
-        # done.set; refunded when the thread cannot start). Generic lifetime
-        # plumbing only — no change to suppression/abandon bookkeeping.
-        from agent.b2b_execution import retain_launch_lease
-        lease_ref = retain_launch_lease()
 
         def _release_token() -> None:
             with self._hook_timeout_lock:
@@ -337,11 +331,6 @@ class PluginDispatchMixin:
             except BaseException as exc:
                 failure["exc"] = exc
             finally:
-                if lease_ref is not None:
-                    try:
-                        lease_ref.release()
-                    except Exception:
-                        pass
                 _release_token()
                 done.set()
 
@@ -349,11 +338,6 @@ class PluginDispatchMixin:
         try:
             thread.start()
         except RuntimeError as exc:
-            if lease_ref is not None:
-                try:
-                    lease_ref.release()
-                except Exception:
-                    pass
             _release_token()  # the runner's finally never runs when OS thread creation fails
             logger.warning(
                 "Hook '%s' callback %s worker failed to start: %s — skipping",

@@ -55,8 +55,8 @@ Installed configuration, plugin presence, valid schema hashes and an inert
 constructor remain preparation, not evidence of readiness. A lane without a
 current mission-scoped proof reports `not-ready` with a typed code
 (`execution_inputs_unavailable`, `c1_producer_unavailable`,
-`c1_context_required`, or `capacity_exhausted`) — health evaluation performs
-no plugin discovery or
+`context_preparation_stuck`, or `c1_context_required`) — health evaluation
+performs no plugin discovery or
 probe and cannot leak ambient execution state. A missing, crossed, stale,
 future-dated, late or otherwise unqualified source fails closed with
 `503 execution_unavailable` before admission. That refusal covers NEW
@@ -85,15 +85,26 @@ admission. Their short expiry does not govern preparation or publication after
 admission. Source authority is renewed by `before_provider`; the OC observation
 bound is never renewed. Typed preparation refusals reach the durable attempt
 classification without being replaced by a fixed `context_unavailable` reason.
-New attempts reserve exactly ONE unit on their own canonical home's shared
-work ledger — the same per-home accounting the run limiter reads — before
-the first native read, and hold it until the last host-created worker
-actually exits. A saturated home refuses with the limiter's exact
-`429 rate_limit_exceeded` (`Retry-After: 1`), never a preparation-specific
-refusal, and a preparation timeout still answers `503 execution_unavailable`
-while the abandoned worker keeps the unit until it exits. Health reports a
-saturated lane `capacity_exhausted` with `producer_available: false`.
-Durable replay keeps its existing bypass — it never touches the ledger.
+New attempts check capacity before native preparation and again afterwards,
+without reserving a slot; durable replay keeps its existing bypass.
+
+The only preparation state the lane budgets is the ABANDONED native read — a
+worker whose caller already walked away when the standing source deadline
+passed (a late completion can never attach). Per canonical `hermes_home_key`,
+once 2 such orphaned workers exist (`_MAX_ABANDONED_PREPARATIONS`), NEW
+launches on that home are refused `503 execution_unavailable` before any
+discovery or native read, and health reports `context_preparation_stuck`
+until an orphan actually exits — the worker's own `finally` is the only
+release. Healthy reads never count, however many run concurrently, and the
+bound never consults `max_concurrent_runs`: it bites identically at 0.
+Known limitation: the bound gates new work only — it never kills or
+serializes reads already started, so several reads begun together can all
+become abandoned together and push the count past the cap; the gate then
+holds until enough orphans exit. A second known limitation is slow
+discovery: plugin discovery runs before the native source deadline starts,
+bounded only by the per-plugin loader timeout (10s), so a producer that is
+slow to discover delays every attempt's first read without tripping any
+preparation bound; no code extends that timer.
 
 `/1` OC receipts and view/capture instants are never
 source observation and refuse as `context_oc_unqualified`. Preparation also

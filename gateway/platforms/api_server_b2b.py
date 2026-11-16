@@ -21,7 +21,6 @@ import re
 import time
 import types
 import uuid
-from contextlib import suppress
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from agent.b2b_execution import (
@@ -810,6 +809,7 @@ _BLOCK_CONTEXT_STALE_REASONS = frozenset({
     "context_oc_unavailable", "context_oc_read_metadata",
     "context_oc_unqualified", "context_oc_projection",
     "context_oc_source_stale", "context_oc_read_replayed",
+    "context_preparation_stuck",
     "context_proof_missing", "context_proof_invalid",
     "context_accepted_unavailable",
     "context_accepted_malformed", "context_accepted_unqualified",
@@ -897,9 +897,6 @@ class _AttemptSink:
         # The frozen context preparation attached by _launch_b2b_run before
         # admission; None on every sink the launch path did not prepare.
         self._context_preparation = None
-        # The launch's ONE shared capacity unit — every host-created child
-        # worker retains a ref of it (api_server_capacity).
-        self._work_lease = None
 
     def assert_current_policy(self) -> bool:
         state = _state_for(self._adapter)
@@ -1157,237 +1154,210 @@ class _AttemptSink:
         return json.loads(stored)
 
 
-_ATTEMPT_UNCHECKED = object()  # sentinel: ingress pre-resolved the attempt row
-
-
-def _acquire_launch_lease(adapter: Any, profile: str):
-    """Atomically reserve ONE capacity unit on the launch profile's canonical
-    home — the SAME ledger the run limiter reads — or return its exact 429
-    refusal. Never a separate preparation gate: the launch's lease is the
-    unit, held from before its first native read until its last worker exits."""
-    try:
-        with adapter._profile_scope(profile):
-            from gateway.platforms.api_server_capacity import acquire_launch_lease
-            from hermes_constants import hermes_home_key
-            lease, refusal = acquire_launch_lease(adapter, hermes_home_key())
-            return lease if lease is not None else refusal
-    except Exception:
-        # Scope-entry failure fails closed like the rest of the launch guard —
-        # the typed 503, never an untyped 500.
-        return _deny(503, "execution_unavailable")
-
-
 async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, keys,
                           session_id: str, binding_digest: str, attempt_id: str,
-                          resolved: Dict[str, Any], store: Any, db: Any,
-                          lease: Any = None, existing_attempt: Any = _ATTEMPT_UNCHECKED):
+                          resolved: Dict[str, Any], store: Any, db: Any):
     """Keep the immutable empty origin, but accept worked sessions through their owned binding."""
+    import asyncio as _a
     from hermes_constants import get_hermes_home
     home = get_hermes_home().resolve()
     if (not getattr(db, "db_path", None) or str(db.db_path) == ":memory:" or
             db.db_path.resolve().parent != home):
         return _deny(503, "store_unavailable")
     run_id = "run_" + uuid.uuid4().hex
-    from gateway.platforms.api_server_capacity import (
-        LaunchWorkLease, lease_to_thread, run_bounded_lease_worker)
-    if existing_attempt is _ATTEMPT_UNCHECKED:
-        existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
-    # Durable replay stays outside capacity entirely (unchanged); a NEW launch
-    # owns exactly ONE unit on its own home from here — before its first native
-    # read — until its last host-created worker actually exits.
-    root_lease = lease
-    owns_lease = False
-    if existing_attempt is None and root_lease is None:
-        acquired = _acquire_launch_lease(adapter, profile)
-        if not isinstance(acquired, LaunchWorkLease):
-            return acquired  # the shared limiter's exact refusal (429)
-        root_lease = acquired
-        owns_lease = True
+    session = await _a.to_thread(db.get_session, session_id)
+    if (not session or session.get("id") != session_id or session.get("source") != "api_server"
+            or any(session.get(key) is not None for key in
+                   ("parent_session_id", "ended_at", "end_reason"))):
+        return _deny(409, "session_incompatible")
     try:
-        session = await lease_to_thread(db.get_session, session_id,
-                                        work_lease=root_lease)
-        if (not session or session.get("id") != session_id or session.get("source") != "api_server"
-                or any(session.get(key) is not None for key in
-                       ("parent_session_id", "ended_at", "end_reason"))):
-            return _deny(409, "session_incompatible")
+        tip = await _a.to_thread(db.resolve_resume_session_id, session_id)
+    except Exception:
+        return _deny(409, "genesis_resume")
+    if tip != session_id:
+        return _deny(409, "genesis_resume")
+    existing = store.b2b_binding(session_id=session_id, profile=profile)
+    if existing is None:
+        if not _genesis_vs_native(session or {}, session_id, profile):
+            # A concurrent winner may already have started the exact session.
+            existing = store.b2b_binding(session_id=session_id, profile=profile)
+            if existing is None:
+                return _deny(409, "genesis_native")
+    if existing is None:
+        if not _valid_observation(resolved.get("observation_genesis"), profile, session_id):
+            return _deny(403, "genesis_proof")
+        obs = resolved["observation_genesis"]
+        native_obs = {
+            "id": session.get("id"), "source": session.get("source"),
+            "title": session.get("title"), "model": session.get("model"),
+            "parent_session_id": session.get("parent_session_id"),
+            "has_system_prompt": session.get("system_prompt") is not None,
+            "has_model_config": session.get("model_config") is not None,
+            "ended_at": session.get("ended_at"), "end_reason": session.get("end_reason"),
+            "message_count": int(session.get("message_count") or 0),
+            "tool_call_count": int(session.get("tool_call_count") or 0),
+            "api_call_count": int(session.get("api_call_count") or 0),
+            "profile": profile}
+        if native_obs != {k: obs[k] for k in _OBSERVATION_KEYS}:
+            return _deny(409, "genesis_mismatch")
+    project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
+    if project is None or project["project_id"] != resolved["project_id"]:
+        return _deny(404, "not_found")
+    # P2 admission gate: NEW work proves its mission context BEFORE the single
+    # durable attempt is consumed — the sink/cap are built in memory first,
+    # then prepare_b2b_context does the real native read (the profile's
+    # prepare_context plugin callback, bound to THIS cap) inside the owning
+    # profile scope, attaches the frozen preparation to the sink, and only
+    # then is readiness (the same single classifier /health/detailed reports)
+    # consulted. Any source/producer error is 503 execution_unavailable with
+    # NO binding/attempt/run/title/provider side effects — the in-memory
+    # sink/cap are simply dropped. An already-durable attempt row is always
+    # served by the idempotent replay below (b2b_admit -> _replayed_response),
+    # so a lost-ACK retry never hears "execution_unavailable" for a committed
+    # lane and never pays a context read.
+    existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
+    policy = {
+        "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
+        "attempt_id": attempt_id, "profile_home": str(home),
+        "schema_pins": R2_SCHEMA_PINS, "execution_policy": "h1/proposal-v1",
+        "requester_id": resolved["requester_id"],
+        "project_id": resolved["project_id"],
+        "project_binding_id": resolved["project_binding_id"],
+        "mission_id": resolved["mission_id"], "mission_revision": resolved["mission_revision"],
+        "reservation_ref": resolved["reservation_ref"],
+        "request_digest": resolved["request_digest"],
+        "ticket_digest": resolved["ticket_digest"],
+        "authority_basis_digest": resolved["authority_basis_digest"],
+        "authority_digest": resolved["authority_digest"],
+        "observation_genesis": resolved["observation_genesis"],
+        "mission_request": resolved["mission_request"], "project": project}
+    fingerprint = _policy_digest(profile, entry, project, policy)
+    scope = _run_scope(profile, resolved["requester_id"], binding_digest)
+    initial_status = {"status": "queued", "session_id": session_id, "created_at": time.time()}
+    sink = None
+    cap = None
+    # Lost-ACK replay is allowed even while the original holds the final native worker slot.
+    if existing_attempt is None:
+        # Cheap capacity check BEFORE the expensive native preparation — only
+        # for NEW attempts; the post-preparation check below still stands and
+        # no slot is reserved here.
+        limited = adapter._concurrency_limited_response()
+        if limited is not None:
+            return limited
+        # A home whose abandoned native reads already hit the bound refuses
+        # NEW launches too — refuse before discovery/preparation spends
+        # another doomed read. Durable replays bypass this gate entirely,
+        # and a scope-entry failure fails closed on the same typed refusal.
+        from gateway.platforms.api_server_b2b_context import (
+            context_preparation_stuck)
         try:
-            tip = await lease_to_thread(db.resolve_resume_session_id, session_id,
-                                        work_lease=root_lease)
+            with adapter._profile_scope(profile):
+                preparation_stuck = context_preparation_stuck()
         except Exception:
-            return _deny(409, "genesis_resume")
-        if tip != session_id:
-            return _deny(409, "genesis_resume")
-        existing = store.b2b_binding(session_id=session_id, profile=profile)
-        if existing is None:
-            if not _genesis_vs_native(session or {}, session_id, profile):
-                # A concurrent winner may already have started the exact session.
-                existing = store.b2b_binding(session_id=session_id, profile=profile)
-                if existing is None:
-                    return _deny(409, "genesis_native")
-        if existing is None:
-            if not _valid_observation(resolved.get("observation_genesis"), profile, session_id):
-                return _deny(403, "genesis_proof")
-            obs = resolved["observation_genesis"]
-            native_obs = {
-                "id": session.get("id"), "source": session.get("source"),
-                "title": session.get("title"), "model": session.get("model"),
-                "parent_session_id": session.get("parent_session_id"),
-                "has_system_prompt": session.get("system_prompt") is not None,
-                "has_model_config": session.get("model_config") is not None,
-                "ended_at": session.get("ended_at"), "end_reason": session.get("end_reason"),
-                "message_count": int(session.get("message_count") or 0),
-                "tool_call_count": int(session.get("tool_call_count") or 0),
-                "api_call_count": int(session.get("api_call_count") or 0),
-                "profile": profile}
-            if native_obs != {k: obs[k] for k in _OBSERVATION_KEYS}:
-                return _deny(409, "genesis_mismatch")
-        project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
-        if project is None or project["project_id"] != resolved["project_id"]:
-            return _deny(404, "not_found")
-        # P2 admission gate: NEW work proves its mission context BEFORE the single
-        # durable attempt is consumed — the sink/cap are built in memory first,
-        # then prepare_b2b_context does the real native read (the profile's
-        # prepare_context plugin callback, bound to THIS cap) inside the owning
-        # profile scope, attaches the frozen preparation to the sink, and only
-        # then is readiness (the same single classifier /health/detailed reports)
-        # consulted. Any source/producer error is 503 execution_unavailable with
-        # NO binding/attempt/run/title/provider side effects — the in-memory
-        # sink/cap are simply dropped. An already-durable attempt row is always
-        # served by the idempotent replay below (b2b_admit -> _replayed_response),
-        # so a lost-ACK retry never hears "execution_unavailable" for a committed
-        # lane and never pays a context read.
-        policy = {
-            "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
-            "attempt_id": attempt_id, "profile_home": str(home),
-            "schema_pins": R2_SCHEMA_PINS, "execution_policy": "h1/proposal-v1",
-            "requester_id": resolved["requester_id"],
-            "project_id": resolved["project_id"],
-            "project_binding_id": resolved["project_binding_id"],
-            "mission_id": resolved["mission_id"], "mission_revision": resolved["mission_revision"],
-            "reservation_ref": resolved["reservation_ref"],
-            "request_digest": resolved["request_digest"],
-            "ticket_digest": resolved["ticket_digest"],
-            "authority_basis_digest": resolved["authority_basis_digest"],
-            "authority_digest": resolved["authority_digest"],
-            "observation_genesis": resolved["observation_genesis"],
-            "mission_request": resolved["mission_request"], "project": project}
-        fingerprint = _policy_digest(profile, entry, project, policy)
-        scope = _run_scope(profile, resolved["requester_id"], binding_digest)
-        initial_status = {"status": "queued", "session_id": session_id, "created_at": time.time()}
-        sink = None
-        cap = None
-        # Lost-ACK replay is allowed even while the original holds its launch unit.
-        if existing_attempt is None:
-            # The sink + cap exist ONLY in memory until b2b_admit commits the
-            # attempt — a failed preparation drops them with zero durable trace.
-            sink = _AttemptSink(adapter, store, profile=profile, entry=entry, keys=keys,
-                                attempt_id=attempt_id, session_id=session_id,
-                                binding_digest=binding_digest, run_id=run_id, policy=policy)
-            sink._work_lease = root_lease
-            cap = BoundExecution(
-                profile=profile, session_id=session_id, binding_digest=binding_digest,
-                attempt_id=attempt_id, run_id=run_id, policy=dict(policy),
-                sink=sink, created_at=time.time())
-
-            def _prepare() -> Optional[str]:
-                """Off-loop: owning profile scope + the bound execution, THEN
-                config/inputs/producer/readiness — the ContextVar is always reset.
-                The precommit subscriber recheck rides the SAME bounded worker
-                and budget: no second daemon, no second deadline, and no await
-                between the last subscriber check and the durable commit."""
-                from agent.b2b_execution import bind_execution, reset_execution
-                from gateway.platforms.api_server_b2b_execution import (
-                    b2b_execution_inputs_ready, b2b_execution_unavailable_code)
-                from gateway.platforms.api_server_b2b_context import prepare_b2b_context
-                try:
-                    with adapter._profile_scope(profile):
-                        token = bind_execution(cap)
-                        try:
-                            from gateway.run import _load_gateway_config
-                            from hermes_cli.plugins import discover_plugins, get_plugin_manager
-
-                            config = _load_gateway_config()
-                            discover_plugins()
-                            manager = get_plugin_manager()
-                            if manager.has_non_plugin_hook_subscribers():
-                                return "non_plugin_hook_subscribers"
-                            if not b2b_execution_inputs_ready(project, config):
-                                return "execution_inputs_unavailable"
-                            sink._context_preparation = prepare_b2b_context(
-                                cap, resolved=resolved)
-                            unavailable = b2b_execution_unavailable_code(project, config)
-                            if unavailable is not None:
-                                return unavailable
-                            if manager.has_non_plugin_hook_subscribers():
-                                return "non_plugin_hook_subscribers"
-                            return None
-                        finally:
-                            reset_execution(token)
-                except Exception:
-                    return "execution_unavailable"
-            # The ENTIRE preparation runs on ONE bounded daemon worker: a
-            # producer past the source budget costs this requester the same
-            # 503 as before, but its lease — and so its capacity unit — stays
-            # held until the worker's real finally.
-            try:
-                preparation_error = await run_bounded_lease_worker(
-                    root_lease, _prepare, deadline=_SOURCE_DEADLINE_S)
-            except Exception:
-                preparation_error = "execution_unavailable"
-            if preparation_error == "non_plugin_hook_subscribers":
-                return _deny(503, "non_plugin_hook_subscribers")
-            if preparation_error is not None:
-                return _deny(503, "execution_unavailable")
-        # Signed proof can expire while preparation was awaited: re-verify the
-        # freshness window on BOTH envelopes immediately before the durable
-        # commit — after the LAST awaited operation, same predicate the
-        # CAS/seal paths apply to their own source reads.
-        now = int(time.time())
-        if not all(env["issued_at"] <= now < env["expires_at"] for env in
-                   (resolved["_signed_request"], resolved["_signed_response"])):
-            return _deny(403, "source_denied")
-        outcome = store.b2b_admit(
+            return _deny(503, "execution_unavailable")
+        if preparation_stuck:
+            return _deny(503, "execution_unavailable")
+        # The sink + cap exist ONLY in memory until b2b_admit commits the
+        # attempt — a failed preparation drops them with zero durable trace.
+        sink = _AttemptSink(adapter, store, profile=profile, entry=entry, keys=keys,
+                            attempt_id=attempt_id, session_id=session_id,
+                            binding_digest=binding_digest, run_id=run_id, policy=policy)
+        cap = BoundExecution(
             profile=profile, session_id=session_id, binding_digest=binding_digest,
-            attempt_id=attempt_id, fingerprint=fingerprint,
-            binding_row={"profile": profile, "session_id": session_id,
-                         "binding_digest": binding_digest,
-                         "policy_json": json_utf8(policy).decode("utf-8")},
-            attempt_row={"attempt_id": attempt_id, "binding_digest": binding_digest,
-                         "profile": profile, "session_id": session_id, "status": "admitted",
-                         "run_id": run_id, "requester_id": resolved["requester_id"],
-                         "source_bind": _source_record(resolved)},
-            run_scope=scope, run_key=attempt_id, run_id=run_id,
-            run_fingerprint=fingerprint, run_status=initial_status,
-            owner_pid=getattr(adapter, "_run_owner_pid", 0),
-            owner_started=getattr(adapter, "_run_owner_started", 0))
-        if outcome.get("status") == "conflict":
-            return _deny(409, "conflict")
-        stored_run_id = outcome.get("run_id") or (
-            (outcome.get("attempt") or {}).get("run_id") if outcome.get("status") == "replayed" else run_id)
-        if outcome.get("status") == "replayed":
-            return _replayed_response(adapter, stored_run_id, attempt_id, binding_digest, profile, session_id)
-        adapter._run_idempotency_ids.add(stored_run_id)
+            attempt_id=attempt_id, run_id=run_id, policy=dict(policy),
+            sink=sink, created_at=time.time())
+
+        def _prepare() -> Optional[str]:
+            """Off-loop: owning profile scope + the bound execution, THEN
+            config/inputs/producer/readiness — the ContextVar is always reset."""
+            from agent.b2b_execution import bind_execution, reset_execution
+            from gateway.platforms.api_server_b2b_execution import (
+                b2b_execution_inputs_ready, b2b_execution_unavailable_code)
+            from gateway.platforms.api_server_b2b_context import prepare_b2b_context
+            try:
+                with adapter._profile_scope(profile):
+                    token = bind_execution(cap)
+                    try:
+                        from gateway.run import _load_gateway_config
+                        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+                        config = _load_gateway_config()
+                        discover_plugins()
+                        if get_plugin_manager().has_non_plugin_hook_subscribers():
+                            return "non_plugin_hook_subscribers"
+                        if not b2b_execution_inputs_ready(project, config):
+                            return "execution_inputs_unavailable"
+                        sink._context_preparation = prepare_b2b_context(
+                            cap, resolved=resolved)
+                        return b2b_execution_unavailable_code(project, config)
+                    finally:
+                        reset_execution(token)
+            except Exception:
+                return "execution_unavailable"
+        preparation_error = await _a.to_thread(_prepare)
+        if preparation_error == "non_plugin_hook_subscribers":
+            return _deny(503, "non_plugin_hook_subscribers")
+        if preparation_error is not None:
+            return _deny(503, "execution_unavailable")
+        limited = adapter._concurrency_limited_response()
+        if limited is not None:
+            return limited
+    # Signed proof can expire while session/DB checks were awaited: re-verify the
+    # freshness window on BOTH envelopes immediately before the durable commit —
+    # same predicate the CAS/seal paths apply to their own source reads.
+    now = int(time.time())
+    if not all(env["issued_at"] <= now < env["expires_at"] for env in
+               (resolved["_signed_request"], resolved["_signed_response"])):
+        return _deny(403, "source_denied")
+    if existing_attempt is None:
         try:
-            await lease_to_thread(db.set_session_title, session_id,
-                                  f"B2B {session_id}", work_lease=root_lease)
+            with adapter._profile_scope(profile):
+                from hermes_cli.plugins import get_plugin_manager
+
+                has_non_plugin_hooks = (
+                    get_plugin_manager().has_non_plugin_hook_subscribers())
         except Exception:
-            store.b2b_update_attempt(profile=profile, attempt_id=attempt_id, status="failed")
-            return _deny(500, "title_commit_failed")
-        # The admitted winner's run_id is the chosen one — the sink/cap built
-        # pre-admission already carry it (a replayed outcome returned above).
-        launched = await _spawn_run(adapter, request, cap=cap, resolved=resolved,
-                                    session_id=session_id, run_id=stored_run_id, profile=profile)
-        if launched is None:
-            sink.block("launch_failed")
-            return _deny(503, "launch_failed")
-        from aiohttp import web
-        return web.json_response({
-            "object": "b2b.proposal_attempt", "attempt_id": attempt_id,
-            "binding_digest": binding_digest, "run_id": stored_run_id, "profile": profile,
-            "session_id": session_id, "status": "admitted"})
-    finally:
-        if owns_lease:
-            root_lease.release()
+            return _deny(503, "execution_unavailable")
+        if has_non_plugin_hooks:
+            return _deny(503, "non_plugin_hook_subscribers")
+    outcome = store.b2b_admit(
+        profile=profile, session_id=session_id, binding_digest=binding_digest,
+        attempt_id=attempt_id, fingerprint=fingerprint,
+        binding_row={"profile": profile, "session_id": session_id,
+                     "binding_digest": binding_digest,
+                     "policy_json": json_utf8(policy).decode("utf-8")},
+        attempt_row={"attempt_id": attempt_id, "binding_digest": binding_digest,
+                     "profile": profile, "session_id": session_id, "status": "admitted",
+                     "run_id": run_id, "requester_id": resolved["requester_id"],
+                     "source_bind": _source_record(resolved)},
+        run_scope=scope, run_key=attempt_id, run_id=run_id,
+        run_fingerprint=fingerprint, run_status=initial_status,
+        owner_pid=getattr(adapter, "_run_owner_pid", 0),
+        owner_started=getattr(adapter, "_run_owner_started", 0))
+    if outcome.get("status") == "conflict":
+        return _deny(409, "conflict")
+    stored_run_id = outcome.get("run_id") or (
+        (outcome.get("attempt") or {}).get("run_id") if outcome.get("status") == "replayed" else run_id)
+    if outcome.get("status") == "replayed":
+        return _replayed_response(adapter, stored_run_id, attempt_id, binding_digest, profile, session_id)
+    adapter._run_idempotency_ids.add(stored_run_id)
+    try:
+        await _a.to_thread(db.set_session_title, session_id, f"B2B {session_id}")
+    except Exception:
+        store.b2b_update_attempt(profile=profile, attempt_id=attempt_id, status="failed")
+        return _deny(500, "title_commit_failed")
+    # The admitted winner's run_id is the chosen one — the sink/cap built
+    # pre-admission already carry it (a replayed outcome returned above).
+    launched = await _spawn_run(adapter, request, cap=cap, resolved=resolved,
+                                session_id=session_id, run_id=stored_run_id, profile=profile)
+    if launched is None:
+        sink.block("launch_failed")
+        return _deny(503, "launch_failed")
+    from aiohttp import web
+    return web.json_response({
+        "object": "b2b.proposal_attempt", "attempt_id": attempt_id,
+        "binding_digest": binding_digest, "run_id": stored_run_id, "profile": profile,
+        "session_id": session_id, "status": "admitted"})
 
 
 def _replayed_response(adapter: Any, run_id: Any, attempt_id: str, binding_digest: str,
@@ -1412,10 +1382,6 @@ async def _spawn_run(adapter: Any, request: Any, *, cap, resolved, session_id, r
     adapter._run_owners[run_id] = _run_scope(profile, resolved["requester_id"], cap.binding_digest)
     adapter._set_run_status(run_id, "queued", created_at=created_at,
                             session_id=session_id, model=None)
-    # The scheduled run task holds ONE ref of the launch's capacity unit — the
-    # task is already covered by the lease, so it is excluded from the count
-    # (no double count); the ref releases on done, even cancelled pre-tick.
-    work_lease = getattr(getattr(cap, "sink", None), "_work_lease", None)
     launch = _runs._RunLaunch(
         adapter, run_id, q, session_id, None, False, prompt, [],
         False, dict(ephemeral_system_prompt=None, session_id=session_id,
@@ -1425,31 +1391,10 @@ async def _spawn_run(adapter: Any, request: Any, *, cap, resolved, session_id, r
                     confirmed_runtime_lock=True),
         request_profile=profile if profile != "default" else None,
         browser_control_principal=None, browser_control_transport_family=None,
-        turn_author=None, b2b_execution=cap, work_lease=work_lease)
+        turn_author=None, b2b_execution=cap)
     adapter._activate_admitted_request()
-    ref = None
-    if work_lease is not None:
-        ref = work_lease.retain()
-    try:
-        task = adapter._active_run_tasks[run_id] = _a.create_task(
-            _runs._execute_run(adapter, launch, _api_server=sys.modules["gateway.platforms.api_server"]))
-    except BaseException:
-        if ref is not None:
-            with suppress(Exception):
-                ref.release()
-        raise
-    if ref is not None:
-        task.add_done_callback(lambda _t: ref.release())
-    capacity = getattr(adapter, "_capacity", None)
-    if capacity is not None:
-        try:
-            from gateway.platforms.api_server_capacity import capacity_home_key
-            capacity.note_task(
-                run_id,
-                work_lease.home_key if work_lease is not None else capacity_home_key(),
-                covered=work_lease is not None)
-        except Exception:
-            pass
+    task = adapter._active_run_tasks[run_id] = _a.create_task(
+        _runs._execute_run(adapter, launch, _api_server=sys.modules["gateway.platforms.api_server"]))
     try:
         adapter._background_tasks.add(task)
         task.add_done_callback(adapter._background_tasks.discard)
@@ -1490,39 +1435,23 @@ async def _handle_b2b_proposal_post(adapter: Any, request: Any):
         return _deny(400, "invalid_attempt_id")
     if (request.headers.get("Idempotency-Key") or "").strip() != attempt_id:
         return _deny(400, "idempotency_key_mismatch")
+    db = await adapter._ensure_session_db_async()
+    if db is None:
+        return _deny(503, "store_unavailable")
     store = adapter._run_idempotency_store
     if not _store_durable(store):
         return _deny(503, "store_unavailable")
-    # Durable replay discrimination may precede capacity: an already-committed
-    # attempt is served outside the ledger exactly as before. A NEW attempt
-    # reserves its ONE unit BEFORE the first native open/read — a surviving
-    # db-open worker would otherwise run unaccounted.
-    existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
-    lease = None
-    if existing_attempt is None:
-        from gateway.platforms.api_server_capacity import LaunchWorkLease
-        lease = _acquire_launch_lease(adapter, profile)
-        if not isinstance(lease, LaunchWorkLease):
-            return lease
-    try:
-        db = await adapter._ensure_session_db_async(work_lease=lease)
-        if db is None:
-            return _deny(503, "store_unavailable")
-        resolved, reason = await _resolve_source_async(
-            entry, keys, "bind", attempt_id=attempt_id, profile=profile, session_id=session_id)
-        if resolved is None:
-            # Any signed-source invalidity collapses to one refusal shape — the
-            # specific check is journal-side, never leaked to the caller.
-            return _deny(503 if reason == "source_unavailable" else 403,
-                         "source_unavailable" if reason == "source_unavailable" else "source_denied")
-        return await _launch_b2b_run(
-            adapter, request, profile=profile, entry=entry, keys=keys,
-            session_id=session_id, binding_digest=binding_digest, attempt_id=attempt_id,
-            resolved=resolved, store=store, db=db,
-            lease=lease, existing_attempt=existing_attempt)
-    finally:
-        if lease is not None:
-            lease.release()
+    resolved, reason = await _resolve_source_async(
+        entry, keys, "bind", attempt_id=attempt_id, profile=profile, session_id=session_id)
+    if resolved is None:
+        # Any signed-source invalidity collapses to one refusal shape — the
+        # specific check is journal-side, never leaked to the caller.
+        return _deny(503 if reason == "source_unavailable" else 403,
+                     "source_unavailable" if reason == "source_unavailable" else "source_denied")
+    return await _launch_b2b_run(
+        adapter, request, profile=profile, entry=entry, keys=keys,
+        session_id=session_id, binding_digest=binding_digest, attempt_id=attempt_id,
+        resolved=resolved, store=store, db=db)
 
 
 async def _b2b_get(adapter: Any, request: Any, *, want_context: bool):
