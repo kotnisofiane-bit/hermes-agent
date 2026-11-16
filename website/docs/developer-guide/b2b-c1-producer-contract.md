@@ -10,12 +10,20 @@ governed context produced by the installed `dubsar-agent-context` plugin.
 It is distinct from the operational model-path criterion C1 in L13-D4. Scope reference:
 https://github.com/kotnisofiane-bit/dubsar-platform/pull/120
 
+The original native evidence below records `dde57dec` and its preceding P2
+implementation. The pass-2 interface now requires a Python `prepare_context`
+hook. The external producer at `dubsar-hermes-profile@05d7394c` does not yet
+register it: admission with that unchanged plugin fails closed. This repository
+proves the generic contract with an unrelated directory plugin; enabling the
+native producer again requires the separate plugin change, not a core fallback.
+
 ## Delivery boundary
 
-P2 wires the governed C1 execution path end to end — proven locally by the
-native integration lane, not an installed deployment: admission now requires a
-live, current, mission-scoped context preparation built through the installed
-external `dubsar-agent-context` plugin — real native My Work mission reads
+The native integration lane proved the original P2 composition locally, not an
+installed deployment. Admission requires a live, current, mission-scoped
+context preparation supplied by exactly one `prepare_context` hook registered
+under the owning profile. The concrete external producer is responsible for
+real native My Work mission reads
 (`createB2BMissionPorts`), a real native Operational Context kernel read
 (`dubsar.my-work-oc-context-view/2` with a measured state projection), and a
 mission-qualified Memory Plane v2 read. Preparation runs before `b2b_admit`,
@@ -40,15 +48,26 @@ untyped 500. No attempt or binding is created by that refusal.
 ## Proof semantics
 
 The preparation binds, immutably: the exact Hermes home (resolved path), the
-frozen policy frame and catalogue project JSON, the loaded plugin module /
-manager / bound-runtime stamp identity, and the native OC `/2` source
+frozen policy frame and catalogue project JSON, the profile's plugin manager
+and registered callback identities, plus the plugin-owned configuration
+validator, and the native OC `/2` source
 observation —
 `state_projection.candidate.result_kind == "measured"` with explicit
 `source_observed_at` and a positive integer `freshness_max_age_ms`. The
 source window `observed <= now < observed + min(900000, freshness_max_age_ms)`
 is enforced at preparation, publication, configuration and every recheck;
 its deadline is stored in the preparation and is never extended by provider
-delay or another TTL. `/1` OC receipts and view/capture instants are never
+delay or another TTL.
+
+The POST's signed envelopes are checked again immediately before durable
+admission. Their short expiry does not govern preparation or publication after
+admission. Source authority is renewed by `before_provider`; the OC observation
+bound is never renewed. Typed preparation refusals reach the durable attempt
+classification without being replaced by a fixed `context_unavailable` reason.
+New attempts check capacity before native preparation and again afterwards,
+without reserving a slot; durable replay keeps its existing bypass.
+
+`/1` OC receipts and view/capture instants are never
 source observation and refuse as `context_oc_unqualified`. Preparation also
 validates the candidate render before admission (UTF-8, nonempty,
 ≤ `CONTEXT_MAX_BYTES`, ≤ 9000 chars, `bounds.render_chars` exact); the
@@ -81,6 +100,19 @@ Memory Plane origin, and allowlisted My Work and OC read ports. Its bound
 factory must create execution-local adapters without changing shared profile
 mappings. The base runtime's `my_work_*` pilot binding is not a substitute
 for the bound catalog's `project_context`.
+
+## Preparation interface
+
+A Python plugin registers `ctx.register_hook("prepare_context", callback)`.
+The synchronous callback receives `execution` as a keyword argument and returns
+`{"view": view, "rendered": rendered, "validate_configuration": validator}`.
+The zero-argument validator rebuilds/checks the plugin's configuration locally
+and returns literal `True` or raises a typed refusal; it performs no native
+source read or publication. Runtime imports, configuration stamps and private
+builder details belong entirely to the plugin. Hermes qualifies the returned
+view and render, binds the proof to the capability and profile, and rejects
+missing, ambiguous, changed or unloaded registrations. Publication stays in
+`pre_llm_call`.
 
 ## Publication interface and timing
 
@@ -138,7 +170,7 @@ signer/key ownership and verifier; it is not implemented or assumed here.
 ## P2 evidence and scope
 
 The native integration lane (`tests/gateway/test_api_server_b2b_native.py`,
-integration-marked, gated on `B2B_TEST_MY_WORK_ROOT`) demonstrates the full
+integration-marked, gated on `B2B_TEST_MY_WORK_ROOT`) demonstrated the original full
 path in one subprocessed host: real `APIServerAdapter.connect` with the
 unauthenticated model-gateway probe, real authenticated POST, Ed25519-signed
 source envelopes in both directions, durable admission, plugin discovery of
@@ -174,7 +206,10 @@ operator inputs alone. Merely supplying all operator inputs or changing
 health status cannot open execution — only a current, mission-scoped,
 source-fresh native proof bound to the attempt's own capability can.
 
-## Recorded verification — 15–16 November 2026
+## Recorded verification — 15–16 November 2026 (historical, before pass 2)
+
+Current pass-2 results are recorded in the task report; the counts below
+predate the `prepare_context` interface.
 
 Baseline: `82fee98f75a65fc508d76ef88d31fe0aa4e8a39b`. Resumed work:
 `fe2a14af9bce18f8aa661936e20b7776064af8f2`. No real provider was called: the
@@ -226,12 +261,12 @@ retained in `/srv/dubsar-lots/b2b-l13-p2r/evidence/`; the final task report is
 |---|---|
 | 1 — Agent proposes | Preserved: one iteration, no tools, no recovery/fallback (`api_server_b2b_execution.py:320-334`; `agent/b2b_execution.py:627-654`) |
 | 3 — No direct business action | Preserved: existing proposal-only terminal and dispatch CAS; no Tool/Composio surface added (`agent/b2b_execution.py:1185-1224`; `api_server_run_idempotency.py:445-479`) |
-| 4 — Changed situation invalidates | Advanced locally: native source observation window is not renewed, and OC drift blocks dispatch (`api_server_b2b_context.py:155-192,238-245`; native drift tests). Installed Core approval remains a separate qualification |
-| 5 — Decisions have evidence | Advanced for context/proposal: exact render, view, digests and fresh rechecks persist with the attempt (`api_server_b2b.py:1066-1093`; native artifact assertions) |
+| 4 — Changed situation invalidates | Advanced locally: native source observation window is not renewed, and OC drift blocks dispatch (`_assert_source_window`, `_PreparedContext._assert_window`; native drift tests). Installed Core approval remains a separate qualification |
+| 5 — Decisions have evidence | Advanced for context/proposal: exact render, view, digests and fresh rechecks persist with the attempt (`put_context` + `b2b_commit_context` persisted artifacts; typed durable refusal causes reach the durable attempt status; native artifact assertions) |
 | 6 — Approver sees AI inputs | Exact AI input is preserved (`agent/turn_context.py:745-851`; native render equality assertion). The complete approver UI and model/token display remain outside P2 |
 | 9 — One interchangeable model gateway | Existing pinned runtime and refusal of alternate routes preserved (`api_server_b2b_execution.py:247-334`; `agent/b2b_execution.py:1102-1136`). Installed G2 routing is not qualified here |
 | 10 — Chosen model/data only | Synthetic local proof only; host test egress fence (`tests/gateway/native_b2b/host.py:18-32`). Production network isolation and data policy remain P1/P3/P4/P15 requirements |
-| 11 — Claims match code | Health is not mission readiness; real components, doubles, incomplete suites and installation limits are identified above |
+| 11 — Claims match code | Health is not mission readiness; real components, doubles, incomplete suites and installation limits are identified above. Pass-2 proof uses an unrelated generic fake plugin; the external native producer's `prepare_context` update is pending |
 
 Principles 2, 7, 8 and 12 have no changed product surface in P2. Approval,
 global stop, cost tracking and the real Portal journey retain their separate

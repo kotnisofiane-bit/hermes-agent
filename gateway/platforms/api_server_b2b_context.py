@@ -1,9 +1,10 @@
 """C1 context preparation for the B2B execution lane — the host-side adapter
-to the INSTALLED ``dubsar-agent-context`` plugin's bound runtime.
+to the generic ``prepare_context`` plugin hook.
 
 P2 contract: an available plugin is not proof of producer readiness. A mission
 is admitted only after THIS capability's own preparation — a real, current,
 mission-scoped native read (My Work mission + native OC receipt + Memory Plane)
+returned by the profile's single registered ``prepare_context`` callback and
 qualified by ``agent.b2b_execution`` — has been captured, stamped and bound to
 this attempt's sink. Nothing here is a cache or a flag: the frozen preparation
 lives on the owning ``_AttemptSink`` for exactly one capability, and every later
@@ -11,21 +12,17 @@ gate re-proves the live configuration against it (``assert_current`` before
 admission, ``assert_publication`` at publication, ``assert_configuration_current``
 from the sink's policy gate).
 
-No new producer is added: ``build_agent_context_view_v2`` in the installed
-plugin is the only builder, and the worker-side ``pre_llm_call`` publication
-remains the only publisher. This module performs no preflight publish, reads no
-provider credentials, and never touches ``sys.path`` — the scoped package is
-imported under the already-loaded module's namespace.
+No new producer is added: whatever plugin registered ``prepare_context`` under
+the current profile's plugin manager is the only builder, and the worker-side
+``pre_llm_call`` publication remains the only publisher. This module performs
+no preflight publish and reads no provider credentials.
 """
 
 from __future__ import annotations
 
 import contextvars
-import importlib
-import sys
 import threading
 import time
-import types
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, Optional, Tuple
 
@@ -37,105 +34,58 @@ from agent.b2b_execution import (
 from gateway.platforms.api_server_b2b import _SOURCE_DEADLINE_S
 
 
-_CONTEXT_PLUGIN_ID = "dubsar-agent-context"
 _SOURCE_OBSERVED_MAX_AGE_MS = 900_000
 
 
-def _context_plugin(*, discover: bool = False):
-    """The already-loaded, enabled, error-free C1 plugin under the CURRENT
-    home's plugin manager — or ``None``. Health/diagnostics pass
-    ``discover=False``: plugin ``register()`` may do IO, so a status query
-    must never trigger a load; only bounded preparation may discover."""
+def _context_provider(*, discover: bool = False):
+    """The single registered ``prepare_context`` callback under the CURRENT
+    home's plugin manager — ``(manager, callback)`` or ``None``. Exactly one
+    callable must be registered: zero is "no producer", two or more is
+    ambiguity — both fail closed. Health/diagnostics pass ``discover=False``:
+    plugin ``register()`` may do IO, so a status query must never trigger a
+    load; only bounded preparation may discover."""
     from hermes_cli.plugins import discover_plugins, get_plugin_manager
     if discover:
         discover_plugins()
     manager = get_plugin_manager()
-    for loaded in getattr(manager, "_plugins", {}).values():
-        manifest = getattr(loaded, "manifest", None)
-        if (getattr(manifest, "name", None) == _CONTEXT_PLUGIN_ID
-                and getattr(loaded, "enabled", False)
-                and not getattr(loaded, "error", None)
-                and getattr(loaded, "module", None) is not None
-                and "pre_llm_call" in (getattr(loaded, "hooks_registered", None) or [])):
-            return manager, loaded
-    return None
+    callbacks = manager.iter_hook_callbacks("prepare_context")
+    if len(callbacks) != 1 or not callable(callbacks[0]):
+        return None
+    return manager, callbacks[0]
 
 
 def producer_available() -> bool:
     """Registration introspection for diagnostics (health/health-detailed):
-    is the C1 producer installed, enabled, error-free and hooked in THIS home?
+    is exactly one ``prepare_context`` callback registered in THIS home?
     Says nothing about any mission's readiness — an available producer still
     admits nothing without a current per-capability preparation."""
     try:
-        return _context_plugin(discover=False) is not None
+        return _context_provider(discover=False) is not None
     except Exception:
         return False
 
 
-def _plugin_modules(loaded: Any) -> Tuple[Any, Any]:
-    """Import ``runtime``/``assembly_v2`` under the LOADED module's own exact
-    namespace — ``<loaded.module.__name__>.dubsar_agent_context.<mod>``.
-    Scoped-package imports only; no parent-prefix fallback, no sys.path or
-    raw paths."""
-    prefix = loaded.module.__name__
-    runtime = importlib.import_module(prefix + ".dubsar_agent_context.runtime")
-    assembly = importlib.import_module(prefix + ".dubsar_agent_context.assembly_v2")
-    return runtime, assembly
-
-
-def _bound_runtime(cap: BoundExecution, *, discover: bool = True):
-    """Fresh PluginContext -> RuntimeAdapter -> bound factory for THIS cap,
-    built entirely through the installed plugin's own constructors. Returns
-    ``(bound, loaded, assembly)``; any missing/mismatched/readonly/version/
-    origin/port/pin failure surfaces as the typed refusal — fail closed."""
-    found = _context_plugin(discover=discover)
-    if found is None:
-        raise B2BTerminalRefusal("context_unavailable")
-    manager, loaded = found
-    try:
-        runtime, assembly = _plugin_modules(loaded)
-    except Exception:
-        raise B2BTerminalRefusal("context_unavailable") from None
-    try:
-        from hermes_cli.plugins import PluginContext
-        ctx = PluginContext(loaded.manifest, manager)
-        base = runtime.RuntimeAdapter.from_plugin_context(ctx)
-        bound = runtime.RuntimeAdapter.for_bound_execution(
-            base, cap, cap.policy_get("project"))
-    except B2BTerminalRefusal:
-        raise
-    except Exception:
-        raise B2BTerminalRefusal("context_unavailable") from None
-    if getattr(bound, "_bound_stamp", None) is None:
-        raise B2BTerminalRefusal("context_unavailable")
-    return bound, loaded, assembly
-
-
-def _native_build(bound: Any, assembly: Any):
-    """One real native read through the plugin's OWN builder — the same call
-    the worker's ``pre_llm_call`` makes. No second producer, no fixture."""
-    return assembly.build_agent_context_view_v2(
-        bound, preserve_native_oc_receipt=True,
-        include_automation_results=bound._bound_include_automation_results)
-
-
-def _bounded_native_read(cap: BoundExecution, deadline: float):
-    """The preparation's native read, bounded off-loop by the signed source
-    window and the standing source budget (pattern: ``recheck_context``). The
-    build runs on a daemon thread under ``copy_context``; the caller Event-
-    waits the remaining budget and is the ONLY attacher — a late completion
-    can never admit anything."""
-    budget = max(0.0, min(deadline - time.time(), _SOURCE_DEADLINE_S))
-    if budget <= 0:
-        raise B2BTerminalRefusal("context_unavailable")
+def _bounded_native_read(cap: BoundExecution):
+    """The preparation's native read, bounded off-loop by the standing source
+    budget (pattern: ``recheck_context``). The callback runs on a daemon
+    thread under ``copy_context``; the caller Event-waits the budget and is
+    the ONLY attacher — a late completion can never admit anything."""
+    budget = _SOURCE_DEADLINE_S
     outcome: Dict[str, Any] = {}
     done = threading.Event()
     invoke_context = contextvars.copy_context()
 
     def _invoke() -> None:
         try:
-            bound, loaded, assembly = _bound_runtime(cap)
-            outcome["value"] = (_native_build(bound, assembly), bound, loaded)
+            found = _context_provider(discover=True)
+            if found is None:
+                raise B2BTerminalRefusal("context_unavailable")
+            manager, prepare = found
+            result = prepare(execution=cap)
+            if (not isinstance(result, Mapping)
+                    or not callable(result.get("validate_configuration"))):
+                raise B2BTerminalRefusal("context_unavailable")
+            outcome["value"] = result, manager, prepare
         except BaseException as exc:  # noqa: BLE001 -- normalized below
             outcome["error"] = exc
         finally:
@@ -195,18 +145,15 @@ def _assert_source_window(plain: Mapping[str, Any]) -> Tuple[int, int]:
 @dataclass(frozen=True)
 class _PreparedContext:
     """The frozen proof bound to ONE capability's sink: the qualified view,
-    the bound-factory stamp, the loaded plugin objects and the signed-source
-    deadline plus the source's own observation deadline. Immutable; scoped to
-    ``cap`` by identity — never a global cache."""
+    the registering manager/callback identities, the plugin-owned
+    configuration validator and the source's own observation deadline.
+    Immutable; scoped to ``cap`` by identity — never a global cache."""
 
     cap: BoundExecution
     view: Mapping[str, Any]
-    stamp: Any
-    module_name: str
-    module: types.ModuleType
     manager: Any
-    loaded: Any
-    deadline: float
+    prepare: Any
+    validate_configuration: Any
     source_deadline_ms: int
     project_utf8: bytes
     profile: str
@@ -222,50 +169,50 @@ class _PreparedContext:
                 json_utf8(cap.policy_get("project")) != self.project_utf8):
             raise B2BTerminalRefusal("b2b_policy_changed")
 
-    def _assert_stamp(self, cap: BoundExecution) -> None:
-        """The configuration the preparation read under — plugin still the
-        SAME loaded module object under the SAME manager, and a freshly
-        rebuilt bound factory carries the SAME stamp."""
-        if sys.modules.get(self.module_name) is not self.module:
+    def _assert_stamp(self) -> None:
+        """The configuration the preparation read under — the SAME callback
+        still registered under the SAME manager, and the plugin's own
+        zero-argument validator re-proves its configuration. The validator
+        performs no publication/native IO; any non-``True`` answer or error
+        fails closed."""
+        found = _context_provider(discover=False)
+        if found is None or found[0] is not self.manager or found[1] is not self.prepare:
             raise B2BTerminalRefusal("context_unavailable")
-        from hermes_cli.plugins import get_plugin_manager
-        if get_plugin_manager() is not self.manager:
-            raise B2BTerminalRefusal("context_unavailable")
-        bound, loaded, _assembly = _bound_runtime(cap, discover=False)
-        if loaded is not self.loaded or bound._bound_stamp != self.stamp:
+        try:
+            current = self.validate_configuration()
+        except B2BTerminalRefusal:
+            raise
+        except Exception:
+            raise B2BTerminalRefusal("context_unavailable") from None
+        if current is not True:
             raise B2BTerminalRefusal("b2b_policy_changed")
 
-    def _assert_window(self, cap: BoundExecution) -> None:
-        """The source's own observation deadline governs every gate; the
-        signed-source deadline additionally governs while the lane is still
-        pre-publication. Neither is extended by TTL or provider waiting."""
+    def _assert_window(self) -> None:
+        """The source's own observation deadline governs every gate; it is
+        never extended by TTL or provider waiting."""
         if int(time.time() * 1000) >= self.source_deadline_ms:
             raise B2BTerminalRefusal("context_oc_source_stale")
-        if cap.context_receipt is None and time.time() >= self.deadline:
-            raise B2BTerminalRefusal("source_window_closed")
 
     def assert_current(self, cap: Optional[BoundExecution]) -> None:
         self._assert_frame(cap)
-        self._assert_window(cap)
-        self._assert_stamp(cap)
+        self._assert_window()
+        self._assert_stamp()
 
     def assert_configuration_current(self) -> bool:
         """Recheck for the sink's policy gates (which run under the owning
         profile's scope, possibly outside a bound execution ContextVar):
         same cap/home/project, source still inside its own observation
-        deadline, same loaded plugin objects, same stamp."""
-        try:
-            self._assert_frame(self.cap)
-            self._assert_window(self.cap)
-            self._assert_stamp(self.cap)
-            return True
-        except Exception:
-            return False
+        deadline, same registered callback, validator still ``True``. Typed
+        refusals propagate — the caller classifies them durably."""
+        self._assert_frame(self.cap)
+        self._assert_window()
+        self._assert_stamp()
+        return True
 
     def assert_publication(self, cap: Optional[BoundExecution], receipt: Any) -> None:
         """The published receipt must BE this preparation's mission: same
-        cap, still inside both deadlines, same stamp — and a source-
-        equivalent view with a still-current source observation. The
+        cap, still inside the source deadline, same registration — and a
+        source-equivalent view with a still-current source observation. The
         publishing hook already performed its own fresh native read; no
         second read happens here."""
         self.assert_current(cap)
@@ -278,9 +225,10 @@ class _PreparedContext:
 
 
 def prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) -> _PreparedContext:
-    """Read + qualify the mission's context for THIS capability, before the
-    signed source deadline. Returns the frozen preparation (the CALLER decides
-    whether to attach it — a late result attaches nothing) or raises
+    """Read + qualify the mission's context for THIS capability via the
+    profile's ``prepare_context`` callback, inside the standing source
+    budget. Returns the frozen preparation (the CALLER decides whether to
+    attach it — a late result attaches nothing) or raises
     ``B2BTerminalRefusal`` — the caller maps it to ``execution_unavailable``.
 
     No durable write, no admission, no agent, no provider call, no
@@ -289,15 +237,17 @@ def prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) -> 
     """
     if not isinstance(cap, BoundExecution) or getattr(cap, "sink", None) is None:
         raise B2BTerminalRefusal("context_unavailable")
-    req, resp = resolved.get("_signed_request"), resolved.get("_signed_response")
-    if not isinstance(req, Mapping) or not isinstance(resp, Mapping):
-        raise B2BTerminalRefusal("context_unavailable")
-    deadline = min(float(req["expires_at"]), float(resp["expires_at"]))
-    if time.time() >= deadline:
-        raise B2BTerminalRefusal("source_window_closed")
 
-    built, bound, loaded = _bounded_native_read(cap, deadline)
-    view, rendered = built
+    # The cap is bound to the home that minted it. A generic producer must not
+    # decide that; the host refuses a foreign-home cap before any callback.
+    from hermes_constants import get_hermes_home
+    if str(get_hermes_home().resolve()) != cap.policy_get("profile_home"):
+        raise B2BTerminalRefusal("b2b_policy_changed")
+
+    result, manager, prepare = _bounded_native_read(cap)
+    view, rendered = result.get("view"), result.get("rendered")
+    if not isinstance(view, Mapping):
+        raise B2BTerminalRefusal("context_unavailable")
     plain = qualify_context_view(cap, view)
 
     # P2 proof bar: NATIVE OC metadata only — a legacy arbitrary view cannot
@@ -330,41 +280,41 @@ def prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) -> 
 
     _observed_ms, source_deadline_ms = _assert_source_window(plain)
 
-    if time.time() >= deadline:
-        raise B2BTerminalRefusal("source_window_closed")
-    stamp = bound._bound_stamp
-    bound2, loaded2, _assembly2 = _bound_runtime(cap)
-    if loaded2 is not loaded or bound2._bound_stamp != stamp:
-        raise B2BTerminalRefusal("b2b_policy_changed")
-
-    from hermes_cli.plugins import get_plugin_manager
-    from hermes_constants import get_hermes_home
-    return _PreparedContext(
-        cap=cap, view=_deep_freeze(plain), stamp=stamp,
-        module_name=loaded.module.__name__,
-        module=loaded.module, manager=get_plugin_manager(), loaded=loaded,
-        deadline=deadline, source_deadline_ms=source_deadline_ms,
+    prepared = _PreparedContext(
+        cap=cap, view=_deep_freeze(plain), manager=manager, prepare=prepare,
+        validate_configuration=result["validate_configuration"],
+        source_deadline_ms=source_deadline_ms,
         project_utf8=json_utf8(cap.policy_get("project")),
         profile=cap.profile,
         home=str(get_hermes_home().resolve()),
         policy_home=cap.policy_get("profile_home"))
+    # The plugin's configuration must not have drifted during the read.
+    prepared.assert_current(cap)
+    return prepared
+
+
+def assert_prepared_context_current(cap: Optional[BoundExecution], project: Any) -> None:
+    """The TYPED readiness assertion: raise ``B2BTerminalRefusal`` with the
+    preparation's exact durable cause whenever a live, current,
+    mission-scoped preparation is not attached to THIS capability's sink."""
+    if cap is None or getattr(cap, "sink", None) is None:
+        raise B2BTerminalRefusal("context_unavailable")
+    preparation = getattr(cap.sink, "_context_preparation", None)
+    if preparation is None or preparation.cap is not cap:
+        raise B2BTerminalRefusal("context_unavailable")
+    if json_utf8(project) != preparation.project_utf8:
+        raise B2BTerminalRefusal("b2b_policy_changed")
+    preparation.assert_current(cap)
 
 
 def prepared_context_ready(cap: Optional[BoundExecution], project: Any) -> bool:
     """THE readiness predicate: is a live, current, mission-scoped preparation
     attached to THIS capability's sink — under the same project policy, inside
-    its signed window? No cap, no preparation, a stale stamp or a closed
-    window all answer False — an installed plugin or complete config alone
-    can never answer True."""
-    if cap is None or getattr(cap, "sink", None) is None:
-        return False
-    preparation = getattr(cap.sink, "_context_preparation", None)
-    if preparation is None or preparation.cap is not cap:
-        return False
-    if json_utf8(project) != preparation.project_utf8:
-        return False
+    its source window? No cap, no preparation, a stale registration or a
+    closed window all answer False — an installed plugin or complete config
+    alone can never answer True."""
     try:
-        preparation.assert_current(cap)
+        assert_prepared_context_current(cap, project)
         return True
     except Exception:
         return False

@@ -86,11 +86,18 @@ def guard_agent_construction(
     # P2: construction requires this capability's current native context
     # preparation under its owning profile. Publication follows in the
     # admitted worker's pre_llm_call hook. Missing or stale preparation
-    # refuses before run_agent import and runtime/credential/tool resolution.
+    # refuses before run_agent import and runtime/credential/tool resolution —
+    # durably, with the preparation's own TYPED cause.
     from gateway.run import _load_gateway_config
-    if not b2b_execution_ready(project, _load_gateway_config()):
-        cap.sink.block("context_unavailable")
-        raise B2BTerminalRefusal("context_unavailable")
+    from gateway.platforms.api_server_b2b_context import (
+        assert_prepared_context_current)
+    try:
+        assert_prepared_context_current(cap, project)
+        if not b2b_execution_inputs_ready(project, _load_gateway_config()):
+            raise B2BTerminalRefusal("context_unavailable")
+    except B2BTerminalRefusal as exc:
+        cap.sink.block(str(exc))
+        raise
     return cap
 
 

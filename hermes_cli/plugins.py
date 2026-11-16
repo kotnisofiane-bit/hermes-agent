@@ -201,11 +201,16 @@ VALID_HOOKS: Set[str] = {
     # IGNORED in v1 — a plugin returning a directive-shaped dict gets a debug log so future block/rewrite
     # adopters are discoverable once the middleware variant ships against the #64231 taxonomy.
     "pre_command",
+    # Python-only preparation: execution -> view, rendered, validate_configuration.
+    "prepare_context",
 }
 
 # Hooks whose directive the shell-hook response parser has no channel for. VALID_HOOKS doubles as
 # the shell-hook allow-list, so these are refused loudly instead of having output silently ignored.
-SHELL_UNSUPPORTED_HOOKS: Set[str] = {"transform_api_error_classification"}
+SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "transform_api_error_classification",
+    "prepare_context",
+}
 
 _env_enabled = env_var_enabled  # imported by plugins/memory
 _UNSET = object()

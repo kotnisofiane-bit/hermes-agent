@@ -915,13 +915,17 @@ class _AttemptSink:
                 _policy_digest(self.profile, entry, project, self.policy) == self._fingerprint):
             return False
         # P2: when a preparation is attached, the producer's live configuration
-        # (roots/mappings/origin/version/read-ports/module) must still match the
-        # stamp it read under — config drift revokes the lane like policy drift.
+        # must still satisfy the plugin's own validator — config drift revokes
+        # the lane like policy drift. A TYPED refusal is a durable terminal
+        # cause: block with that exact reason and rethrow, never flatten it.
         preparation = self._context_preparation
         if preparation is not None:
             try:
                 if not preparation.assert_configuration_current():
                     return False
+            except B2BTerminalRefusal as exc:
+                self.block(str(exc))
+                raise
             except Exception:
                 return False
         return True
@@ -1066,7 +1070,7 @@ class _AttemptSink:
     def put_context(self, receipt: Any) -> None:
         """Persist the published context (view + rendered bytes + digest) once."""
         # The accepted receipt must BE the attached preparation's mission —
-        # same cap, same stamp, same source basis, still inside both windows.
+        # same cap, same configuration, same source basis, inside the OC window.
         preparation = self._context_preparation
         if preparation is not None:
             from agent.b2b_execution import current_execution
@@ -1200,8 +1204,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         return _deny(404, "not_found")
     # P2 admission gate: NEW work proves its mission context BEFORE the single
     # durable attempt is consumed — the sink/cap are built in memory first,
-    # then prepare_b2b_context does the real native read (already-loaded
-    # dubsar-agent-context plugin, bound to THIS cap) inside the owning
+    # then prepare_b2b_context does the real native read (the profile's
+    # prepare_context plugin callback, bound to THIS cap) inside the owning
     # profile scope, attaches the frozen preparation to the sink, and only
     # then is readiness (the same single classifier /health/detailed reports)
     # consulted. Any source/producer error is 503 execution_unavailable with
@@ -1233,6 +1237,12 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     cap = None
     # Lost-ACK replay is allowed even while the original holds the final native worker slot.
     if existing_attempt is None:
+        # Cheap capacity check BEFORE the expensive native preparation — only
+        # for NEW attempts; the post-preparation check below still stands and
+        # no slot is reserved here.
+        limited = adapter._concurrency_limited_response()
+        if limited is not None:
+            return limited
         # The sink + cap exist ONLY in memory until b2b_admit commits the
         # attempt — a failed preparation drops them with zero durable trace.
         sink = _AttemptSink(adapter, store, profile=profile, entry=entry, keys=keys,

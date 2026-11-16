@@ -399,10 +399,9 @@ def test_create_agent_b2b_constructs_bounded_agent_when_ready(
     # An UNRELATED default-route credential is present: a bare loopback custom
     # pin must resolve its own placeholder, never adopt the foreign key.
     monkeypatch.setenv("OPENAI_API_KEY", "sk-unit-unrelated-" + "0" * 8)
-    # TEST-ONLY availability lift: production ``b2b_execution_ready`` stays
-    # False until the C1 producer ships — no production bypass is added.
-    monkeypatch.setattr(
-        b2b_exec, "b2b_execution_ready", lambda *a, **k: True)
+    # TEST-ONLY availability lift: a unit preparation stand-in supplies the
+    # per-capability proof; production keeps requiring the real read.
+    lane.sink._context_preparation = _UnitPreparation(lane.cap)
     token = _api_request_profile.set(lane.profile)
     cap_token = bind_execution(lane.cap)
     try:
@@ -589,8 +588,9 @@ def test_construct_b2b_agent_pinned_openrouter_route(tmp_path, monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-unit-" + "1" * 8)
     for name in ("OPENAI_API_KEY", "OPENAI_BASE_URL"):
         monkeypatch.delenv(name, raising=False)
-    monkeypatch.setattr(
-        b2b_exec, "b2b_execution_ready", lambda *a, **k: True)
+    # TEST-ONLY availability lift: a unit preparation stand-in supplies the
+    # per-capability proof; production keeps requiring the real read.
+    lane.sink._context_preparation = _UnitPreparation(lane.cap)
     import agent.agent_init as ainit
     ainit._ra()._openrouter_prewarm_done.clear()
 
@@ -664,8 +664,9 @@ def test_construct_b2b_agent_named_custom_provider(tmp_path, monkeypatch):
         raise AssertionError("model metadata fetch must not run")
 
     monkeypatch.setattr(ainit, "fetch_model_metadata", _no_metadata)
-    monkeypatch.setattr(
-        b2b_exec, "b2b_execution_ready", lambda *a, **k: True)
+    # TEST-ONLY availability lift: a unit preparation stand-in supplies the
+    # per-capability proof; production keeps requiring the real read.
+    lane.sink._context_preparation = _UnitPreparation(lane.cap)
     token = _api_request_profile.set(lane.profile)
     cap_token = bind_execution(lane.cap)
     try:
@@ -1360,18 +1361,23 @@ class _UnitPreparation:
     it never feeds readiness (assert_* are explicit stubs)."""
 
     def __init__(self, cap, *, current=True, configuration=True,
-                 publication=None):
+                 publication=None, current_error=None,
+                 configuration_error=None):
         from agent.b2b_execution import json_utf8
         self.cap = cap
         self.project_utf8 = json_utf8(cap.policy_get("project"))
         self._current, self._configuration, self._publication = (
             current, configuration, publication)
+        self._current_error = current_error or "source_window_closed"
+        self._configuration_error = configuration_error
 
     def assert_current(self, cap):
         if not self._current:
-            raise B2BTerminalRefusal("source_window_closed")
+            raise B2BTerminalRefusal(self._current_error)
 
     def assert_configuration_current(self):
+        if self._configuration_error is not None:
+            raise B2BTerminalRefusal(self._configuration_error)
         return self._configuration
 
     def assert_publication(self, cap, receipt):
@@ -1728,3 +1734,419 @@ def test_source_window_unqualified_receipts(frozen_source_now, view):
     with pytest.raises(B2BTerminalRefusal) as excinfo:
         _assert_source_window(view)
     assert excinfo.value.args[0] == "context_oc_unqualified"
+
+
+# ======================================================================
+# Generic ``prepare_context`` plugin hook — profile-scoped producer
+# selection through the real plugin manager (no named plugin).
+# ======================================================================
+
+_FAKE_PLUGIN_NAME = "unitctx-producer"
+
+_FAKE_PLUGIN_INIT = '''\
+def register(ctx):
+    def prepare_context(*, execution):
+        from agent.b2b_execution import B2BTerminalRefusal
+        from tests.gateway.b2b_process_harness import (
+            UNIT_RENDERED, build_unit_native_oc_view)
+        stamp = ctx.get_config("preparation_stamp")
+
+        def validate_configuration():
+            if ctx.get_config("preparation_stamp") != stamp:
+                raise B2BTerminalRefusal("b2b_policy_changed")
+            return True
+
+        view = build_unit_native_oc_view(
+            execution.policy, {"mission_source_digest": "c" * 64},
+            ordered=True)
+        return {"view": view, "rendered": UNIT_RENDERED,
+                "validate_configuration": validate_configuration}
+    ctx.register_hook("prepare_context", prepare_context)
+'''
+
+_FAKE_PLUGIN_TRIPWIRE_INIT = '''\
+def register(ctx):
+    def prepare_context(*, execution):
+        raise AssertionError("callback must not run for a foreign-home cap")
+    ctx.register_hook("prepare_context", prepare_context)
+'''
+
+
+def _write_fake_plugin(home, *, name=_FAKE_PLUGIN_NAME, init=_FAKE_PLUGIN_INIT):
+    """One unrelated directory plugin under ``<home>/plugins`` — loaded only
+    through the real discovery/manifest path, never by test fiat."""
+    plug = home / "plugins" / name
+    plug.mkdir(parents=True, exist_ok=True)
+    (plug / "plugin.yaml").write_text(
+        f"name: {name}\nversion: 1.0.0\ndescription: unit fake producer\n")
+    (plug / "__init__.py").write_text(init)
+
+
+def _plugin_config(home, *, stamp="stamp-a", names=(_FAKE_PLUGIN_NAME,)):
+    """Append the serving config's plugin opt-in + entry settings."""
+    enabled = "".join(f"    - {n}\n" for n in names)
+    entries = "".join(
+        f"    {n}:\n      settings:\n        preparation_stamp: {stamp}\n"
+        for n in names)
+    with open(os.path.join(str(home), "config.yaml"), "a") as fh:
+        fh.write("plugins:\n  enabled:\n" + enabled +
+                 "  entries:\n" + entries)
+
+
+@pytest.fixture
+def fake_plugin_home(tmp_path, monkeypatch):
+    """A separate HERMES_HOME carrying the fake producer; the active home is
+    bound by set_hermes_home_override so the manager cache stays real."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    home = tmp_path / "plugin-home"
+    home.mkdir()
+    _write_fake_plugin(home)
+    _plugin_config(home)
+    now = [1793361605.0]
+    monkeypatch.setattr(
+        b2b_ctx, "time", SimpleNamespace(time=lambda: now[0]))
+    token = set_hermes_home_override(home)
+    yield SimpleNamespace(home=home, now=now)
+    reset_hermes_home_override(token)
+
+
+def _prepare_resolved(now_s):
+    """The resolved envelope shape prepare consumed pre-refactor; the hook
+    contract itself only needs the mission source digest."""
+    return {"mission_source_digest": "c" * 64,
+            "_signed_request": {"issued_at": now_s - 1,
+                                "expires_at": now_s + 30},
+            "_signed_response": {"issued_at": now_s - 1,
+                                 "expires_at": now_s + 29}}
+
+
+def test_prepare_context_hook_generic_producer(tmp_path, fake_plugin_home):
+    """REAL discovery: an unrelated directory plugin registering
+    ``prepare_context`` under THIS home supplies the mission view — the
+    returned preparation is bound to this cap and passes its own gates."""
+    from hermes_cli.plugins import discover_plugins
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    lane = _ready_lane(tmp_path)
+    discover_plugins()
+    assert b2b_ctx.producer_available() is True
+    prep = b2b_ctx.prepare_b2b_context(
+        lane.cap, resolved=_prepare_resolved(fake_plugin_home.now[0]))
+    assert prep.cap is lane.cap
+    prep.assert_current(lane.cap)
+    assert prep.assert_configuration_current() is True
+    lane.store.close()
+
+
+def test_prepare_context_profile_scope_a_b_a(tmp_path, monkeypatch,
+                                             fake_plugin_home):
+    """Profile scope is the plugin manager's own: a proof produced under home
+    A fails closed while home B is active (different manager, foreign
+    callback), is valid again on return to A's cached manager — and a cap
+    minted under A can never be PREPARED under B: the host binding refuses
+    before B's own producer callback may run."""
+    from hermes_cli.plugins import discover_plugins
+    from hermes_constants import (
+        reset_hermes_home_override, set_hermes_home_override)
+    from agent.secret_scope import is_multiplex_active, set_multiplex_active
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    lane = _ready_lane(tmp_path)
+    home_b = tmp_path / "plugin-home-b"
+    home_b.mkdir()
+    _write_fake_plugin(home_b, init=_FAKE_PLUGIN_TRIPWIRE_INIT)
+    _plugin_config(home_b)
+    # The profile manager cache is exercised under the real multiplexer latch,
+    # so each scoped home is an actual isolated profile, not a loose path.
+    previous_multiplex = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        prep = b2b_ctx.prepare_b2b_context(
+            lane.cap, resolved=_prepare_resolved(fake_plugin_home.now[0]))
+        token_b = set_hermes_home_override(home_b)
+        try:
+            discover_plugins()
+            # B carries a real producer of its own — but A's cap is foreign
+            # here: the host refuses before B's callback can run.
+            assert b2b_ctx.producer_available() is True
+            with pytest.raises(B2BTerminalRefusal) as exc:
+                b2b_ctx.prepare_b2b_context(
+                    lane.cap,
+                    resolved=_prepare_resolved(fake_plugin_home.now[0]))
+            assert str(exc.value) == "b2b_policy_changed"
+            with pytest.raises(B2BTerminalRefusal):
+                prep.assert_current(lane.cap)
+            with pytest.raises(B2BTerminalRefusal):
+                prep.assert_configuration_current()
+        finally:
+            reset_hermes_home_override(token_b)
+        # Back under home A the SAME preparation is live again.
+        prep.assert_current(lane.cap)
+        assert prep.assert_configuration_current() is True
+    finally:
+        set_multiplex_active(previous_multiplex)
+    lane.store.close()
+
+
+def test_prepare_context_config_mutation_and_unload_reject(
+        tmp_path, fake_plugin_home):
+    """The returned validator re-reads plugin-owned configuration: mutating
+    the entry's settings revokes the proof (typed b2b_policy_changed), and
+    unloading the plugin removes the callback (context_unavailable)."""
+    from hermes_cli.plugins import discover_plugins, get_plugin_manager
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    lane = _ready_lane(tmp_path)
+    discover_plugins()
+    prep = b2b_ctx.prepare_b2b_context(
+        lane.cap, resolved=_prepare_resolved(fake_plugin_home.now[0]))
+    _plugin_config(fake_plugin_home.home, stamp="stamp-b")
+    with pytest.raises(B2BTerminalRefusal):
+        prep.assert_current(lane.cap)
+    _plugin_config(fake_plugin_home.home, stamp="stamp-a")
+    prep.assert_current(lane.cap)
+    manager = get_plugin_manager()
+    manager.unload(_FAKE_PLUGIN_NAME)
+    with pytest.raises(B2BTerminalRefusal) as exc:
+        prep.assert_current(lane.cap)
+    assert str(exc.value) == "context_unavailable"
+    lane.store.close()
+
+
+def test_prepare_context_ambiguity_fails_closed(tmp_path, monkeypatch,
+                                                fake_plugin_home):
+    """Exactly ONE prepare_context callback is permitted per profile: a second
+    registering plugin makes the producer unavailable — never first-wins."""
+    from hermes_cli.plugins import discover_plugins
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    lane = _ready_lane(tmp_path)
+    _write_fake_plugin(fake_plugin_home.home, name="unitctx-second")
+    _plugin_config(fake_plugin_home.home,
+                   names=(_FAKE_PLUGIN_NAME, "unitctx-second"))
+    discover_plugins()
+    assert b2b_ctx.producer_available() is False
+    with pytest.raises(B2BTerminalRefusal) as exc:
+        b2b_ctx.prepare_b2b_context(
+            lane.cap, resolved=_prepare_resolved(fake_plugin_home.now[0]))
+    assert str(exc.value) == "context_unavailable"
+    lane.store.close()
+
+
+def test_prepare_context_producer_presence_is_not_readiness(
+        tmp_path, monkeypatch, fake_plugin_home):
+    """A registered producer changes the UNAVAILABLE CODE only: health stays
+    not-ready (c1_context_required) until a per-capability proof exists."""
+    from pathlib import Path
+    from hermes_constants import (
+        reset_hermes_home_override, set_hermes_home_override)
+    from hermes_cli.plugins import discover_plugins
+    from hermes_cli.profiles import get_profile_dir
+    lane = _ready_lane(tmp_path)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    hub_home = get_profile_dir("hub")
+    hub_home.mkdir(parents=True, exist_ok=True)
+    _write_serving_config(hub_home)
+    _write_fake_plugin(hub_home)
+    _plugin_config(hub_home)
+    token = set_hermes_home_override(hub_home)
+    try:
+        discover_plugins()
+    finally:
+        reset_hermes_home_override(token)
+    state = _state({"hub": _lane_entry(lane)})
+    status = b2b_execution_status(_status_adapter(state))
+    assert status["b2b_execution_profiles"] == {
+        "hub": {"state": "not-ready", "code": "c1_context_required"}}
+    lane.store.close()
+
+
+# --- Goal B: preparation/publication obey the OC source deadline only -----
+
+
+def _bare_prepared(cap, *, source_deadline_ms):
+    """A _PreparedContext instance populated field-by-field (frozen dataclass
+    on either side of the refactor); the stamp hook is stubbed by callers."""
+    from agent.b2b_execution import json_utf8
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    from hermes_constants import get_hermes_home
+    prep = object.__new__(b2b_ctx._PreparedContext)
+    for name, value in {
+            "cap": cap, "view": None, "stamp": None, "module_name": "",
+            "module": None, "manager": None, "loaded": None, "prepare": None,
+            "validate_configuration": lambda: True, "deadline": 0.0,
+            "source_deadline_ms": source_deadline_ms,
+            "project_utf8": json_utf8(cap.policy_get("project")),
+            "profile": cap.profile,
+            "home": str(get_hermes_home().resolve()),
+            "policy_home": cap.policy_get("profile_home")}.items():
+        object.__setattr__(prep, name, value)
+    return prep
+
+
+def test_prepared_context_governed_by_oc_deadline_not_post_ttl(
+        tmp_path, monkeypatch):
+    """The signed envelope TTL gates ADMISSION only: a preparation made while
+    the POST window was open must still pass assert_current AND
+    assert_publication after that window closed — the source's own OC
+    deadline is the only freshness bound left."""
+    from agent.b2b_execution import qualify_context_view, source_basis
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    from tests.gateway.b2b_process_harness import build_unit_native_oc_view
+    lane = _ready_lane(tmp_path)
+    lane.sink.context_receipt = None
+    object.__setattr__(lane.cap, "_receipt", None)
+    now = [1793361605.0]
+    monkeypatch.setattr(
+        b2b_ctx, "time", SimpleNamespace(time=lambda: now[0]))
+    raw = build_unit_native_oc_view(
+        lane.cap.policy, {"mission_source_digest": "c" * 64}, ordered=True)
+    plain = qualify_context_view(lane.cap, raw)
+    # A legitimate publication carries the NEXT attested read of the same
+    # source (read_id 2 > 1), the way pre_llm_call re-reads before publish.
+    fresh = qualify_context_view(lane.cap, renew_unit_oc_read(raw, read_id=2))
+    prep = _bare_prepared(lane.cap, source_deadline_ms=1793361610000)
+    object.__setattr__(prep, "view", plain)
+    object.__setattr__(prep, "deadline", now[0] + 1)  # POST TTL still open
+    monkeypatch.setattr(
+        b2b_ctx._PreparedContext, "_assert_stamp", lambda *a, **k: None)
+    prep.assert_current(lane.cap)
+    now[0] += 2  # the POST window closes BETWEEN preparation and publication
+    prep.assert_current(lane.cap)
+    receipt = SimpleNamespace(
+        turn_id=lane.cap.current_turn_id, view=fresh,
+        source_basis=source_basis(fresh))
+    prep.assert_publication(lane.cap, receipt)
+    now[0] = 1793361611.0  # past observed + governed OC bound
+    with pytest.raises(B2BTerminalRefusal) as exc:
+        prep.assert_current(lane.cap)
+    assert str(exc.value) == "context_oc_source_stale"
+    lane.store.close()
+
+
+@pytest.mark.parametrize("cause", ["source_window_closed",
+                                   "context_oc_source_stale"])
+def test_preparation_typed_cause_reaches_durable_block(tmp_path, cause):
+    """A typed refusal from the configuration gate must NOT be flattened to
+    a boolean: it propagates out of assert_current_policy AND the durable
+    attempt row classifies through _BLOCK_STATUS[cause]."""
+    lane = _ready_lane(tmp_path)
+    lane.sink._context_preparation = _UnitPreparation(
+        lane.cap, configuration_error=cause)
+    with pytest.raises(B2BTerminalRefusal) as exc:
+        lane.sink.assert_current_policy()
+    assert str(exc.value) == cause
+    row = lane.store.b2b_attempt(
+        profile=lane.cap.profile, attempt_id=lane.cap.attempt_id)
+    assert row["status"] == b2b._BLOCK_STATUS[cause]
+    lane.store.close()
+
+
+@pytest.mark.parametrize("cause", ["source_window_closed",
+                                   "context_oc_source_stale"])
+def test_prepared_context_assert_propagates_typed_cause(
+        tmp_path, monkeypatch, cause):
+    """The typed assertion (not the boolean readiness wrapper) preserves the
+    preparation's exact durable cause through assert_current."""
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    lane = _ready_lane(tmp_path)
+    lane.sink._context_preparation = _UnitPreparation(
+        lane.cap, current=False, current_error=cause)
+    token = bind_execution(lane.cap)
+    try:
+        with pytest.raises(B2BTerminalRefusal) as exc:
+            b2b_ctx.assert_prepared_context_current(lane.cap, lane.project)
+    finally:
+        reset_execution(token)
+    assert str(exc.value) == cause
+    lane.store.close()
+
+
+@pytest.mark.parametrize("cause", ["source_window_closed",
+                                   "context_oc_source_stale"])
+def test_construction_guard_blocks_with_typed_cause(
+        tmp_path, monkeypatch, cause):
+    """guard_agent_construction's final readiness check blocks the attempt
+    with the preparation's TYPED cause — never a generic
+    context_unavailable."""
+    from gateway.platforms.api_server_b2b_execution import (
+        guard_agent_construction)
+    lane = _ready_lane(tmp_path)
+    lane.sink._context_preparation = _UnitPreparation(
+        lane.cap, current=False, current_error=cause)
+    profile_token = _api_request_profile.set(lane.profile)
+    cap_token = bind_execution(lane.cap)
+    try:
+        with pytest.raises(B2BTerminalRefusal) as exc:
+            guard_agent_construction(
+                _adapter(lane), session_id=lane.session_id,
+                ephemeral_system_prompt=None, gateway_session_key=None,
+                room_dispatch=None, room_execution_policy=None,
+                session_model=None, model_options=None, route=None,
+                requested_model=None, requested_provider=None)
+    finally:
+        reset_execution(cap_token)
+        _api_request_profile.reset(profile_token)
+    assert str(exc.value) == cause
+    row = lane.store.b2b_attempt(
+        profile=lane.cap.profile, attempt_id=lane.cap.attempt_id)
+    assert row["status"] == b2b._BLOCK_STATUS[cause]
+    lane.store.close()
+
+
+# --- Goal C: concurrency checked before the expensive preparation --------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("position", ["early", "post_prepare"])
+async def test_launch_concurrency_check_order(
+        tmp_path, monkeypatch, opened, position):
+    """A NEW attempt checks capacity BEFORE the native preparation (early
+    limit -> real 429, zero prepares) and again after it (first call None ->
+    prepare runs once -> second call 429). Neither path writes the store,
+    titles the session, or spawns a worker."""
+    from aiohttp import web
+    from tests.gateway import test_api_server_b2b_admission as adm
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    prof = adm._profile_home(tmp_path, monkeypatch, "hub")
+    _write_serving_config(prof)
+    adapter = adm._adapter(tmp_path, monkeypatch, "hub")
+    adapter._session_db = SessionDB(prof / "state.db")
+    opened.extend([adapter._session_db, adapter._run_idempotency_store])
+    lane = _ready_lane(tmp_path)
+    entry = _lane_entry(
+        lane, portal_issuer="portal-hub", hermes_issuer="hermes-hub")
+    session_id = "b2b_" + "b" * 64
+    adapter._session_db.create_session(session_id, "api_server")
+    resolved = _launch_resolved(lane, session_id=session_id)
+    obs = dict(resolved["observation_genesis"])
+    obs["id"], obs["profile"] = session_id, "hub"
+    resolved["observation_genesis"] = obs
+    resolved["session_id"] = session_id
+    resolved["binding_digest"] = session_id[4:]
+    resolved["attempt_id"] = b2b._attempt_id_for(session_id[4:])
+
+    prepares = []
+
+    def _prepare(cap, *, resolved):
+        prepares.append(cap)
+        return _UnitPreparation(cap)
+
+    monkeypatch.setattr(b2b_ctx, "prepare_b2b_context", _prepare)
+    monkeypatch.setattr(b2b, "_spawn_run", _adm_tripwire("_spawn_run"))
+    limited = web.Response(status=429, text="capacity")
+    calls = iter([limited] if position == "early" else [None, limited])
+    monkeypatch.setattr(
+        adapter, "_concurrency_limited_response", lambda: next(calls))
+    store = adapter._run_idempotency_store
+    before = adm._store_counts(store)
+    response = await b2b._launch_b2b_run(
+        adapter, None, profile="hub", entry=entry, keys=b2b._KeyRing(entry),
+        session_id=session_id, binding_digest=session_id[4:],
+        attempt_id=resolved["attempt_id"], resolved=resolved,
+        store=store, db=adapter._session_db)
+    assert response.status == 429
+    if position == "early":
+        assert prepares == []
+    else:
+        assert len(prepares) == 1
+    assert adm._store_counts(store) == before
+    assert adapter._session_db.get_session(session_id)["title"] is None
+    lane.store.close()
