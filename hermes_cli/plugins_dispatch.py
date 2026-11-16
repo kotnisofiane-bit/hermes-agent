@@ -13,6 +13,7 @@ import inspect
 import logging
 import queue
 import re
+import sys
 import threading
 import time
 import types
@@ -224,7 +225,7 @@ class PluginDispatchMixin:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-        for cb in self._hooks.get(hook_name, []):
+        for cb in self._dispatch_hook_callbacks(hook_name):
             try:
                 if use_timeout:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
@@ -498,7 +499,7 @@ class PluginDispatchMixin:
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-        for cb in self._hooks.get(hook_name, []):
+        for cb in self._dispatch_hook_callbacks(hook_name):
             callback_name = getattr(cb, "__name__", repr(cb))
             try:
                 ret = cb(**self._hook_callback_kwargs(cb, kwargs))
@@ -517,6 +518,31 @@ class PluginDispatchMixin:
                 if fail_closed:
                     results.append(_policy_error_block_directive(hook_name, cb, exc))
         return results
+
+    def _dispatch_hook_callbacks(self, hook_name: str) -> tuple[Callable, ...]:
+        """Callbacks permitted to run for *hook_name* in this context.
+
+        While a B2B execution is bound to this context (``agent.b2b_execution``
+        ContextVar set at launch admission), only callbacks owned by an active
+        ``PluginContext.register_hook`` registration may run — configured
+        outbound webhooks, shell hooks and other raw ``_hooks`` subscribers
+        would forward mission payloads off-box for ANY event. Outside a bound
+        execution every registered callback is returned unchanged. The B2B
+        module is probed through ``sys.modules`` so ordinary lanes never import
+        it; payload kwargs are never consulted.
+        """
+        callbacks = self.iter_hook_callbacks(hook_name)
+        b2b_execution = sys.modules.get("agent.b2b_execution")
+        if b2b_execution is None:
+            return callbacks
+        current_execution = getattr(b2b_execution, "current_execution", None)
+        if current_execution is None or current_execution() is None:
+            return callbacks
+        plugin_owned = {
+            id(callback)
+            for _plugin_key, callback in self.iter_plugin_hook_callbacks(hook_name)
+        }
+        return tuple(cb for cb in callbacks if id(cb) in plugin_owned)
 
     def iter_hook_callbacks(self, hook_name: str) -> tuple[Callable, ...]:
         """Return a stable snapshot of callbacks registered for a hook."""
