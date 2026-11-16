@@ -252,7 +252,7 @@ def _queued_dispatcher_cleanup():
         dispatchers = [
             plugin_stream_hooks._dispatchers.pop(key)
             for key in list(plugin_stream_hooks._dispatchers)
-            if key[0] in _QUEUED_B2B_HOOKS
+            if key[1] in _QUEUED_B2B_HOOKS
         ]
     for dispatcher in dispatchers:
         plugin_stream_hooks._stop_dispatcher(dispatcher, timeout=5)
@@ -262,7 +262,7 @@ def _drain_queued_hook(hook_name: str) -> None:
     with plugin_stream_hooks._dispatcher_lock:
         dispatchers = tuple(
             dispatcher
-            for (name, _callback_id), dispatcher in plugin_stream_hooks._dispatchers.items()
+            for (_home, name, _callback_id), dispatcher in plugin_stream_hooks._dispatchers.items()
             if name == hook_name
         )
     drained = threading.Event()

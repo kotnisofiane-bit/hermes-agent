@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION
+from hermes_constants import hermes_home_key
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,10 @@ class _ConsumerDispatcher:
 
 
 _dispatcher_lock = threading.Lock()
-_dispatchers: dict[tuple[str, int], _ConsumerDispatcher] = {}
+# (owning profile's canonical home key, hook name, id(callback)) — one process
+# serves many profiles; lazy stale-pruning must never reap another home's
+# worker on the strength of ITS manager's callback list.
+_dispatchers: dict[tuple[str, str, int], _ConsumerDispatcher] = {}
 
 
 def _callback_name(callback: Callable[..., Any]) -> str:
@@ -67,7 +71,7 @@ def _worker(dispatcher: _ConsumerDispatcher) -> None:
             payload = dict(payload)
             payload.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
             try:
-                # The worker outlives every turn and serves every profile; run the callback in the
+                # The worker outlives every turn and serves its owning profile; run the callback in the
                 # enqueuing turn's contextvars so it sees that turn's profile scope (home override,
                 # secrets), not an unbound context that fail-closed plugin bindings refuse (#118538).
                 # ``copy()``: one snapshot fans out to N consumer threads and a Context can only be
@@ -122,7 +126,10 @@ def _start_dispatcher(hook_name: str, callback: Callable[..., Any]) -> _Consumer
 
 def _dispatchers_for(hook_name: str) -> list[_ConsumerDispatcher]:
     """Live dispatcher per registered callback (restarting dead workers); stale
-    ones for unregistered callbacks are stopped outside the lock."""
+    ones for unregistered callbacks are stopped outside the lock. Registration
+    and staleness are judged against the CURRENT profile home only — another
+    home's dispatcher is a different key, never a stale one."""
+    home = hermes_home_key()
     registered_callback_ids = {
         id(callback) for callback in _registered_callbacks(hook_name)
     }
@@ -132,10 +139,11 @@ def _dispatchers_for(hook_name: str) -> list[_ConsumerDispatcher]:
         stale = [
             _dispatchers.pop(key)
             for key in list(_dispatchers)
-            if key[0] == hook_name and key[1] not in registered_callback_ids
+            if key[0] == home and key[1] == hook_name
+            and key[2] not in registered_callback_ids
         ]
         for callback in callbacks:
-            key = (hook_name, id(callback))
+            key = (home, hook_name, id(callback))
             dispatcher = _dispatchers.get(key)
             if dispatcher is None or dispatcher.thread is None or not dispatcher.thread.is_alive():
                 dispatcher = _dispatchers[key] = _start_dispatcher(hook_name, callback)

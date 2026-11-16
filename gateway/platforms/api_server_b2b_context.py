@@ -36,6 +36,15 @@ from gateway.platforms.api_server_b2b import _SOURCE_DEADLINE_S
 
 _SOURCE_OBSERVED_MAX_AGE_MS = 900_000
 
+# Fixed process-wide resource bound on in-flight native preparations: at most
+# ONE discovery+read worker may run at a time, for every profile this process
+# serves. A worker keeps its slot until it actually finishes — a caller
+# deadline expiring releases nothing — so a wedged producer pins the bound and
+# later launches (including other profiles') fail closed on saturation instead
+# of stacking unbounded discovery/provider threads behind it.
+_MAX_CONCURRENT_PREPARATIONS = 1
+_preparation_slots = threading.BoundedSemaphore(_MAX_CONCURRENT_PREPARATIONS)
+
 
 def _context_provider(*, discover: bool = False):
     """The single plugin-owned ``prepare_context`` callback under the CURRENT
@@ -77,7 +86,13 @@ def _bounded_native_read(cap: BoundExecution):
     """The preparation's native read, bounded off-loop by the standing source
     budget (pattern: ``recheck_context``). The callback runs on a daemon
     thread under ``copy_context``; the caller Event-waits the budget and is
-    the ONLY attacher — a late completion can never admit anything."""
+    the ONLY attacher — a late completion can never admit anything.
+
+    The worker is admitted against the process-wide
+    ``_MAX_CONCURRENT_PREPARATIONS`` bound BEFORE any discovery/provider work
+    starts: a saturated bound refuses ``context_unavailable`` without spawning
+    a thread. The slot is held until the worker completes (producer exceptions
+    included) — never released by the caller's deadline expiring."""
     budget = _SOURCE_DEADLINE_S
     outcome: Dict[str, Any] = {}
     done = threading.Event()
@@ -98,8 +113,16 @@ def _bounded_native_read(cap: BoundExecution):
             outcome["error"] = exc
         finally:
             done.set()
+            _preparation_slots.release()
 
-    threading.Thread(target=lambda: invoke_context.run(_invoke), daemon=True).start()
+    if not _preparation_slots.acquire(blocking=False):
+        raise B2BTerminalRefusal("context_unavailable")
+    try:
+        threading.Thread(
+            target=lambda: invoke_context.run(_invoke), daemon=True).start()
+    except BaseException:
+        _preparation_slots.release()
+        raise
     if not done.wait(budget):
         raise B2BTerminalRefusal("context_unavailable")
     exc = outcome.get("error")
