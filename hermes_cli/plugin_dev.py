@@ -366,7 +366,7 @@ def doctor_plugin(target: str | os.PathLike[str] | None = None) -> DoctorReport:
                 elif name not in VALID_HOOKS:
                     report.error(f"unknown hook {name!r} in provides_hooks")
 
-            for hook_name in host.registered_hooks:
+            for hook_name in dict.fromkeys(host.registered_hooks):
                 if hook_name not in VALID_HOOKS:
                     report.error(f"registered unknown hook {hook_name!r}")
                 for callback in host.manager._dispatch_hook_callbacks(hook_name):

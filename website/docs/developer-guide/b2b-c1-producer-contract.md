@@ -27,11 +27,15 @@ materializes a second clean copy for the `legacy_plugin` negative case. The
 patch is a test-only reconstruction authored for this harness — it does not
 claim or certify equality with any external patch — and the shipped producer
 at `05d7394c` keeps returning `503` until P3 delivers the real plugin change.
-Only a callback registered through
-`PluginContext.register_hook` counts — configured outbound webhooks, shell
-hooks and the dashboard hook form refuse `prepare_context` at configuration,
-and the producer's own plugin must also register `pre_llm_call` under the same
-owner, or admission fails closed before any durable write.
+Only callbacks registered through `PluginContext.register_hook` count for
+admission. A new attempt fails closed with `503 non_plugin_hook_subscribers`
+before context preparation, native reads or durable admission if any raw
+subscriber on any event lacks an active plugin registration; scope, discovery
+or manager lookup errors remain `503 execution_unavailable`. The check is
+repeated immediately before `b2b_admit` to catch registrations made during
+preparation. Durable replays bypass this new-admission gate. The producer's
+own plugin must also register `pre_llm_call` under the same owner as
+`prepare_context`.
 
 ## Delivery boundary
 
@@ -236,7 +240,7 @@ Measured results for this pass are recorded in the task report and PR descriptio
 | 5 — Decisions have evidence | Advanced for context/proposal: exact render, view, digests and fresh rechecks persist with the attempt (`put_context` + `b2b_commit_context` persisted artifacts; typed durable refusal causes reach the durable attempt status; native artifact assertions) |
 | 6 — Approver sees AI inputs | Exact AI input is preserved (`agent/turn_context.py:745-851`; native render equality assertion). The complete approver UI and model/token display remain outside P2 |
 | 9 — One interchangeable model gateway | Existing pinned runtime and refusal of alternate routes preserved (`api_server_b2b_execution.py:247-334`; `agent/b2b_execution.py:1102-1136`). Installed G2 routing is not qualified here |
-| 10 — Chosen model/data only | Configuration rejects `prepare_context` webhooks and shell hooks; owner-aware selection never calls a non-plugin producer. Bound-execution dispatch isolation: for every `VALID_HOOKS` event, sync and async `invoke_hook`/`ainvoke_hook` in a bound B2B context deliver only to active `PluginContext.register_hook` callbacks — proven per event against a real local HTTP capture server, a real shell-hook subprocess and a raw sentinel, while the same subscribers still receive real deliveries outside a bound context (`tests/agent/test_b2b_hook_isolation.py`). This is dispatch-scoped isolation, not global network isolation and not a constraint on arbitrary Python plugin code. Native evidence remains synthetic and local; installed production network isolation remains outside P2. |
+| 10 — Chosen model/data only | New admission is refused with `503 non_plugin_hook_subscribers` before preparation, native reads and durable admission if a raw callback on any event lacks an active `PluginContext.register_hook` registration; discovery/scope/lookup errors fail closed with `503 execution_unavailable`, and the check repeats immediately before `b2b_admit`. Durable replays bypass this new-admission check. The bound-execution dispatch filter remains a second barrier for sync/async/queued delivery, with queued workers rechecking callback identity before invocation (`gateway/platforms/api_server_b2b.py`, `hermes_cli/plugins_dispatch.py`, `agent/plugin_stream_hooks.py`; `tests/gateway/test_api_server_b2b_hook_admission.py`, `tests/agent/test_b2b_hook_isolation.py`). This is not global network isolation or a constraint on arbitrary Python plugin code. |
 | 11 — Claims match code | Health is not mission readiness. Native tests distinguish the patched test-only external producer (positive path) from unchanged `05d7394c` or no plugin (`503 execution_unavailable`, no durable admission). Real components, doubles and installation limits are explicit; delivery of the external patch belongs to P3. |
 
 Principles 2, 7, 8 and 12 have no changed product surface in P2. Approval,

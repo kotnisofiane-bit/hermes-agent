@@ -276,6 +276,162 @@ def _drain_queued_hook(hook_name: str) -> None:
     assert drained.wait(5), f"observer workers did not drain {hook_name}"
 
 
+def test_b2b_enqueue_preserves_raw_stream_dispatcher_during_ordinary_enqueue(
+        lane, _queued_dispatcher_cleanup, monkeypatch):
+    event = "on_stream_delta"
+    manager = lane.manager
+    slow_started = threading.Event()
+    release_slow = threading.Event()
+    slow_finished = threading.Event()
+    ordinary_one_ready = threading.Event()
+    resume_ordinary_one = threading.Event()
+    ordinary_one_done = threading.Event()
+    b2b_done = threading.Event()
+    ordinary_delivered = []
+    worker_ids = set()
+    stopped_raw = []
+    record_stops = [True]
+
+    def slow_observer(**kwargs):
+        delta = kwargs["delta"]
+        worker_ids.add(threading.get_ident())
+        if delta == "ordinary-0":
+            slow_started.set()
+            release_slow.wait()
+            slow_finished.set()
+        ordinary_delivered.append(delta)
+
+    manager._hooks.setdefault(event, []).append(slow_observer)
+    original_dispatchers_for = plugin_stream_hooks._dispatchers_for
+    original_stop_dispatcher = plugin_stream_hooks._stop_dispatcher
+
+    def pause_after_dispatchers_ready(hook_name):
+        dispatchers = original_dispatchers_for(hook_name)
+        if (hook_name == event
+                and threading.current_thread().name == "ordinary-event-one"):
+            ordinary_one_ready.set()
+            resume_ordinary_one.wait(timeout=5)
+        return dispatchers
+
+    def track_raw_stop(dispatcher, timeout=1.0):
+        if record_stops[0] and dispatcher.callback is slow_observer:
+            stopped_raw.append(dispatcher)
+        return original_stop_dispatcher(dispatcher, timeout=timeout)
+
+    monkeypatch.setattr(
+        plugin_stream_hooks, "_dispatchers_for", pause_after_dispatchers_ready)
+    monkeypatch.setattr(
+        plugin_stream_hooks, "_stop_dispatcher", track_raw_stop)
+
+    one_result = []
+
+    def enqueue_ordinary_one():
+        one_result.append(plugin_stream_hooks.enqueue_plugin_stream_hook(
+            event, delta="ordinary-1"))
+        ordinary_one_done.set()
+
+    b2b_result = []
+
+    def enqueue_b2b():
+        token = bind_execution(_cap("b2b_" + "e" * 64))
+        try:
+            b2b_result.append(plugin_stream_hooks.enqueue_plugin_stream_hook(
+                event, delta="b2b-secret"))
+        finally:
+            reset_execution(token)
+            b2b_done.set()
+
+    ordinary_thread = threading.Thread(
+        target=enqueue_ordinary_one, name="ordinary-event-one")
+    b2b_thread = threading.Thread(target=enqueue_b2b, name="b2b-event")
+    try:
+        assert plugin_stream_hooks.enqueue_plugin_stream_hook(
+            event, delta="ordinary-0")
+        assert slow_started.wait(timeout=2)
+
+        ordinary_thread.start()
+        assert ordinary_one_ready.wait(timeout=2)
+
+        b2b_thread.start()
+        assert b2b_done.wait(timeout=2), "B2B enqueue waited for the raw subscriber"
+        assert b2b_result == [True]
+        assert stopped_raw == []
+
+        resume_ordinary_one.set()
+        assert ordinary_one_done.wait(timeout=2)
+        assert one_result == [True]
+        assert plugin_stream_hooks.enqueue_plugin_stream_hook(
+            event, delta="ordinary-2")
+        assert not slow_finished.is_set()
+
+        release_slow.set()
+        _drain_queued_hook(event)
+        assert ordinary_delivered == [
+            "ordinary-0", "ordinary-1", "ordinary-2"]
+        assert len(worker_ids) == 1
+        assert _plugin_events(lane.plugin_log).count(event) == 4
+        assert stopped_raw == []
+    finally:
+        record_stops[0] = False
+        resume_ordinary_one.set()
+        release_slow.set()
+        if ordinary_thread.is_alive():
+            ordinary_thread.join(timeout=5)
+        if b2b_thread.is_alive():
+            b2b_thread.join(timeout=5)
+        callbacks = manager._hooks.get(event, [])
+        if slow_observer in callbacks:
+            callbacks.remove(slow_observer)
+
+
+def test_queued_plugin_stream_callback_is_skipped_after_unload(
+        lane, _queued_dispatcher_cleanup):
+    plugin_name = "queued-unload-probe"
+    plugin_dir = lane.home / "plugins" / plugin_name
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.yaml").write_text(
+        f"name: {plugin_name}\nversion: 0.1.0\ndescription: queued unload probe\n",
+        encoding="utf-8")
+    (plugin_dir / "__init__.py").write_text(
+        "def register(ctx):\n"
+        "    def on_stream_delta(**kwargs):\n"
+        "        _CALLS.append(kwargs['delta'])\n"
+        "        if kwargs['delta'] == 'first':\n"
+        "            _STARTED.set()\n"
+        "            _RELEASE.wait(timeout=5)\n"
+        "    ctx.register_hook('on_stream_delta', on_stream_delta)\n",
+        encoding="utf-8")
+    config_path = lane.home / "config.yaml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    config.setdefault("plugins", {}).setdefault("enabled", []).append(plugin_name)
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    lane.manager.discover_and_load(force=True)
+
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    loaded = lane.manager._plugins[plugin_name]
+    loaded.module._STARTED = started
+    loaded.module._RELEASE = release
+    loaded.module._CALLS = calls
+
+    try:
+        assert plugin_stream_hooks.enqueue_plugin_stream_hook(
+            "on_stream_delta", delta="first")
+        assert started.wait(timeout=2)
+        assert plugin_stream_hooks.enqueue_plugin_stream_hook(
+            "on_stream_delta", delta="pending")
+        assert calls == ["first"]
+
+        assert lane.manager.unload(plugin_name)
+        release.set()
+        _drain_queued_hook("on_stream_delta")
+
+        assert calls == ["first"]
+    finally:
+        release.set()
+
+
 def _emit_queued_hook(agent, event: str, payload: dict) -> None:
     if event == "on_interim_message":
         agent._emit_interim_assistant_message({

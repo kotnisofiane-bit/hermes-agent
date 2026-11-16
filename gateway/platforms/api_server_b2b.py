@@ -1265,7 +1265,12 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                     token = bind_execution(cap)
                     try:
                         from gateway.run import _load_gateway_config
+                        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
                         config = _load_gateway_config()
+                        discover_plugins()
+                        if get_plugin_manager().has_non_plugin_hook_subscribers():
+                            return "non_plugin_hook_subscribers"
                         if not b2b_execution_inputs_ready(project, config):
                             return "execution_inputs_unavailable"
                         sink._context_preparation = prepare_b2b_context(
@@ -1275,7 +1280,10 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                         reset_execution(token)
             except Exception:
                 return "execution_unavailable"
-        if await _a.to_thread(_prepare) is not None:
+        preparation_error = await _a.to_thread(_prepare)
+        if preparation_error == "non_plugin_hook_subscribers":
+            return _deny(503, "non_plugin_hook_subscribers")
+        if preparation_error is not None:
             return _deny(503, "execution_unavailable")
         limited = adapter._concurrency_limited_response()
         if limited is not None:
@@ -1287,6 +1295,17 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     if not all(env["issued_at"] <= now < env["expires_at"] for env in
                (resolved["_signed_request"], resolved["_signed_response"])):
         return _deny(403, "source_denied")
+    if existing_attempt is None:
+        try:
+            with adapter._profile_scope(profile):
+                from hermes_cli.plugins import get_plugin_manager
+
+                has_non_plugin_hooks = (
+                    get_plugin_manager().has_non_plugin_hook_subscribers())
+        except Exception:
+            return _deny(503, "execution_unavailable")
+        if has_non_plugin_hooks:
+            return _deny(503, "non_plugin_hook_subscribers")
     outcome = store.b2b_admit(
         profile=profile, session_id=session_id, binding_digest=binding_digest,
         attempt_id=attempt_id, fingerprint=fingerprint,

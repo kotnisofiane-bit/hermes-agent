@@ -556,6 +556,31 @@ class PluginDispatchMixin:
         }
         return tuple(cb for cb in callbacks if id(cb) in plugin_owned)
 
+    def has_non_plugin_hook_subscribers(self) -> bool:
+        """Whether any raw hook callback lacks an active PluginContext registration."""
+        raw_hooks = tuple(
+            (hook_name, tuple(callbacks))
+            for hook_name, callbacks in self._hooks.items()
+        )
+        registrations = tuple(
+            registration
+            for owned in tuple(self._ownership_ledger.values())
+            for registration in tuple(owned)
+        )
+        return any(
+            not callable(callback)
+            or not any(
+                registration.active
+                and registration.kind == "hook"
+                and registration.key == hook_name
+                and registration.callback is callback
+                and callable(registration.callback)
+                for registration in registrations
+            )
+            for hook_name, callbacks in raw_hooks
+            for callback in callbacks
+        )
+
     def iter_hook_callbacks(self, hook_name: str) -> tuple[Callable, ...]:
         """Return a stable snapshot of callbacks registered for a hook."""
         return self._dispatch_hook_callbacks(hook_name)

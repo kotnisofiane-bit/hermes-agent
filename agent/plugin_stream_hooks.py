@@ -72,7 +72,11 @@ def _worker(dispatcher: _ConsumerDispatcher) -> None:
                 # secrets), not an unbound context that fail-closed plugin bindings refuse (#118538).
                 # ``copy()``: one snapshot fans out to N consumer threads and a Context can only be
                 # entered by one thread at a time.
-                context.copy().run(dispatcher.callback, **payload)
+                def invoke_if_registered() -> None:
+                    if any(callback is dispatcher.callback for callback in _dispatch_callbacks(dispatcher.hook_name)):
+                        dispatcher.callback(**payload)
+
+                context.copy().run(invoke_if_registered)
             except Exception as exc:
                 # Fires once per streaming delta: a mis-declared callback fails identically every
                 # time, so it goes through the manager's warn-once reporter (#111922).
@@ -84,6 +88,15 @@ def _worker(dispatcher: _ConsumerDispatcher) -> None:
 
 
 def _registered_callbacks(hook_name: str) -> tuple[Callable[..., Any], ...]:
+    try:
+        from hermes_cli import plugins
+        return tuple(plugins.get_plugin_manager()._hooks.get(hook_name, ()))
+    except Exception:
+        logger.debug("plugin stream hook callback lookup failed: %s", hook_name, exc_info=True)
+        return ()
+
+
+def _dispatch_callbacks(hook_name: str) -> tuple[Callable[..., Any], ...]:
     try:
         from hermes_cli import plugins
         return plugins.get_plugin_manager()._dispatch_hook_callbacks(hook_name)
@@ -110,14 +123,17 @@ def _start_dispatcher(hook_name: str, callback: Callable[..., Any]) -> _Consumer
 def _dispatchers_for(hook_name: str) -> list[_ConsumerDispatcher]:
     """Live dispatcher per registered callback (restarting dead workers); stale
     ones for unregistered callbacks are stopped outside the lock."""
-    callbacks = _registered_callbacks(hook_name)
-    if not callbacks:
-        return []
-
-    callback_ids = {id(callback) for callback in callbacks}
+    registered_callback_ids = {
+        id(callback) for callback in _registered_callbacks(hook_name)
+    }
+    callbacks = _dispatch_callbacks(hook_name)
     ready: list[_ConsumerDispatcher] = []
     with _dispatcher_lock:
-        stale = [_dispatchers.pop(key) for key in list(_dispatchers) if key[0] == hook_name and key[1] not in callback_ids]
+        stale = [
+            _dispatchers.pop(key)
+            for key in list(_dispatchers)
+            if key[0] == hook_name and key[1] not in registered_callback_ids
+        ]
         for callback in callbacks:
             key = (hook_name, id(callback))
             dispatcher = _dispatchers.get(key)
@@ -146,11 +162,11 @@ def enqueue_plugin_stream_hook(hook_name: str, **payload: Any) -> bool:
 
 
 def has_stream_observer_hooks() -> bool:
-    return any(_registered_callbacks(name) for name in ("on_stream_start", "on_stream_delta", "on_stream_end"))
+    return any(_dispatch_callbacks(name) for name in ("on_stream_start", "on_stream_delta", "on_stream_end"))
 
 
 def has_reasoning_stream_observer_hooks() -> bool:
-    return stream_reasoning_deltas_enabled() and bool(_registered_callbacks("on_stream_delta"))
+    return stream_reasoning_deltas_enabled() and bool(_dispatch_callbacks("on_stream_delta"))
 
 
 def stream_reasoning_deltas_enabled() -> bool:

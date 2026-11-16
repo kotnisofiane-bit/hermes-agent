@@ -1630,7 +1630,10 @@ async def test_launch_refuses_producer_without_plugin_owned_pair(
         attempt_id=resolved["attempt_id"], resolved=resolved,
         store=store, db=adapter._session_db)
     assert response.status == 503
-    assert json.loads(response.body)["error"] == "execution_unavailable"
+    expected_error = (
+        "non_plugin_hook_subscribers" if scenario == "raw_direct_callback"
+        else "execution_unavailable")
+    assert json.loads(response.body)["error"] == expected_error
     assert adm._store_counts(store) == before
     assert adapter._session_db.get_session(session_id)["title"] is None
     lane.store.close()
