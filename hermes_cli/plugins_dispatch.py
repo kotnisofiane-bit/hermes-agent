@@ -180,6 +180,9 @@ def _hook_uses_callback_timeout(hook_name: str, timeout: float) -> bool:
 
 
 class PluginDispatchMixin:
+    _hooks: Dict[str, List[Callable]]
+    _ownership_ledger: Dict[str, List[Any]]
+
     @staticmethod
     def _hook_callback_kwargs(callback: Callable, payload: Dict[str, Any]) -> Dict[str, Any]:
         """The slice of *payload* a callback accepts: everything for ``**kwargs`` (or
@@ -226,6 +229,8 @@ class PluginDispatchMixin:
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
         for cb in self._dispatch_hook_callbacks(hook_name):
+            if not any(current is cb for current in self._dispatch_hook_callbacks(hook_name)):
+                continue
             try:
                 if use_timeout:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
@@ -479,7 +484,7 @@ class PluginDispatchMixin:
 
     def has_hook(self, hook_name: str) -> bool:
         """Return True when at least one callback is registered for a hook."""
-        return bool(self._hooks.get(hook_name))
+        return bool(self._dispatch_hook_callbacks(hook_name))
 
     async def ainvoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """:meth:`invoke_hook` for callers that are already on an event loop.
@@ -500,6 +505,8 @@ class PluginDispatchMixin:
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
         for cb in self._dispatch_hook_callbacks(hook_name):
+            if not any(current is cb for current in self._dispatch_hook_callbacks(hook_name)):
+                continue
             callback_name = getattr(cb, "__name__", repr(cb))
             try:
                 ret = cb(**self._hook_callback_kwargs(cb, kwargs))
@@ -531,7 +538,7 @@ class PluginDispatchMixin:
         module is probed through ``sys.modules`` so ordinary lanes never import
         it; payload kwargs are never consulted.
         """
-        callbacks = self.iter_hook_callbacks(hook_name)
+        callbacks = tuple(self._hooks.get(hook_name, ()))
         b2b_execution = sys.modules.get("agent.b2b_execution")
         if b2b_execution is None:
             return callbacks
@@ -539,18 +546,23 @@ class PluginDispatchMixin:
         if current_execution is None or current_execution() is None:
             return callbacks
         plugin_owned = {
-            id(callback)
-            for _plugin_key, callback in self.iter_plugin_hook_callbacks(hook_name)
+            id(registration.callback)
+            for owned in self._ownership_ledger.values()
+            for registration in owned
+            if registration.active
+            and registration.kind == "hook"
+            and registration.key == hook_name
+            and callable(registration.callback)
         }
         return tuple(cb for cb in callbacks if id(cb) in plugin_owned)
 
     def iter_hook_callbacks(self, hook_name: str) -> tuple[Callable, ...]:
         """Return a stable snapshot of callbacks registered for a hook."""
-        return tuple(self._hooks.get(hook_name, ()))
+        return self._dispatch_hook_callbacks(hook_name)
 
     def iter_plugin_hook_callbacks(self, hook_name: str) -> tuple[tuple[str, Callable], ...]:
         """Snapshot active hooks registered through PluginContext, with their owners."""
-        callbacks = self.iter_hook_callbacks(hook_name)
+        callbacks = self._dispatch_hook_callbacks(hook_name)
         return tuple(
             (registration.plugin_key, registration.callback)
             for owned in self._ownership_ledger.values()

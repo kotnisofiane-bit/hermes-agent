@@ -8,6 +8,7 @@ from threading import Event
 from time import monotonic, sleep
 from types import MethodType
 
+import pytest
 import yaml
 
 
@@ -1440,3 +1441,74 @@ def test_context_provider_selects_only_plugin_owned_prepare_with_same_owner_publ
                 prepare_handle.dispose()
     finally:
         manager.unload()
+
+
+@pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize("bound", [False, True])
+def test_dispatch_skips_callbacks_unloaded_during_snapshot(mode, bound):
+    import asyncio
+
+    from agent.b2b_execution import BoundExecution, bind_execution, reset_execution
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+
+    manager = PluginManager()
+    owner_a = PluginContext(
+        PluginManifest(name="dispatch_owner_a"), manager)
+    owner_c = PluginContext(
+        PluginManifest(name="dispatch_owner_c"), manager)
+    calls = []
+
+    if mode == "async":
+        async def callback_a(**kwargs):
+            calls.append("A")
+            manager.unload("dispatch_owner_a")
+            return "A"
+
+        async def callback_b(**kwargs):
+            calls.append("B")
+            return "B"
+
+        async def callback_c(**kwargs):
+            calls.append("C")
+            return "C"
+    else:
+        def callback_a(**kwargs):
+            calls.append("A")
+            manager.unload("dispatch_owner_a")
+            return "A"
+
+        def callback_b(**kwargs):
+            calls.append("B")
+            return "B"
+
+        def callback_c(**kwargs):
+            calls.append("C")
+            return "C"
+
+    owner_a.register_hook("on_session_finalize", callback_a)
+    owner_a.register_hook("on_session_finalize", callback_b)
+    owner_c.register_hook("on_session_finalize", callback_c)
+
+    cap = BoundExecution(
+        profile="hub",
+        session_id="b2b_" + "a" * 64,
+        binding_digest="b" * 64,
+        attempt_id="att_" + "c" * 8,
+        run_id="run_x",
+        sink=object(),
+        created_at=0.0,
+        policy={"project": {"project_id": "p"}, "mission_request": {"objective": "probe"}},
+    )
+    token = bind_execution(cap) if bound else None
+    try:
+        if mode == "sync":
+            results = manager.invoke_hook("on_session_finalize")
+        else:
+            results = asyncio.run(manager.ainvoke_hook("on_session_finalize"))
+    finally:
+        if token is not None:
+            reset_execution(token)
+        manager.unload()
+
+    assert calls == ["A", "C"]
+    assert results == ["A", "C"]

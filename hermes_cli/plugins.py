@@ -1815,7 +1815,7 @@ def has_hook(hook_name: str) -> bool:
 
 def iter_hook_callbacks(hook_name: str) -> tuple[Callable, ...]:
     """Return a stable snapshot of callbacks registered for a hook."""
-    return get_plugin_manager().iter_hook_callbacks(hook_name)
+    return get_plugin_manager()._dispatch_hook_callbacks(hook_name)
 
 
 def fire_pre_command_hook(

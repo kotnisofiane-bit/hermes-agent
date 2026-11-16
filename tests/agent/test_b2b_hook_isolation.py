@@ -6,8 +6,8 @@ ContextVar set at launch admission), ``PluginManager.invoke_hook`` /
 ``PluginContext.register_hook`` registration. Every other subscriber of
 ``manager._hooks`` — configured outbound webhooks (``hooks.outbound``), shell
 hooks (``hooks:``) and raw in-process subscribers (dashboard-style sentinels) —
-must see NOTHING, for EVERY hook name in ``VALID_HOOKS`` and through both the
-sync and async dispatch loops. ``prepare_context`` and
+must see NOTHING, for every name in ``VALID_HOOKS`` plus an unknown name and
+through both the sync and async dispatch loops. ``prepare_context`` and
 ``transform_api_error_classification`` are refused by the config registrars, so
 their raw subscribers are wired through the same ``_make_callback`` factories
 deliberately — dispatch isolation must not depend on config guards. Outside a
@@ -27,7 +27,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from agent import outbound_webhooks, shell_hooks
+from agent import outbound_webhooks, plugin_stream_hooks, shell_hooks
 from agent.b2b_execution import BoundExecution, bind_execution, reset_execution
 import hermes_cli.plugins as plugins_mod
 from hermes_cli.plugins import (
@@ -37,34 +37,9 @@ from hermes_cli.plugins import (
     get_plugin_manager,
 )
 
-# Every name a B2B-bound dispatch must isolate. Keep equal to VALID_HOOKS —
-# test_hook_inventory_covers_valid_hooks fails the moment a new event lands
-# without coverage here.
-_HOOKS_UNDER_TEST = {
-    "pre_tool_call", "post_tool_call", "transform_terminal_output",
-    "transform_tool_result", "transform_llm_output", "pre_llm_call",
-    "post_llm_call", "on_stream_start", "on_stream_delta", "on_stream_end",
-    "on_interim_message", "pre_verify", "pre_api_request", "post_api_request",
-    "api_request_error", "pre_auxiliary_call", "post_auxiliary_call",
-    "transform_api_error_classification", "on_session_start", "on_session_end",
-    "on_session_finalize", "on_session_reset", "on_skill_lifecycle",
-    "subagent_start", "subagent_stop", "pre_gateway_dispatch",
-    "agent_loop_stopped", "pre_approval_request", "post_approval_response",
-    "on_room_member_activity", "pre_transcription", "kanban_task_claimed",
-    "kanban_task_completed", "kanban_task_blocked", "on_kanban_worker_spawned",
-    "on_kanban_worker_exited", "on_kanban_worker_stale_claim",
-    "on_kanban_task_updated", "on_kanban_dispatch_tick",
-    "gateway_platform_event", "pre_command", "prepare_context",
-}
-
 _UNKNOWN_HOOK = "b2b_probe_unknown_hook"
 _PLUGIN_NAME = "b2b_hook_probe"
 _MISSION_SENTINEL = "MISSION-SENTINEL-" + "9e4f" * 8
-
-
-def test_hook_inventory_covers_valid_hooks():
-    """A hook name added to VALID_HOOKS without coverage here fails this test."""
-    assert _HOOKS_UNDER_TEST == VALID_HOOKS
 
 
 # ── real local HTTP capture server ────────────────────────────────────────
@@ -123,7 +98,7 @@ def _write_probe_plugin(hermes_home: Path, log_path: Path) -> Path:
         "                fh.write(event + '\\n')\n"
         "            return None\n"
         "        return _cb\n"
-        f"    for _event in {sorted(_HOOKS_UNDER_TEST) + [_UNKNOWN_HOOK]!r}:\n"
+        f"    for _event in {sorted(VALID_HOOKS) + [_UNKNOWN_HOOK]!r}:\n"
         "        ctx.register_hook(_event, _record(_event))\n",
         encoding="utf-8")
     cfg_path = hermes_home / "config.yaml"
@@ -162,14 +137,14 @@ def _wire_raw_subscribers(manager, event: str, url: str, command: str) -> None:
     config-refused events use the same ``_make_callback`` factories appended
     straight onto ``_hooks`` — dispatch safety must not depend on config.
     """
-    if event in PLUGIN_ONLY_HOOKS:
+    if event not in VALID_HOOKS or event in PLUGIN_ONLY_HOOKS:
         target = outbound_webhooks.WebhookTarget(url=url, events=[event], timeout=5)
         manager._hooks.setdefault(event, []).append(
             outbound_webhooks._make_callback(event, target))
     else:
         outbound_webhooks.register_from_config(
             {"hooks": {"outbound": [{"url": url, "events": [event], "timeout": 5}]}})
-    if event in SHELL_UNSUPPORTED_HOOKS:
+    if event not in VALID_HOOKS or event in SHELL_UNSUPPORTED_HOOKS:
         spec = shell_hooks.ShellHookSpec(event=event, command=command, timeout=5)
         manager._hooks.setdefault(event, []).append(
             shell_hooks._make_callback(spec))
@@ -206,7 +181,7 @@ def _plugin_events(log_path: Path):
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
-@pytest.mark.parametrize("event", sorted(_HOOKS_UNDER_TEST))
+@pytest.mark.parametrize("event", sorted(VALID_HOOKS) + [_UNKNOWN_HOOK])
 def test_bound_b2b_dispatch_reaches_plugin_only(
         lane, http_server, tmp_path, event, mode):
     """For EVERY hook name: bound context → plugin only; unbound → all delivered."""
@@ -261,42 +236,127 @@ def test_bound_b2b_dispatch_reaches_plugin_only(
     assert len(sentinel_calls) == 2
 
 
-def test_unknown_hook_name_is_filtered_too(lane, http_server, tmp_path):
-    """The filter is not an event allowlist: an unknown hook name (registered
-    via register_hook, which warns but stores) is isolated the same way."""
+_QUEUED_B2B_HOOKS = (
+    "on_stream_start",
+    "on_stream_delta",
+    "on_stream_end",
+    "on_interim_message",
+    "on_room_member_activity",
+)
+
+
+@pytest.fixture
+def _queued_dispatcher_cleanup():
+    yield
+    with plugin_stream_hooks._dispatcher_lock:
+        dispatchers = [
+            plugin_stream_hooks._dispatchers.pop(key)
+            for key in list(plugin_stream_hooks._dispatchers)
+            if key[0] in _QUEUED_B2B_HOOKS
+        ]
+    for dispatcher in dispatchers:
+        plugin_stream_hooks._stop_dispatcher(dispatcher, timeout=5)
+
+
+def _drain_queued_hook(hook_name: str) -> None:
+    with plugin_stream_hooks._dispatcher_lock:
+        dispatchers = tuple(
+            dispatcher
+            for (name, _callback_id), dispatcher in plugin_stream_hooks._dispatchers.items()
+            if name == hook_name
+        )
+    drained = threading.Event()
+
+    def join_queues():
+        for dispatcher in dispatchers:
+            dispatcher.events.join()
+        drained.set()
+
+    threading.Thread(target=join_queues, daemon=True).start()
+    assert drained.wait(5), f"observer workers did not drain {hook_name}"
+
+
+def _emit_queued_hook(agent, event: str, payload: dict) -> None:
+    if event == "on_interim_message":
+        agent._emit_interim_assistant_message({
+            "role": "assistant",
+            "content": payload["user_message"],
+        })
+    else:
+        plugin_stream_hooks.enqueue_plugin_stream_hook(event, **payload)
+
+
+@pytest.mark.parametrize("event", _QUEUED_B2B_HOOKS)
+def test_bound_b2b_queued_dispatch_reaches_plugin_only(
+        lane, http_server, tmp_path, event, _queued_dispatcher_cleanup):
+    """Queued observers select subscribers when the event is enqueued."""
+    from run_agent import AIAgent
+
     manager = lane.manager
     url = f"http://127.0.0.1:{http_server.server_address[1]}/hook"
-    capture_file = tmp_path / "shell_capture_unknown.json"
-    # Low-level bridge: config registrars refuse unknown names by design.
-    manager._hooks.setdefault(_UNKNOWN_HOOK, []).append(
-        outbound_webhooks._make_callback(
-            _UNKNOWN_HOOK,
-            outbound_webhooks.WebhookTarget(url=url, events=[_UNKNOWN_HOOK])))
-    manager._hooks.setdefault(_UNKNOWN_HOOK, []).append(
-        shell_hooks._make_callback(
-            shell_hooks.ShellHookSpec(
-                event=_UNKNOWN_HOOK,
-                command=f'/bin/sh -c "cat >> {capture_file}"', timeout=5)))
+    capture_file = tmp_path / f"queued_shell_capture_{event}.json"
+    _wire_raw_subscribers(
+        manager, event, url, f'/bin/sh -c "cat >> {capture_file}"')
     sentinel_calls = []
-    manager._hooks.setdefault(_UNKNOWN_HOOK, []).append(
+    manager._hooks.setdefault(event, []).append(
         lambda **kwargs: sentinel_calls.append(kwargs))
+    payload = {
+        "session_id": "b2b_" + "a" * 64,
+        "user_message": _MISSION_SENTINEL,
+    }
+    sequence = 0
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://openrouter.ai/api/v1",
+        provider="openrouter",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
 
-    token = bind_execution(_cap("b2b_" + "a" * 64))
-    try:
-        manager.invoke_hook(_UNKNOWN_HOOK, user_message=_MISSION_SENTINEL)
-    finally:
-        reset_execution(token)
+    def enqueue(session_id: str | None) -> None:
+        nonlocal sequence
+        event_payload = {
+            **payload,
+            "user_message": f"{_MISSION_SENTINEL}-{sequence}",
+        }
+        sequence += 1
+        if session_id is None:
+            _emit_queued_hook(agent, event, event_payload)
+            return
+        token = bind_execution(_cap(session_id))
+        try:
+            _emit_queued_hook(agent, event, event_payload)
+        finally:
+            reset_execution(token)
 
+    enqueue("b2b_" + "a" * 64)
+    _drain_queued_hook(event)
     outbound_webhooks.flush(timeout=5)
-    assert _plugin_events(lane.plugin_log).count(_UNKNOWN_HOOK) == 1
+    assert _plugin_events(lane.plugin_log).count(event) == 1
     assert http_server.captured == []
     assert not capture_file.exists()
     assert sentinel_calls == []
 
-    manager.invoke_hook(_UNKNOWN_HOOK, user_message=_MISSION_SENTINEL)
+    enqueue(None)
+    _drain_queued_hook(event)
     outbound_webhooks.flush(timeout=5)
+    assert _plugin_events(lane.plugin_log).count(event) == 2
+    assert len(http_server.captured) == 1
+    assert _MISSION_SENTINEL.encode() in http_server.captured[0]["body"]
+    capture_text = capture_file.read_text(encoding="utf-8")
+    assert _MISSION_SENTINEL in capture_text
+    assert len(sentinel_calls) == 1
+
+    for session_id in ("b2b_" + "a" * 64, "b2b_" + "d" * 64, "b2b_" + "a" * 64):
+        enqueue(session_id)
+    _drain_queued_hook(event)
+    outbound_webhooks.flush(timeout=5)
+    assert _plugin_events(lane.plugin_log).count(event) == 5
     assert len(http_server.captured) == 1
     assert len(sentinel_calls) == 1
+    assert capture_file.read_text(encoding="utf-8") == capture_text
 
 
 def test_execution_bind_reset_restores_ordinary_dispatch(
