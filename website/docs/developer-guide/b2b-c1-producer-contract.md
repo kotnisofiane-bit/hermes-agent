@@ -57,14 +57,21 @@ current mission-scoped proof reports `not-ready` with a typed code
 (`execution_inputs_unavailable`, `c1_producer_unavailable`,
 or `c1_context_required`) — health evaluation
 performs no plugin discovery or
-probe and cannot leak ambient execution state. A missing, crossed, stale,
-future-dated, late or otherwise unqualified source fails closed with
-`503 execution_unavailable` before admission. That refusal covers NEW
-admissions only: an already-durable attempt is always served by the
-idempotent replay (`_replayed_response`) before the readiness guard, so a
-lost-ACK retry recovers its run — and any error entering the profile scope
-or reading the serving config still answers the same typed 503, never an
-untyped 500. No attempt or binding is created by that refusal.
+probe and cannot leak ambient execution state. A NEW admission whose
+preparation cannot produce a qualified source fails closed before admission
+with `503 execution_unavailable`: an absent producer, a missing OC receipt,
+a `/1`, non-measured or otherwise unqualified receipt, a captured rather
+than observed instant, a crossed or stale memory-context read, a late read
+that misses its budget, and every other typed preparation refusal all answer
+that code. The one exception is the OC observation's own window: an
+observation older than its governed bound or dated in the future refuses
+`503 context_oc_source_stale` instead — the exact typed cause the admission
+path preserves. That refusal covers NEW admissions only: an already-durable
+attempt is always served by the idempotent replay (`_replayed_response`)
+before the readiness guard, so a lost-ACK retry recovers its run — and any
+error entering the profile scope or reading the serving config still answers
+the same typed 503, never an untyped 500. No attempt or binding is created by
+that refusal.
 
 ## Proof semantics
 
@@ -83,12 +90,18 @@ delay or another TTL.
 The POST's signed envelopes are checked again immediately before durable
 admission. Their short expiry does not govern preparation or publication after
 admission. Source authority is renewed by `before_provider`; the OC observation
-bound is never renewed: the attached preparation's `source_deadline_ms` is
-re-verified on the host immediately before the durable seal commit — pure
-timestamp arithmetic, never a plugin callback — so an observation that
-crosses its own bound during final validation or across the host-resume
-seam refuses `context_oc_source_stale` instead of sealing. Typed
-preparation refusals reach the durable attempt classification without
+bound is never renewed. `assert_context_source_current` re-proves the attached
+preparation's `source_deadline_ms` on the host — pure timestamp arithmetic,
+never a plugin callback — after the last plugin validation and immediately
+before each of the four commit gates: launch admission (before `b2b_admit`,
+answering `503 context_oc_source_stale`), context publication (before
+`b2b_commit_context`), the dispatch CAS (before the paid provider request) and
+the seal commit (before `b2b_seal`). Every gate raises the typed
+`context_oc_source_stale`; the CAS and seal gates also record the durable
+`context_stale` classification. An observation that crosses its own bound
+during final validation, host serialization or across the host-resume seam
+therefore refuses instead of admitting, publishing, dispatching or sealing.
+Typed preparation refusals reach the durable attempt classification without
 being replaced by a fixed `context_unavailable` reason.
 
 Every B2B plugin operation in the launch and seal path runs inside its own
