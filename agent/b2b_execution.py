@@ -44,6 +44,7 @@ PROPOSAL_LIMITS = {
     "limitations": (0, 12), "limitation": (1, 500),
     "max_public_bytes": 32768}
 CONTEXT_MAX_BYTES = 262_144
+NO_MEMORY_CONTEXT_FORMAT = "dubsar.agent-context/2.r2.no-memory/1"
 _PROPOSAL_KEYS = frozenset({"summary", "steps", "source_refs", "limitations"})
 _SOURCE_BASIS_KEYS = (
     "format", "bot_id", "profile_id", "project_id", "mission_id", "mission_binding",
@@ -148,7 +149,15 @@ def strict_public_json(text: str) -> Any:
 
 
 def source_basis(view: Mapping[str, Any]) -> Dict[str, Any]:
-    result = {key: _plain_json(view.get(key)) for key in _SOURCE_BASIS_KEYS}
+    keys = _SOURCE_BASIS_KEYS
+    if view.get("format") == NO_MEMORY_CONTEXT_FORMAT:
+        # The no-memory variant never carries the Memory-resolved blocks:
+        # they are absent bytes, not None, on both sides of the comparison.
+        keys = tuple(key for key in keys
+                     if key not in ("memory", "accepted_context"))
+    result = {key: _plain_json(view.get(key)) for key in keys}
+    if "memory_mode" in view:
+        result["memory_mode"] = _plain_json(view["memory_mode"])
     if "automation_results" in view:
         result["automation_results"] = _plain_json(view["automation_results"])
     oc = result.get("operational_context")
@@ -310,11 +319,31 @@ def validate_context_schema(view: Mapping[str, Any], contract_root: Any) -> Dict
             if len(raw) > 1_048_576 or hashlib.sha256(raw).hexdigest() != pin:
                 raise ValueError("schema pin")
             schemas[name] = strict_public_json(raw.decode("utf-8"))
-        registry = Registry(retrieve=_deny_schema_fetch).with_resources(
-            (schema["$id"], Resource.from_contents(schema)) for schema in schemas.values())
         plain = _plain_json(view)
-        validator = Draft202012Validator(schemas["agent-context-r2.schema.json"],
-                                        registry=registry)
+        schema = schemas["agent-context-r2.schema.json"]
+        if isinstance(plain, Mapping) and plain.get("format") == NO_MEMORY_CONTEXT_FORMAT:
+            # Host-versioned no-memory variant: the four pinned Contracts
+            # blobs are still loaded and pin-verified byte-for-byte; only
+            # this fresh in-memory parse of the main schema is specialized.
+            # The Contracts files and the historical r2 contract stay
+            # byte-identical — no fabricated memory block, no data cleanup,
+            # no fallback to the unmodified schema.
+            schema["required"] = [key for key in schema["required"]
+                                  if key != "memory"] + ["memory_mode"]
+            schema["properties"]["format"] = {"const": NO_MEMORY_CONTEXT_FORMAT}
+            schema["properties"]["memory_mode"] = {"const": "none"}
+            schema["properties"]["memory"] = False
+            schema["properties"]["accepted_context"] = False
+            for key in ("namespaces_searched", "namespaces_refused"):
+                schema["properties"][key] = {"const": []}
+            schema["$defs"]["coverage"]["properties"]["capabilities"] = {
+                "type": "array", "minItems": 2, "maxItems": 2,
+                "uniqueItems": True,
+                "items": {"enum": ["my_work", "operational_context"]}}
+            schema["$defs"]["bounds"]["properties"]["relation_count"] = {"const": 0}
+        registry = Registry(retrieve=_deny_schema_fetch).with_resources(
+            (item["$id"], Resource.from_contents(item)) for item in schemas.values())
+        validator = Draft202012Validator(schema, registry=registry)
         if next(validator.iter_errors(plain), None) is not None:
             raise B2BTerminalRefusal("context_schema_invalid")
     except B2BTerminalRefusal:
@@ -417,8 +446,9 @@ BLOCK_REASONS = frozenset({
     "context_memory_malformed_source_contract",
     "context_memory_malformed_truncated",
     "context_memory_malformed_v1_fallback", "context_memory_mission",
-    "context_memory_missing", "context_memory_namespace",
-    "context_memory_provenance", "context_memory_unqualified",
+    "context_memory_missing", "context_memory_mode",
+    "context_memory_namespace", "context_memory_provenance",
+    "context_memory_unexpected", "context_memory_unqualified",
     "context_mission_id",
     "context_my_work_authority", "context_my_work_mismatch",
     "context_namespaces", "context_oc_malformed", "context_oc_mismatch",
@@ -672,6 +702,40 @@ def _qualify_memory_relation(relation, allowed_namespaces, binding) -> None:
             raise B2BTerminalRefusal("context_memory_mission")
 
 
+def _context_memory_mode(view: Mapping[str, Any]) -> str:
+    """Closed vocabulary for the view's declared context mode.
+
+    ``required`` is the historical r2 contract: no ``memory_mode`` field may
+    appear at all. ``none`` is the explicit no-memory variant —
+    ``memory_mode: "none"`` plus the exact empty/absent shapes below; any
+    deviation is a typed refusal, never a tolerated extra or a fallback.
+    """
+    if view.get("format") != NO_MEMORY_CONTEXT_FORMAT:
+        if "memory_mode" in view:
+            raise B2BTerminalRefusal("context_memory_mode")
+        return "required"
+    if view.get("memory_mode") != "none":
+        raise B2BTerminalRefusal("context_memory_mode")
+    # accepted_context contains Memory-resolved targets and supports.
+    if "memory" in view or "accepted_context" in view:
+        raise B2BTerminalRefusal("context_memory_unexpected")
+    for key in ("namespaces_searched", "namespaces_refused"):
+        value = view.get(key)
+        if not isinstance(value, (list, tuple)) or value:
+            raise B2BTerminalRefusal("context_namespaces")
+    coverage = view.get("coverage")
+    capabilities = coverage.get("capabilities") if isinstance(coverage, Mapping) else None
+    if (not isinstance(capabilities, (list, tuple)) or len(capabilities) != 2 or
+            any(not isinstance(item, str) for item in capabilities) or
+            set(capabilities) != {"my_work", "operational_context"}):
+        raise B2BTerminalRefusal("context_memory_mode")
+    bounds = view.get("bounds")
+    count = bounds.get("relation_count") if isinstance(bounds, Mapping) else None
+    if type(count) is not int or count != 0:
+        raise B2BTerminalRefusal("context_relation_bounds")
+    return "none"
+
+
 def qualify_recorded_memory(view: Mapping[str, Any]) -> None:
     """One advisory-Memory rule for worker, sink and durable proof verification.
 
@@ -683,6 +747,8 @@ def qualify_recorded_memory(view: Mapping[str, Any]) -> None:
             ("authority", "none"), ("content_trust", "advisory_data"),
             ("text_role", "data"), ("truth", "not_selected"))):
         raise B2BTerminalRefusal("context_memory_malformed_globals")
+    if _context_memory_mode(view) == "none":
+        return
     memory = view.get("memory")
     binding = view.get("mission_binding")
     searched = view.get("namespaces_searched")
@@ -733,6 +799,10 @@ def qualify_recorded_memory(view: Mapping[str, Any]) -> None:
 
 def qualify_context_view(cap: BoundExecution, view: Mapping[str, Any]) -> Dict[str, Any]:
     project = cap.policy_get("project", {})
+    memory_mode = project.get("memory_mode", "required")
+    if (memory_mode not in ("required", "none") or
+            _context_memory_mode(view) != memory_mode):
+        raise B2BTerminalRefusal("context_memory_mode")
     plain = validate_context_schema(view, project.get("context_contract_root"))
     if plain["context_digest"] != native_context_digest(plain):
         raise B2BTerminalRefusal("context_digest_invalid")
@@ -768,11 +838,15 @@ def qualify_context_view(cap: BoundExecution, view: Mapping[str, Any]) -> Dict[s
         raise B2BTerminalRefusal("context_selection_mismatch")
     allowed = set(project.get("allowed_namespaces") or ())
     searched = plain["namespaces_searched"]
-    if (not searched or len(set(searched)) != len(searched) or
+    if memory_mode == "required" and (
+            not searched or len(set(searched)) != len(searched) or
             not set(searched) <= allowed or set(searched) & set(plain["namespaces_refused"])):
         raise B2BTerminalRefusal("context_namespaces")
-    memory, my_work, oc = (plain[key] for key in ("memory", "my_work", "operational_context"))
-    if any(source["availability"] != "available" for source in (memory, my_work, oc)):
+    my_work, oc = (plain[key] for key in ("my_work", "operational_context"))
+    sources = (my_work, oc)
+    if memory_mode == "required":
+        sources += (plain["memory"],)
+    if any(source["availability"] != "available" for source in sources):
         raise B2BTerminalRefusal("context_source_unavailable")
     if oc["freshness"] != "current":
         raise B2BTerminalRefusal("context_source_stale")
@@ -803,7 +877,7 @@ def qualify_context_view(cap: BoundExecution, view: Mapping[str, Any]) -> Dict[s
     if not isinstance(oc.get("view"), dict):
         raise B2BTerminalRefusal("context_oc_unavailable")
     accepted = plain.get("accepted_context")
-    relation_count = len(memory["relations"])
+    relation_count = len(plain["memory"]["relations"]) if memory_mode == "required" else 0
     if accepted is not None:
         if accepted["availability"] not in ("available", "not_applicable"):
             raise B2BTerminalRefusal("context_accepted_unavailable")

@@ -87,8 +87,9 @@ _PROFILE_ENTRY_KEYS = frozenset({
 _PROJECT_ENTRY_KEYS = frozenset({
     "project_id", "bot_id", "profile_id", "allowed_namespaces", "context_contract_root",
     "model", "provider", "base_url", "api_mode", "logical_mission", "project_context",
-    "request_timeout_seconds"})
-_PROJECT_ENTRY_REQUIRED_KEYS = _PROJECT_ENTRY_KEYS - {"request_timeout_seconds"}
+    "request_timeout_seconds", "memory_mode"})
+_PROJECT_ENTRY_REQUIRED_KEYS = _PROJECT_ENTRY_KEYS - {
+    "request_timeout_seconds", "memory_mode"}
 _PROJECT_CONTEXT_KEYS = frozenset({"allocation_root", "project_id", "start"})
 _API_MODES = frozenset({"chat_completions"})
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -291,6 +292,9 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
         raise B2BConfigError(
             f"b2b config: project {binding_id}: request_timeout_seconds")
     request_timeout_seconds = raw_timeout
+    memory_mode = entry.get("memory_mode", "required")
+    if memory_mode not in ("required", "none"):
+        raise B2BConfigError(f"b2b config: project {binding_id}: memory_mode")
     pc = entry.get("project_context")
     if pc is not None:
         if not isinstance(pc, Mapping) or set(pc.keys()) != _PROJECT_CONTEXT_KEYS:
@@ -319,6 +323,8 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
     # the injected default.
     if "request_timeout_seconds" in entry:
         normalized["request_timeout_seconds"] = request_timeout_seconds
+    if "memory_mode" in entry:
+        normalized["memory_mode"] = memory_mode
     return normalized
 
 
@@ -725,6 +731,8 @@ def _policy_digest(profile: str, entry: Mapping[str, Any], project: Mapping[str,
     # configured value still revokes a running cap when changed mid-run.
     if "request_timeout_seconds" in project:
         basis["request_timeout_seconds"] = project["request_timeout_seconds"]
+    if "memory_mode" in project:
+        basis["memory_mode"] = project["memory_mode"]
     return hashlib.sha256(canonical_json(basis)).hexdigest()
 
 
@@ -806,7 +814,8 @@ _BLOCK_CONTEXT_STALE_REASONS = frozenset({
     "context_memory_malformed_api", "context_memory_malformed_source_contract",
     "context_memory_malformed_v1_fallback",
     "context_memory_malformed_truncated", "context_memory_malformed_limits",
-    "context_memory_missing",
+    "context_memory_missing", "context_memory_mode",
+    "context_memory_unexpected",
     "context_contradictions", "context_oc_malformed", "context_oc_mismatch",
     "context_oc_unavailable", "context_oc_read_metadata",
     "context_oc_unqualified", "context_oc_projection",

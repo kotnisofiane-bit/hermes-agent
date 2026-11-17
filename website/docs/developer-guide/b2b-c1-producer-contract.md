@@ -45,8 +45,11 @@ context preparation supplied by exactly one `prepare_context` hook registered
 under the owning profile. The concrete external producer is responsible for
 real native My Work mission reads
 (`createB2BMissionPorts`), a real native Operational Context kernel read
-(`dubsar.my-work-oc-context-view/2` with a measured state projection), and a
-mission-qualified Memory Plane v2 read. Preparation runs before `b2b_admit`,
+(`dubsar.my-work-oc-context-view/2` with a measured state projection), and —
+under the default `required` catalogue mode only — a mission-qualified
+Memory Plane v2 read. An operator may instead select the explicit no-memory
+variant described below (`memory_mode: none`), where no memory or RAG
+service takes part in preparation, publication or recheck. Preparation runs before `b2b_admit`,
 title changes or worker launch; it performs no durable write, no admission,
 no agent construction and no provider call. Actual publication still happens
 only inside the admitted worker's real `pre_llm_call` hook.
@@ -246,6 +249,64 @@ deadlines. Semantic source equivalence is checked separately from fresh OC
 read metadata; replaying an accepted read at another boundary is not a
 recheck. Errors remain fail-closed; no fallback context or provider is allowed.
 
+## Explicit no-memory variant
+
+The operator catalogue selects the context contract per project through the
+closed `memory_mode` vocabulary: `"required"` is the historical contract
+(the key may also be absent — absence is replay-identical to the historical
+bytes and adds none to the policy fingerprint), `"none"` selects the
+no-memory variant. An explicitly configured `memory_mode` — either value —
+enters the policy fingerprint, so changing it mid-run revokes the capability
+like any other policy edit.
+
+```yaml
+extra:
+  b2b:
+    enabled: true
+    profiles:
+      hub:
+        # ...signing identity and other project keys as usual...
+        projects:
+          b2b-bench:
+            # ...project_id, model, base_url, allowed_namespaces, etc....
+            memory_mode: none
+```
+
+In `none` mode the qualified view carries the host-versioned variant format
+`dubsar.agent-context/2.r2.no-memory/1` and `memory_mode: "none"`, with empty
+`namespaces_searched` and `namespaces_refused`, coverage capabilities exactly
+`["my_work", "operational_context"]`, and `bounds.relation_count: 0`. The
+`memory` and `accepted_context` blocks are absent bytes — never empty
+objects, nulls, fabricated relations or placeholders; the My Work mission,
+authority and native OC `/2` receipt shapes are unchanged. Schema validation
+specializes a fresh parse of the same four pinned Contracts blobs; the blobs
+themselves and the historical r2 contract are byte-for-byte untouched. No
+Memory Plane or RAG service is read in preparation, publication or recheck
+under this mode, and there is no fallback either way: `required` still
+rejects an absent/malformed block (`context_schema_invalid` at schema
+qualification, `context_memory_malformed` at recorded-proof verification),
+and an empty relation list remains `context_memory_missing`; a
+memory-carrying, mode-mismatched or mode-less view under `none` is refused
+(`context_memory_unexpected`, `context_memory_mode`,
+`context_namespaces`, `context_relation_bounds`).
+
+A `none` mission additionally requires the producer's explicit opt-in: the
+callback declares `prepare_context.b2b_memory_modes = ("none",)` before
+`ctx.register_hook("prepare_context", ...)` runs. A producer that does not
+declare support is refused BEFORE its callback is invoked
+(`context_memory_mode`) — never executed then cleaned up — and removing the
+opt-in after stamping revokes the preparation at the same stamp gate. The
+attribute is a trusted-producer contract, not a sandbox and not a proof
+boundary for arbitrary plugin code: the same profile-scoped trust model as
+the `required` path applies.
+
+Shipping a real `prepare_context` hook in the external profile, the
+My Work B2B reader and any installed-environment proof stay out of scope:
+the current profile checkout does not register the hook and no installed
+path is qualified here. Evidence for this contract is the Hermes
+qualification/publication path and labelled unit doubles — no native
+end-to-end `none` journey is claimed.
+
 ## Authentication and signing
 
 Do not invent a C1 signing key or claim that a hash is a signature. In the
@@ -338,3 +399,9 @@ Principles 2, 7, 8 and 12 have no changed product surface in P2. Approval,
 global stop, cost tracking and the real Portal journey retain their separate
 delivery/qualification requirements. This is no deployment, network C1–C6
 qualification or authorization for a real model, email or GitHub business action.
+
+The explicit no-memory variant preserves the same rows — 1, 3, 4, 5, 6, 9,
+10 and 11 carry over unchanged: the operator catalogue selects the context
+contract per project, the same qualification/proof/recheck machinery governs
+it, and its refusals stay typed and durable. It advances no deployment,
+approver or installed-environment qualification.
