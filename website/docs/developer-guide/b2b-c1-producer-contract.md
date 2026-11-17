@@ -59,14 +59,50 @@ or `c1_context_required`) — health evaluation
 performs no plugin discovery or
 probe and cannot leak ambient execution state. A NEW admission whose
 preparation cannot produce a qualified source fails closed before admission
-with `503 execution_unavailable`: an absent producer, a missing OC receipt,
-a `/1`, non-measured or otherwise unqualified receipt, a captured rather
-than observed instant, a crossed or stale memory-context read, a late read
-that misses its budget, and every other typed preparation refusal all answer
-that code. The one exception is the OC observation's own window: an
-observation older than its governed bound or dated in the future refuses
-`503 context_oc_source_stale` instead — the exact typed cause the admission
-path preserves. That refusal covers NEW admissions only: an already-durable
+with a typed 503 whose `error` and `code` carry the same reason. Every typed
+preparation refusal raised inside the bounded preparation answers `503
+execution_unavailable` — an absent producer, a missing OC receipt, a `/1`,
+non-measured or otherwise unqualified receipt, a captured rather than
+observed instant, a crossed or stale memory-context read, a render/bounds or
+schema/contract refusal, configuration drift, or any other
+`B2BTerminalRefusal` — and so does any untyped exception there
+(`gateway/platforms/api_server_b2b.py:1371-1375`). The single exception is
+`503 context_oc_source_stale`, relayed verbatim. Host code raises it at
+exactly three sites, all reachable before admission:
+
+- the `/2` projection's age/instant coherence, checked by
+  `_native_oc_read_metadata` (`agent/b2b_execution.py:225-229`) from
+  `qualify_context_view` (`agent/b2b_execution.py:826`) and again from
+  `_prepare_b2b_context` (`gateway/platforms/api_server_b2b_context.py:324`):
+  a non-integer `age_ms` or `freshness_max_age_ms`, an `age_ms` unequal to
+  `view_instant - source_observed_at` (an incoherent receipt, not a window
+  question), a negative `age_ms`, or `freshness_max_age_ms < age_ms`;
+- the observation window `observed <= now < observed +
+  min(900000, freshness_max_age_ms)`, checked by `_assert_source_window`
+  (`gateway/platforms/api_server_b2b_context.py:200-209`, called at
+  `_prepare_b2b_context:350`): a source dated in the future or older than its
+  governed bound;
+- the stored `source_deadline_ms`, rechecked on the host by
+  `assert_context_source_current`
+  (`gateway/platforms/api_server_b2b_context.py:212-216`, called at
+  `_prepare_b2b_context:361`, at `gateway/platforms/api_server_b2b.py:1367`
+  after the readiness classifier, and at the admission gate
+  `gateway/platforms/api_server_b2b.py:1440`): a deadline that elapsed while
+  the preparation or its validators ran.
+
+`_prepare` relays that literal cause unchanged, so a producer or validator
+that raises it is answered the same way
+(`gateway/platforms/api_server_b2b.py:1371-1373`). The readiness classifier
+consulted at the end of preparation can also answer its own code
+(`execution_inputs_unavailable`, `c1_producer_unavailable` or
+`c1_context_required`, `gateway/platforms/api_server_b2b_execution.py:164-183`)
+when the inputs, the producer registration or the attached preparation are no
+longer current at that instant for a reason other than the OC deadline — that
+deadline is rechecked immediately after and wins as
+`context_oc_source_stale`
+(`gateway/platforms/api_server_b2b.py:1365-1375,1403-1404`). A bootstrap or
+preparation worker that misses its budget answers `execution_unavailable`
+too. Those refusals cover NEW admissions only: an already-durable
 attempt is always served by the idempotent replay (`_replayed_response`)
 before the readiness guard, so a lost-ACK retry recovers its run — and any
 error entering the profile scope or reading the serving config still answers
