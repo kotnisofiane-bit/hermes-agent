@@ -99,27 +99,32 @@ def producer_available() -> bool:
         return False
 
 
-def _start_preparation(callback):
-    """Spawn THIS preparation's ONE native worker — a daemon thread running
+def _start_bounded_worker(callback, *, count_abandoned: bool):
+    """Spawn THIS operation's ONE native worker — a daemon thread running
     ``callback`` under ``copy_context`` — and hand back ``(done, outcome,
     abandon)``:
 
     * ``done`` is set only when the worker TRULY exits;
     * ``outcome`` carries ``{"value": ...}`` or ``{"error": BaseException}``;
     * ``abandon()`` — idempotent, under ``_ABANDONED_LOCK`` — counts a
-      still-running worker against this home's bound exactly once.
+      still-running worker against this home's bound exactly once, and is a
+      no-op entirely for ``count_abandoned=False`` callers.
 
     The worker's own finally is the ONLY decrement, and a home already at
     ``_MAX_ABANDONED_PREPARATIONS`` orphans refuses ``context_preparation_stuck``
-    before any thread is spawned."""
+    before any thread is spawned — only when this is a counted preparation.
+    Non-preparation operations (``count_abandoned=False``) neither consult
+    that gate nor touch its counters: they share the machinery, never the
+    accounting."""
     home = hermes_home_key()
     # Per-call bookkeeping shared with the worker's finally, always under the
     # module lock: the worker frees this call's slot only if the caller
     # abandoned it.
     state: Dict[str, bool] = {"finished": False, "abandoned": False}
-    with _ABANDONED_LOCK:
-        if _ABANDONED_PREPARATIONS.get(home, 0) >= _MAX_ABANDONED_PREPARATIONS:
-            raise B2BTerminalRefusal("context_preparation_stuck")
+    if count_abandoned:
+        with _ABANDONED_LOCK:
+            if _ABANDONED_PREPARATIONS.get(home, 0) >= _MAX_ABANDONED_PREPARATIONS:
+                raise B2BTerminalRefusal("context_preparation_stuck")
     outcome: Dict[str, Any] = {}
     done = threading.Event()
     invoke_context = contextvars.copy_context()
@@ -137,7 +142,7 @@ def _start_preparation(callback):
             # the worker's real exit is the gate's only release.
             with _ABANDONED_LOCK:
                 state["finished"] = True
-                if state["abandoned"]:
+                if count_abandoned and state["abandoned"]:
                     remaining = _ABANDONED_PREPARATIONS.get(home, 0) - 1
                     if remaining > 0:
                         _ABANDONED_PREPARATIONS[home] = remaining
@@ -147,7 +152,11 @@ def _start_preparation(callback):
 
     def _abandon() -> None:
         """The caller walked away while the worker still runs: count the
-        orphan ONCE — the worker's real exit performs the only decrement."""
+        orphan ONCE — the worker's real exit performs the only decrement.
+        Non-preparation callers never count: a timed-out bounded operation
+        is simply discarded, not budgeted."""
+        if not count_abandoned:
+            return
         with _ABANDONED_LOCK:
             if not state["finished"] and not state["abandoned"]:
                 state["abandoned"] = True
@@ -170,16 +179,14 @@ def _preparation_result(outcome: Dict[str, Any]) -> Any:
     return outcome["value"]
 
 
-async def run_bounded_context_preparation(callback):
-    """THE bounded preparation: await the worker's ``done`` Event WITHOUT an
+async def _bounded_worker_result(done, outcome, abandon, deadline):
+    """The shared bounded wait: poll the worker's ``done`` Event without an
     executor and without a nested worker — a monotonic deadline over a
-    <=10 ms poll. A budget expiry marks the worker abandoned and refuses
-    ``context_unavailable``; a task cancellation marks it the same way (the
-    daemon is never killed — it stays counted until its true exit) and
-    propagates. The deadline is judged on the worker's OWN recorded finish
-    instant, never on the polling loop's wake."""
-    deadline = _monotonic() + _SOURCE_DEADLINE_S
-    done, outcome, abandon = _start_preparation(callback)
+    <=10 ms poll. A budget expiry abandons the worker (counted only for
+    preparations) and refuses ``context_unavailable``; a task cancellation
+    abandons it the same way and propagates — the daemon is never killed.
+    The deadline is judged on the worker's OWN recorded finish instant,
+    never on the polling loop's wake."""
     try:
         while not done.is_set():
             remaining = deadline - _monotonic()
@@ -198,6 +205,34 @@ async def run_bounded_context_preparation(callback):
         abandon()
         raise
     return _preparation_result(outcome)
+
+
+async def run_bounded_context_preparation(callback):
+    """THE bounded preparation: one counted native worker on the
+    ``_SOURCE_DEADLINE_S`` budget. A budget expiry marks the worker
+    abandoned and refuses ``context_unavailable``; a task cancellation
+    marks it the same way (the daemon is never killed — it stays counted
+    until its true exit) and propagates."""
+    deadline = _monotonic() + _SOURCE_DEADLINE_S
+    done, outcome, abandon = _start_bounded_worker(
+        callback, count_abandoned=True)
+    return await _bounded_worker_result(done, outcome, abandon, deadline)
+
+
+async def run_bounded_context_operation(callback, *, timeout):
+    """The bounded NON-preparation operation — the SAME
+    daemon/``copy_context``/poll machinery and fail-closed
+    ``context_unavailable`` expiry as native preparation, on the caller's
+    own ``timeout``. A timed-out operation is discarded, never budgeted:
+    it neither consults the abandoned-preparation gate nor counts against
+    it, and the worker's real exit is its own release. For work that must
+    stay off the loop and off the executor but is NOT the native read:
+    the launch bootstrap, seal-time source/policy validation, and the
+    seal-time recheck."""
+    deadline = _monotonic() + timeout
+    done, outcome, abandon = _start_bounded_worker(
+        callback, count_abandoned=False)
+    return await _bounded_worker_result(done, outcome, abandon, deadline)
 
 
 def _invoke_producer(cap: BoundExecution):

@@ -19,6 +19,7 @@ import hmac
 import json
 import logging
 import re
+import threading
 import time
 import types
 import uuid
@@ -46,6 +47,38 @@ _SOURCE_DEADLINE_S = 1.0
 _CONTEXT_RECHECK_SAFETY_S = 0.1
 _REQUEST_TTL_S = 10
 _MAX_WINDOW_S = 30
+
+# Launch-bootstrap single-flight: exactly ONE bootstrap worker per canonical
+# home, held until the worker's REAL exit — never released by the caller's
+# bounded wait refusing, its cancellation, or a reply already sent. A second
+# bootstrap on the same home is refused at once instead of queueing behind
+# (or duplicating) the still-running one. The Event signals worker exit.
+_BOOTSTRAP_LOCK = threading.Lock()
+_BOOTSTRAP_IN_FLIGHT: Dict[str, "threading.Event"] = {}
+
+
+def _try_reserve_bootstrap(home_key: str) -> "Optional[threading.Event]":
+    """Reserve this home's ONE bootstrap slot before the worker exists —
+    ``None`` when a bootstrap (live OR merely timed-out) already owns it."""
+    with _BOOTSTRAP_LOCK:
+        if home_key in _BOOTSTRAP_IN_FLIGHT:
+            return None
+        slot = threading.Event()
+        _BOOTSTRAP_IN_FLIGHT[home_key] = slot
+        return slot
+
+
+def _release_bootstrap(home_key: str, slot: "threading.Event") -> None:
+    """Free the slot ONLY if this exact reservation still owns it — called
+    from the worker's finally (its true exit) and from the spawn path when
+    the worker never started. Identity-checked so a superseded reservation
+    can never evict a newer one."""
+    with _BOOTSTRAP_LOCK:
+        if _BOOTSTRAP_IN_FLIGHT.get(home_key) is slot:
+            del _BOOTSTRAP_IN_FLIGHT[home_key]
+    slot.set()
+
+
 _SIG_RE = re.compile(r"^[A-Za-z0-9_-]{86}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _SHA256_FIELD = re.compile(r"^(sha256:)?[0-9a-f]{64}$")
@@ -1095,14 +1128,31 @@ class _AttemptSink:
         resolved, reason = await _resolve_source_async(
             self.entry, self.keys, "before_seal", attempt_id=self.attempt_id,
             profile=self.profile, session_id=self.session_id)
-        if (resolved is None or not self._matches_source(resolved) or
-                not self._source_matches_context(resolved)):
+        if resolved is None:
+            self.block("source_before_seal_denied")
+            return None
+        # The policy/validator match is plugin-owned code — bounded on a
+        # non-preparation worker, never inline on the API loop: a blocked
+        # validator refuses ``context_unavailable`` on ``_SOURCE_DEADLINE_S``
+        # instead of freezing the whole gateway.
+        from gateway.platforms.api_server_b2b_context import (
+            run_bounded_context_operation)
+        matched = await run_bounded_context_operation(
+            lambda: (self._matches_source(resolved) and
+                     self._source_matches_context(resolved)),
+            timeout=_SOURCE_DEADLINE_S)
+        if not matched:
             self.block("source_before_seal_denied")
             return None
         return resolved
 
-    def seal(self, *, source_before_seal: Mapping[str, Any], rechecked_view: Mapping[str, Any],
-             created_at: str) -> Dict[str, Any]:
+    def _prepare_seal(self, *, source_before_seal: Mapping[str, Any],
+                      rechecked_view: Mapping[str, Any], created_at: str) -> Dict[str, Any]:
+        """Plugin-validating seal PREPARATION: every check the attached
+        preparation's validator must pass plus the proposal/artifact
+        MATERIAL — never ``store.b2b_seal``. Runs ONLY inside a bounded
+        worker; material a timed-out worker produced is simply discarded,
+        so a straggler can never mint late durable proof."""
         receipt = self.context_receipt
         result = self._store.b2b_artifact(attempt_id=self.attempt_id, kind="provider_result")
         if (receipt is None or result is None or not self._matches_source(source_before_seal) or
@@ -1142,17 +1192,50 @@ class _AttemptSink:
         previous = verify_context_proof(dispatch.get("context_recheck"))
         assert_source_equivalent(previous["view"], fresh)
         proof = context_proof(fresh)
-        stored = self._store.b2b_seal(
-            profile=self.profile, attempt_id=self.attempt_id,
-            artifacts={
+        return {
+            "proposal": proposal,
+            "source_window": {
+                "request": {
+                    "issued_at": source_before_seal["_signed_request"]["issued_at"],
+                    "expires_at": source_before_seal["_signed_request"]["expires_at"]},
+                "response": {
+                    "issued_at": source_before_seal["_signed_response"]["issued_at"],
+                    "expires_at": source_before_seal["_signed_response"]["expires_at"]}},
+            "artifacts": {
                 "source_before_seal": _source_record(source_before_seal),
                 "context_recheck": json_utf8({
                     "format": "dubsar.b2b-context-recheck/2", "attempt_id": self.attempt_id,
                     "run_id": self.run_id, **proof}),
-                "proposal": json_utf8(proposal)})
+                "proposal": json_utf8(proposal)}}
+
+    def _commit_seal(self, prepared: Mapping[str, Any]) -> Dict[str, Any]:
+        """Host-only durable COMMIT — the sole ``store.b2b_seal`` caller.
+        Invoked exclusively by the API thread after a TIMELY
+        ``_prepare_seal`` return; a worker never owns this closure.
+
+        The signed source window is re-verified HERE on host data — the
+        async prepare→commit seam admits scheduling delay, so the window a
+        timely preparation observed may have closed by commit. Pure
+        timestamp arithmetic: no plugin callback, no revalidation."""
+        window = prepared["source_window"]
+        now = time.time()
+        if not all(env["issued_at"] <= now < env["expires_at"] for env in
+                   (window["request"], window["response"])):
+            raise B2BTerminalRefusal("source_window_closed")
+        stored = self._store.b2b_seal(
+            profile=self.profile, attempt_id=self.attempt_id,
+            artifacts=dict(prepared["artifacts"]))
         if stored is None:
             raise B2BTerminalRefusal("seal_commit_failed")
         return json.loads(stored)
+
+    def seal(self, *, source_before_seal: Mapping[str, Any], rechecked_view: Mapping[str, Any],
+             created_at: str) -> Dict[str, Any]:
+        """Synchronous prepare+commit for direct callers/tests — the same
+        two stages ``_b2b_finalize`` splits across the bounded boundary."""
+        return self._commit_seal(self._prepare_seal(
+            source_before_seal=source_before_seal,
+            rechecked_view=rechecked_view, created_at=created_at))
 
 
 async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, keys,
@@ -1160,7 +1243,7 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                           resolved: Dict[str, Any], store: Any, db: Any):
     """Keep the immutable empty origin, but accept worked sessions through their owned binding."""
     import asyncio as _a
-    from hermes_constants import get_hermes_home
+    from hermes_constants import get_hermes_home, hermes_home_key
     home = get_hermes_home().resolve()
     if (not getattr(db, "db_path", None) or str(db.db_path) == ":memory:" or
             db.db_path.resolve().parent != home):
@@ -1256,7 +1339,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         # plugin secret-source code on the loop; the home is already fixed
         # and db/home-verified above.
         from gateway.platforms.api_server_b2b_context import (
-            context_preparation_stuck, run_bounded_context_preparation)
+            context_preparation_stuck, run_bounded_context_operation,
+            run_bounded_context_preparation)
         from gateway.run import _profile_runtime_scope
         try:
             with _profile_runtime_scope(home, hydrate_secrets=False):
@@ -1276,7 +1360,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             sink=sink, created_at=time.time())
 
         def _bootstrap() -> Tuple[Optional[str], Any, Any]:
-            """Runs OUTSIDE the bounded worker — one untimed to_thread hop:
+            """Runs INSIDE the bounded NON-preparation worker, off the API
+            loop and the default executor, on the ``_REQUEST_TTL_S`` budget:
             owning profile scope (secret hydration included), gateway config,
             plugin discovery, and the non-plugin/inputs gates. Discovery and
             hydration can legitimately take seconds; neither is plugin
@@ -1319,7 +1404,34 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                     reset_execution(token)
             except Exception:
                 return "execution_unavailable"
-        bootstrap_error, config, scope_ctx = await _a.to_thread(_bootstrap)
+        # ONE bootstrap per canonical home, held off the API loop AND the
+        # default executor entirely: the bounded NON-preparation runner owns
+        # the wait on its own ``_REQUEST_TTL_S`` budget (never the
+        # ``_SOURCE_DEADLINE_S`` native-read budget). The slot is reserved
+        # BEFORE the worker exists and released only by the worker's real
+        # exit — a timed-out or cancelled launch still leaves its bootstrap
+        # excluded until the callback itself finishes.
+        bootstrap_key = hermes_home_key(home)
+        bootstrap_slot = _try_reserve_bootstrap(bootstrap_key)
+        if bootstrap_slot is None:
+            return _deny(503, "execution_unavailable")
+
+        def _bootstrap_guarded():
+            try:
+                return _bootstrap()
+            finally:
+                _release_bootstrap(bootstrap_key, bootstrap_slot)
+
+        try:
+            bootstrap_error, config, scope_ctx = await run_bounded_context_operation(
+                _bootstrap_guarded, timeout=_REQUEST_TTL_S)
+        except B2BTerminalRefusal:
+            return _deny(503, "execution_unavailable")
+        except Exception:
+            # The spawn itself failed before the worker could own the slot —
+            # release is identity-checked, a no-op when the worker ran.
+            _release_bootstrap(bootstrap_key, bootstrap_slot)
+            return _deny(503, "execution_unavailable")
         if bootstrap_error == "non_plugin_hook_subscribers":
             return _deny(503, "non_plugin_hook_subscribers")
         if bootstrap_error is not None:

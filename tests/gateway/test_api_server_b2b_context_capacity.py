@@ -122,7 +122,10 @@ def register(ctx):
             if calls[0] == probe.VAL_BLOCK_CALL:
                 barrier = probe.VAL_BARRIER
                 if barrier is not None:
-                    barrier.wait(timeout=15.0)
+                    # Sequential single-flight bootstraps make the eighth
+                    # party arrive ~20s after the first — a 15s rendezvous
+                    # would break before all eight are parked.
+                    barrier.wait(timeout=90.0)
                 probe.VAL_GATE.wait(timeout=30.0)
             if ctx.get_config("preparation_stamp") != stamp:
                 raise B2BTerminalRefusal("b2b_policy_changed")
@@ -161,6 +164,8 @@ def _reset_probe():
     globals()["VAL_BLOCK_CALL"] = 0
     del PREP_WORKER_THREADS[:]
     del VAL_WORKER_THREADS[:]
+    del REGISTER_THREADS[:]
+    del HYDRATE_THREADS[:]
 
 
 def _assert_refused_503(response):
@@ -418,13 +423,23 @@ async def test_healthy_concurrent_launches_never_count_toward_the_cap(
         execution_lane.b2b, "_spawn_run", _spawn_recorder(spawned))
 
     t1 = asyncio.create_task(_launch_profile(case_a, "hub"))
-    t2 = asyncio.create_task(_launch_profile(case_d, "hub"))
+    t2 = None
     try:
-        deadline = time.monotonic() + 10.0
+        deadline = time.monotonic() + 30.0
+        # Bootstrap admission is single-flight per home: a second launch
+        # started while the first is still bootstrapping is refused on
+        # purpose. Launch it only once the first worker is parked inside
+        # the producer — its bootstrap is then complete and the slot free.
+        # The two PREPARATIONS still run genuinely concurrently.
+        while barrier.n_waiting < 1 and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        assert barrier.n_waiting == 1, (
+            "first launch's worker never entered the producer")
+        t2 = asyncio.create_task(_launch_profile(case_d, "hub"))
         while barrier.n_waiting < 2 and time.monotonic() < deadline:
             await asyncio.sleep(0.005)
         assert barrier.n_waiting == 2, (
-            "both launches' workers never entered the producer")
+            "second launch's worker never entered the producer")
         assert len(set(PREP_WORKER_THREADS)) == 2
         # Both workers healthy and still running: the abandoned count stays 0.
         assert _abandoned_count(adapter, "hub") == 0
@@ -432,7 +447,9 @@ async def test_healthy_concurrent_launches_never_count_toward_the_cap(
         r1, r2 = await asyncio.gather(t1, t2)
     finally:
         barrier.abort()
-        await asyncio.gather(t1, t2, return_exceptions=True)
+        await asyncio.gather(
+            *[t for t in (t1, t2) if t is not None],
+            return_exceptions=True)
         _join_prep_workers()
     assert getattr(r1, "status", None) == 200, r1
     assert getattr(r2, "status", None) == 200, r2
@@ -863,12 +880,21 @@ async def _executor_starvation_scenario(tmp_path, monkeypatch, opened):
 
     app.router.add_get("/p/ci/api/sessions/{session_id}", _ci_get_session)
 
-    tasks = [asyncio.create_task(_launch_profile(case_a, "hub"))
-             for _ in range(8)]
+    # Bootstrap admission is single-flight per home: a launch started while
+    # a sibling still bootstraps is refused on purpose. Start each launch
+    # only once the previous worker is parked inside its validator — that
+    # worker's bootstrap is then complete and the slot free. The eight
+    # PREPARATIONS still end up parked genuinely simultaneously.
+    deadline = time.monotonic() + 90.0
+    tasks = []
     try:
-        deadline = time.monotonic() + 10.0
-        while len(VAL_WORKER_THREADS) < 8 and time.monotonic() < deadline:
-            await asyncio.sleep(0.005)
+        for launched in range(8):
+            tasks.append(asyncio.create_task(
+                _launch_profile(case_a, "hub")))
+            while (len(VAL_WORKER_THREADS) <= launched
+                   and not tasks[-1].done()
+                   and time.monotonic() < deadline):
+                await asyncio.sleep(0.005)
         assert len(VAL_WORKER_THREADS) == 8
         assert len({entry[2] for entry in VAL_WORKER_THREADS}) == 8
 
@@ -893,7 +919,7 @@ async def _executor_starvation_scenario(tmp_path, monkeypatch, opened):
             for entry in VAL_WORKER_THREADS)
 
         responses = await asyncio.wait_for(
-            asyncio.gather(*tasks), timeout=15.0)
+            asyncio.gather(*tasks), timeout=60.0)
         for refused in responses:
             _assert_refused_503(refused)
         # The bound refuses NEW preparations; eight already-started reads may
@@ -1064,3 +1090,403 @@ async def test_secret_source_lock_wait_counts_nothing_on_either_home(
     assert sorted(p for p, _run, _s in spawned) == ["ci", "hub"]
     assert _abandoned_count_unhydrated(case_a.profile_home) == 0
     assert _abandoned_count_unhydrated(case_b.profile_home) == 0
+
+
+# ---------------------------------------------------------------------------
+# P2: the launch bootstrap is a bounded NON-preparation operation — held off
+# the loop's default executor entirely, exactly ONE in flight per canonical
+# home (excluded until the REAL worker exit, never the caller's timeout), and
+# never counted against the abandoned-preparation bound.
+# ---------------------------------------------------------------------------
+
+# Threads that ran plugin register()/secret hydration — the bootstrap probe
+# variants below append to them so tests can assert NO plugin/bootstrap code
+# ever ran on the API loop's own thread.
+REGISTER_THREADS = []
+HYDRATE_THREADS = []
+
+# Cold register that BOTH parks on REGISTER_GATE and records its worker.
+_COLD_REGISTER_THREADS_INIT = _COLD_REGISTER_INIT.replace(
+    "    probe.REGISTER_ENTERED.set()\n",
+    "    probe.REGISTER_THREADS.append(_t.current_thread())\n"
+    "    probe.REGISTER_ENTERED.set()\n", 1).replace(
+    "    from tests.gateway import (\n"
+    "        test_api_server_b2b_context_capacity as probe)\n",
+    "    import threading as _t\n"
+    "    from tests.gateway import (\n"
+    "        test_api_server_b2b_context_capacity as probe)\n", 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["plugin_register", "hydration"])
+async def test_blocked_bootstrap_never_starves_default_executor(
+        tmp_path, monkeypatch, opened, stage):
+    """A bootstrap held inside cold plugin ``register()`` — or inside plugin
+    secret-source hydration — consumes ZERO default-executor slots and ZERO
+    API-loop time: with the loop's executor capped at ONE worker a real
+    generic session route on ANOTHER profile (register arm) and the real
+    ``/health/detailed`` handler (both arms) keep answering while the same
+    launch stays pending. A concurrent launch on the SAME home is refused
+    503 ``execution_unavailable`` IMMEDIATELY — never queued behind the
+    still-running bootstrap — and nothing counts as an abandoned
+    preparation."""
+    from concurrent.futures import ThreadPoolExecutor
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    import hermes_cli.env_loader as env_loader
+
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=1))
+    case_a = _new_launch(tmp_path, monkeypatch, opened)
+    case_a.db = case_a.adapter._session_db
+    adapter = case_a.adapter
+    adapter._max_concurrent_runs = 0
+    case_b = _profile_case(
+        tmp_path, monkeypatch, opened, adapter, case_a.lane, "ci", "c")
+    case_b.db.create_session("ci_plain_session", "api_server")
+    assert case_a.db.get_session("ci_plain_session") is None
+    adapter._session_db = None
+
+    _freeze_preparation_clock(monkeypatch)
+    _reset_probe()
+    loop_thread = threading.current_thread()
+    if stage == "plugin_register":
+        execution_lane._write_fake_plugin(
+            case_a.profile_home, init=_COLD_REGISTER_THREADS_INIT)
+    else:
+        execution_lane._write_fake_plugin(case_a.profile_home)
+        real_inner = env_loader._hydrate_profile_secret_sources
+        a_home = str(case_a.profile_home.resolve())
+
+        def _blocked_inner(home):
+            if str(Path(home).resolve()) == a_home:
+                HYDRATE_THREADS.append(threading.current_thread())
+                REGISTER_ENTERED.set()
+                REGISTER_GATE.wait(timeout=30.0)
+            return real_inner(home)
+
+        monkeypatch.setattr(
+            env_loader, "_hydrate_profile_secret_sources", _blocked_inner)
+    execution_lane._plugin_config(
+        case_a.profile_home, stamp=_PREPARATION_STAMP)
+    spawned = []
+    monkeypatch.setattr(
+        execution_lane.b2b, "_spawn_run", _spawn_recorder(spawned))
+
+    app = web.Application()
+
+    async def _ci_get_session(request):
+        with adapter._profile_scope("ci"):
+            return await adapter._handle_get_session(request)
+
+    app.router.add_get("/p/ci/api/sessions/{session_id}", _ci_get_session)
+
+    task = asyncio.create_task(_launch_unhydrated(case_a, "hub"))
+    try:
+        deadline = time.monotonic() + 10.0
+        while not REGISTER_ENTERED.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        assert REGISTER_ENTERED.is_set(), f"bootstrap {stage} never started"
+        assert not task.done()
+
+        # On the hydration arm the bootstrap worker holds the REAL global
+        # secret-source lock — ordinary routes legitimately queue there —
+        # but health must stay non-hydrating and answer regardless.
+        if stage == "plugin_register":
+            async with TestClient(TestServer(app)) as client:
+                response = await asyncio.wait_for(
+                    client.get(
+                        "/p/ci/api/sessions/ci_plain_session",
+                        headers={
+                            "Authorization": "Bearer " + admission._API_KEY}),
+                    timeout=5.0)
+                assert response.status == 200
+                payload = await response.json()
+            assert payload["session"]["id"] == "ci_plain_session"
+
+        request = SimpleNamespace(
+            headers={"Authorization": "Bearer " + admission._API_KEY})
+        detailed = await asyncio.wait_for(
+            adapter._handle_health_detailed(request), timeout=5.0)
+        assert detailed.status == 200
+
+        # A second launch on the SAME home refuses at once — the bootstrap
+        # slot is held for the still-running worker, so this must not wait.
+        refused = await asyncio.wait_for(
+            _launch_unhydrated(case_a, "hub"), timeout=5.0)
+        _assert_refused_503(refused)
+        assert _abandoned_count_unhydrated(case_a.profile_home) == 0
+        assert not task.done()
+        assert spawned == []
+    finally:
+        REGISTER_GATE.set()
+        results = await asyncio.gather(task, return_exceptions=True)
+        adapter._close_cached_session_dbs()
+
+    response = results[0]
+    assert response.status == 200, getattr(response, "body", response)
+    assert len(spawned) == 1
+    assert _abandoned_count_unhydrated(case_a.profile_home) == 0
+    # Bootstrap plugin code — register() or hydration — NEVER ran on the
+    # API loop's own thread.
+    bootstrap_threads = list(REGISTER_THREADS) + list(HYDRATE_THREADS)
+    assert bootstrap_threads, "bootstrap instrumentation saw no callback"
+    assert all(t is not loop_thread for t in bootstrap_threads), (
+        bootstrap_threads)
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_deadline_refuses_and_excludes_home(
+        tmp_path, monkeypatch, opened):
+    """A bootstrap that outlives its OWN bounded budget is refused 503
+    ``execution_unavailable`` — but the home stays excluded until the parked
+    worker's REAL exit: a retry during the still-running callback gets the
+    same immediate refusal instead of spawning a second bootstrap, and only
+    the worker's true finish frees the next admit. The bounded wait counts
+    ZERO abandoned preparations and produces no durable side effects."""
+    case = _new_launch(tmp_path, monkeypatch, opened)
+    case.db = case.adapter._session_db
+    adapter = case.adapter
+    adapter._max_concurrent_runs = 0
+
+    _freeze_preparation_clock(monkeypatch)
+    # The bootstrap's own bound — far under the external test patience:
+    # the launch must refuse on ITS deadline, not the harness's.
+    monkeypatch.setattr(execution_lane.b2b, "_REQUEST_TTL_S", 0.3)
+    _reset_probe()
+    execution_lane._write_fake_plugin(
+        case.profile_home, init=_COLD_REGISTER_INIT)
+    execution_lane._plugin_config(
+        case.profile_home, stamp=_PREPARATION_STAMP)
+    spawned = []
+    monkeypatch.setattr(
+        execution_lane.b2b, "_spawn_run", _spawn_recorder(spawned))
+    before = admission._store_counts(case.store)
+
+    response = await asyncio.wait_for(
+        _launch_unhydrated(case, "hub"), timeout=8.0)
+    _assert_refused_503(response)
+    from gateway.platforms.api_server_b2b import _BOOTSTRAP_IN_FLIGHT
+    from hermes_constants import hermes_home_key
+    home_key = hermes_home_key(case.profile_home)
+    # The register worker is STILL parked — the home's bootstrap slot must
+    # still be held: a retry refuses immediately rather than queueing a
+    # second bootstrap behind it.
+    assert REGISTER_ENTERED.is_set()
+    assert home_key in _BOOTSTRAP_IN_FLIGHT
+    refused = await asyncio.wait_for(
+        _launch_unhydrated(case, "hub"), timeout=5.0)
+    _assert_refused_503(refused)
+    assert _abandoned_count_unhydrated(case.profile_home) == 0
+    assert admission._store_counts(case.store) == before
+    assert spawned == []
+    try:
+        # Releasing the parked register() frees the slot only at its REAL
+        # exit — the next launch then admits end to end.
+        REGISTER_GATE.set()
+        deadline = time.monotonic() + 10.0
+        while home_key in _BOOTSTRAP_IN_FLIGHT and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert home_key not in _BOOTSTRAP_IN_FLIGHT
+    finally:
+        REGISTER_GATE.set()
+    response = await _launch_unhydrated(case, "hub")
+    assert response.status == 200, response.body
+    assert len(spawned) == 1
+    assert _abandoned_count_unhydrated(case.profile_home) == 0
+
+
+@pytest.mark.asyncio
+async def test_b2b_route_scope_entry_never_hydrates_on_loop(
+        tmp_path, monkeypatch, opened):
+    """Through the REAL profile-prefix middleware: a B2B proposal POST and
+    ``/health`` must enter the request profile scope WITHOUT running plugin
+    secret-source hydration on the API loop — hydration belongs to the
+    launch's bounded bootstrap worker alone. The spy records the THREAD
+    every hydration runs on; any loop-thread record is the regression."""
+    from agent.secret_scope import is_multiplex_active, set_multiplex_active
+    from aiohttp.test_utils import TestClient, TestServer
+    import hermes_cli.env_loader as env_loader
+
+    case = _new_launch(tmp_path, monkeypatch, opened)
+    case.db = case.adapter._session_db
+    adapter = case.adapter
+    adapter._max_concurrent_runs = 0
+    # The real POST handler reads the ADAPTER's lane state — install the
+    # lane's full project entry, not the bare _b2b_extra stub.
+    adapter._b2b_state = execution_lane._state({"hub": case.entry})
+
+    _freeze_preparation_clock(monkeypatch)
+    execution_lane._write_fake_plugin(case.profile_home)
+    execution_lane._plugin_config(case.profile_home, stamp=_PREPARATION_STAMP)
+
+    loop_thread = threading.current_thread()
+    hydrate_calls = []
+    real_inner = env_loader._hydrate_profile_secret_sources
+
+    def _spy_inner(home):
+        hydrate_calls.append((str(home), threading.current_thread()))
+        return real_inner(home)
+
+    monkeypatch.setattr(
+        env_loader, "_hydrate_profile_secret_sources", _spy_inner)
+
+    async def _resolved_source(*a, **k):
+        return case.resolved, "ok"
+
+    monkeypatch.setattr(
+        execution_lane.b2b, "_resolve_source_async", _resolved_source)
+    spawned = []
+    monkeypatch.setattr(
+        execution_lane.b2b, "_spawn_run", _spawn_recorder(spawned))
+
+    previous = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        app = admission._app(adapter)
+        app.router.add_get("/health", adapter._handle_health)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                f"/p/hub/api/sessions/{case.session_id}/b2b-proposal",
+                json={"attempt_id": case.resolved["attempt_id"],
+                      "binding_digest": case.session_id[4:]},
+                headers={"Authorization": "Bearer " + admission._API_KEY,
+                         "Idempotency-Key": case.resolved["attempt_id"]})
+            assert response.status == 200, await response.text()
+            health = await client.get("/health")
+            assert health.status == 200
+    finally:
+        set_multiplex_active(previous)
+
+    assert hydrate_calls, "instrumentation never saw a hydration"
+    assert all(thread is not loop_thread
+               for _home, thread in hydrate_calls), hydrate_calls
+
+
+@pytest.mark.asyncio
+async def test_plugin_callbacks_never_run_on_api_loop_inventory(
+        tmp_path, monkeypatch, opened):
+    """Genuine launch inventory: cold ``register()``, the ``prepare_context``
+    native read AND its returned ``validate_configuration`` — every observed
+    plugin-callback phase is asserted POPULATED (a swallowed instrument
+    fails here, never silently passes) and asserted OFF the API loop's own
+    thread."""
+    case = _new_launch(tmp_path, monkeypatch, opened)
+    case.db = case.adapter._session_db
+    adapter = case.adapter
+    adapter._max_concurrent_runs = 0
+    _freeze_preparation_clock(monkeypatch)
+    _reset_probe()
+
+    _INVENTORY_INIT = _GATED_VALIDATOR_INIT.replace(
+        "def register(ctx):\n",
+        "def register(ctx):\n"
+        "    import threading as _t\n"
+        "    from tests.gateway import (\n"
+        "        test_api_server_b2b_context_capacity as probe)\n"
+        "    probe.REGISTER_THREADS.append(_t.current_thread())\n", 1)
+    execution_lane._write_fake_plugin(
+        case.profile_home, name="inventory-producer", init=_INVENTORY_INIT)
+    execution_lane._plugin_config(
+        case.profile_home, stamp=_PREPARATION_STAMP,
+        names=("inventory-producer",))
+    spawned = []
+    monkeypatch.setattr(
+        execution_lane.b2b, "_spawn_run", _spawn_recorder(spawned))
+    loop_thread = threading.current_thread()
+    response = await _launch_unhydrated(case, "hub")
+    assert response.status == 200, response.body
+    assert len(spawned) == 1
+    phases = {
+        "register": list(REGISTER_THREADS),
+        "prepare_context": list(PREP_WORKER_THREADS),
+        "validate_configuration": [t for _i, _c, t in VAL_WORKER_THREADS]}
+    assert all(threads for threads in phases.values()), phases
+    assert all(
+        thread is not loop_thread
+        for threads in phases.values() for thread in threads), phases
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("helper", ["construct", "turn"])
+async def test_bounded_api_worker_bounds_blocked_body(
+        tmp_path, monkeypatch, opened, helper):
+    """B2B construction and the synchronous turn body ride the SAME counted
+    non-preparation bounded worker — never the default executor, never
+    unbounded. A body parked on an event refuses on its derived window with
+    ZERO consumed executor slots (a real health answer still arrives),
+    ZERO abandoned preparations, and a live worker count that stays raised
+    until the orphan's true exit. The ordinary (cap-less) path is asserted
+    unchanged in ``test_generic_runs_limiter_*`` coverage."""
+    from concurrent.futures import ThreadPoolExecutor
+    from agent.b2b_execution import B2BTerminalRefusal
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    from gateway.platforms import api_server_b2b_execution as b2b_exec
+    from gateway.platforms import api_server_runs
+
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=1))
+    case = _new_launch(tmp_path, monkeypatch, opened)
+    adapter = case.adapter
+    lane = case.lane
+    _install_multi_b2b_state(adapter, lane, "hub")
+    _reset_probe()
+
+    # Patched-down copies of the EXISTING budgets so the refusal lands fast.
+    monkeypatch.setattr(execution_lane.b2b, "_REQUEST_TTL_S", 0.2)
+    monkeypatch.setattr(execution_lane.b2b, "_SOURCE_DEADLINE_S", 0.1)
+    policy = dict(lane.cap.policy)
+    policy["project"] = dict(
+        policy["project"], request_timeout_seconds=0.1)
+    from agent.b2b_execution import BoundExecution
+    cap = BoundExecution(
+        profile=lane.cap.profile, session_id=lane.cap.session_id,
+        binding_digest=lane.cap.binding_digest,
+        attempt_id=lane.cap.attempt_id, run_id=lane.cap.run_id,
+        policy=policy, sink=lane.sink, created_at=lane.cap.created_at)
+
+    run = SimpleNamespace(b2b_execution=cap)
+    gate = threading.Event()
+    worker_threads = []
+
+    def _blocked_body():
+        worker_threads.append(threading.current_thread())
+        gate.wait(timeout=30.0)
+        return "done"
+
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.current_thread()
+
+    async def _submit():
+        if helper == "construct":
+            return await b2b_exec.construct_run_agent(
+                adapter, run, _blocked_body, loop)
+        helper_fn = getattr(b2b_exec, "execute_run_agent", None)
+        if helper_fn is not None:
+            return await helper_fn(adapter, run, _blocked_body, loop)
+        # Baseline shape (0be): the turn body rode the unbounded counted
+        # executor hop — kept so this same test proves RED there.
+        return await api_server_runs._submit_api_worker(loop, _blocked_body)
+
+    request = SimpleNamespace(
+        headers={"Authorization": "Bearer " + admission._API_KEY})
+    try:
+        with pytest.raises(B2BTerminalRefusal, match="context_unavailable"):
+            await asyncio.wait_for(_submit(), timeout=10.0)
+        # The orphan is still parked: its live count stays raised, it ran
+        # off the loop thread AND off the single executor slot — a real
+        # health answer (itself a to_thread hop) arrives promptly.
+        assert api_server_runs.api_worker_live_count() == 1
+        assert worker_threads and worker_threads[0] is not loop_thread
+        detailed = await asyncio.wait_for(
+            adapter._handle_health_detailed(request), timeout=5.0)
+        assert detailed.status == 200
+        assert _abandoned_count_unhydrated(case.profile_home) == 0
+    finally:
+        gate.set()
+    deadline = time.monotonic() + 10.0
+    while (api_server_runs.api_worker_live_count() != 0
+           and time.monotonic() < deadline):
+        await asyncio.sleep(0.01)
+    assert api_server_runs.api_worker_live_count() == 0
+    assert _abandoned_count_unhydrated(case.profile_home) == 0

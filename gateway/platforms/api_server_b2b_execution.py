@@ -18,6 +18,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import time
 from contextlib import suppress
 from typing import Any, Callable, Dict, Mapping, Optional
 
@@ -226,6 +227,10 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
     severity = {"execution_inputs_unavailable": 0, "c1_producer_unavailable": 1,
                 "context_preparation_stuck": 2, "c1_context_required": 3}
     profiles: Dict[str, Any] = {}
+    # Pure introspection: every owning-profile scope below is entered WITHOUT
+    # plugin secret-source hydration — a blocked global hydration lock (e.g.
+    # a live bootstrap's external fetch) must never stall a health answer.
+    from gateway.platforms.api_server import _nonhydrating_profile_scopes
     for name, entry in state.config.profiles.items():
         code = "execution_inputs_unavailable"
         try:
@@ -233,7 +238,7 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
             # ``default``, which must resolve to the canonical default home
             # (``get_profile_dir("default")``), never the request's ambient
             # home a prefixed ``/p/<other>/`` request bound.
-            with adapter._profile_scope(name):
+            with _nonhydrating_profile_scopes(), adapter._profile_scope(name):
                 # Health carries NO mission binding: an ambient bound
                 # execution must never leak a ``ready`` verdict into a
                 # status query. Clear it for the evaluation; restore after.
@@ -372,13 +377,47 @@ async def construct_run_agent(adapter: Any, run: Any, construct_agent: Callable[
         # B2B: cold AIAgent.__init__ (httpx import, client build) must not
         # block the serving event loop — typed reads + control stay live.
         # copy_context carries the bound execution across the worker;
-        # _submit_api_worker holds the worker's lifetime count.
+        # _submit_bounded_api_worker holds the worker's lifetime count AND
+        # bounds the wait on the existing request window — a construction
+        # stuck inside plugin code refuses instead of hanging unbounded.
         from contextvars import copy_context
-        from gateway.platforms.api_server_runs import _submit_api_worker
+        from gateway.platforms.api_server_b2b import _REQUEST_TTL_S
+        from gateway.platforms.api_server_runs import _submit_bounded_api_worker
         ctor_context = copy_context()
-        return await _submit_api_worker(loop, lambda: ctor_context.run(construct_agent))
+        return await _submit_bounded_api_worker(
+            lambda: ctor_context.run(construct_agent), timeout=_REQUEST_TTL_S)
     finally:
         reset_execution(cap_token)
+
+
+async def execute_run_agent(adapter: Any, run: Any, callback: Callable[[], Any],
+                            loop) -> Any:
+    """Run the agent TURN body: the native counted executor hop on ordinary
+    lanes; on a B2B lane the same counted body inside a bounded
+    non-preparation worker — plugin sections, turn middleware and every
+    synchronous callback stay off the API loop AND inside a fail-closed
+    total window composed only of EXISTING budgets (two prospective source
+    windows + one pinned provider send + one source deadline). A typed
+    refusal durably blocks the attempt BEFORE propagating so a late worker
+    can never reach CAS/seal."""
+    state = _state_for(adapter)
+    cap = getattr(run, "b2b_execution", None) if (
+        state is not None and state.config.enabled) else None
+    if cap is None:
+        from gateway.platforms.api_server_runs import _submit_api_worker
+        return await _submit_api_worker(loop, callback)
+    from agent.b2b_execution import B2BTerminalRefusal
+    from gateway.platforms.api_server_b2b import (
+        _REQUEST_TTL_S, _SOURCE_DEADLINE_S)
+    from gateway.platforms.api_server_runs import _submit_bounded_api_worker
+    timeout = (2 * _REQUEST_TTL_S
+               + cap.policy_get("project").get("request_timeout_seconds", 5)
+               + _SOURCE_DEADLINE_S)
+    try:
+        return await _submit_bounded_api_worker(callback, timeout=timeout)
+    except B2BTerminalRefusal as exc:
+        cap.sink.block(str(exc))
+        raise
 
 
 def run_execution_resets(adapter: Any, run: Any) -> list:
@@ -473,7 +512,18 @@ async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[s
 
     token = bind_execution(cap)
     try:
-        with sink._adapter._profile_scope(cap.profile if cap.profile != "default" else None):
+        # Finalization scopes to the capability's OWN home WITHOUT hydrating
+        # plugin secret sources on the API loop — a health/B2B route can
+        # never queue behind a blocked external hydration here; every plugin
+        # callback below runs inside a bounded worker anyway.
+        from pathlib import Path
+        from gateway.run import _profile_runtime_scope
+        from gateway.platforms.api_server_b2b import (
+            _CONTEXT_RECHECK_SAFETY_S, _SOURCE_DEADLINE_S)
+        from gateway.platforms.api_server_b2b_context import (
+            run_bounded_context_operation)
+        with _profile_runtime_scope(
+                Path(cap.policy_get("profile_home")), hydrate_secrets=False):
             # First refusal wins: an attempt already blocked durably keeps its typed
             # reason - never reclassify it as a later, unrelated family.
             row = sink._store.b2b_attempt(profile=cap.profile, attempt_id=cap.attempt_id)
@@ -495,17 +545,30 @@ async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[s
                     result.get("final_response", "").strip() != public["text"].strip()):
                 return blocked("result_invalid")
             # The rechecker runs in the copied profile/capability scope; original context stays immutable.
-            # Bounded like the provider-boundary C1s: a blocking callback must
-            # refuse on the prospective before_seal window, never hang sealing.
-            fresh = await asyncio.to_thread(
-                recheck_context, cap, receipt,
-                deadline=sink.seal_recheck_deadline())
+            # Bounded like the provider-boundary C1s — on the shared
+            # non-preparation worker, never a default-executor hop: a blocking
+            # callback must refuse on the prospective before_seal window,
+            # never hang sealing. The inner ``source_window_closed`` deadline
+            # decides; the outer budget only adds scheduling slack.
+            recheck_deadline = sink.seal_recheck_deadline()
+            fresh = await run_bounded_context_operation(
+                lambda: recheck_context(
+                    cap, receipt, deadline=recheck_deadline),
+                timeout=max(0.0, recheck_deadline - time.monotonic())
+                        + _CONTEXT_RECHECK_SAFETY_S)
             source = await sink.resolve_before_seal()
             if source is None:
                 return blocked("source_before_seal_denied")
-            proposal = sink.seal(
-                source_before_seal=source, rechecked_view=fresh,
-                created_at=dt.datetime.now(dt.timezone.utc).isoformat())
+            # Seal is split so a worker NEVER owns durable proof: plugin
+            # validation and artifact material are prepared inside ONE
+            # bounded worker; only a TIMELY return lets the API thread run
+            # the host commit. A timed-out worker's material is discarded.
+            prepared = await run_bounded_context_operation(
+                lambda: sink._prepare_seal(
+                    source_before_seal=source, rechecked_view=fresh,
+                    created_at=dt.datetime.now(dt.timezone.utc).isoformat()),
+                timeout=_SOURCE_DEADLINE_S)
+            proposal = sink._commit_seal(prepared)
             return "completed", {**fields, "completed": True}, {
                 "output": json.dumps(parsed, ensure_ascii=False),
                 "b2b": {key: proposal[key] for key in ("proposal_id", "state", "created_at")}}
