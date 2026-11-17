@@ -764,11 +764,31 @@ async def test_b2b_proposal_post_replays_durable_attempt_before_readiness_guard(
             real_ready = b2b_exec.b2b_execution_ready
             monkeypatch.setattr(
                 b2b_exec, "b2b_execution_ready", lambda *a, **k: True)
+            # UNIT stubs for the two P2 admission gates _prepare consults
+            # before readiness: operator inputs on disk and the per-cap
+            # native preparation. A SimpleNamespace double is enough — the
+            # sink only calls the three assert_* surfaces, never identity.
+            from gateway.platforms import api_server_b2b_context as b2b_ctx
+            monkeypatch.setattr(
+                b2b_exec, "b2b_execution_inputs_ready", lambda *a, **k: True)
+            monkeypatch.setattr(
+                b2b_ctx, "_prepare_b2b_context",
+                lambda cap, *, resolved: SimpleNamespace(
+                    cap=cap, assert_current=lambda c: None,
+                    assert_configuration_current=lambda: True,
+                    assert_publication=lambda c, r: None,
+                    source_deadline_ms=2 ** 62))
             resp = await post()
             assert resp.status == 200, await resp.text()
             first = await resp.json()
             assert first["status"] == "admitted"
             monkeypatch.setattr(b2b_exec, "b2b_execution_ready", real_ready)
+
+            # Lost-ACK retry: the durable row exists, so preparation must
+            # not run again.
+            monkeypatch.setattr(
+                b2b_ctx, "_prepare_b2b_context",
+                _tripwire("_prepare_b2b_context"))
 
             # Lost-ACK retry against the CLOSED lane: replayed, not refused.
             resp = await post()
@@ -808,11 +828,11 @@ async def test_b2b_proposal_post_guard_error_refuses_typed_unavailable(
             scope_calls = []
             real_scope = APIServerAdapter._profile_scope
 
-            def _flaky_scope(profile):
+            def _flaky_scope(profile, **kwargs):
                 scope_calls.append(profile)
                 if len(scope_calls) > 1:
                     raise RuntimeError("profile scope entry failed")
-                return real_scope(profile)
+                return real_scope(profile, **kwargs)
 
             monkeypatch.setattr(adapter, "_profile_scope", _flaky_scope)
         else:

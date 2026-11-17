@@ -663,8 +663,8 @@ async def list_hooks(profile: Optional[str] = None):
 
         valid_events = []
         with contextlib.suppress(Exception):
-            from hermes_cli.plugins import VALID_HOOKS
-            valid_events = sorted(VALID_HOOKS)
+            from hermes_cli.plugins import SHELL_UNSUPPORTED_HOOKS, VALID_HOOKS
+            valid_events = sorted(VALID_HOOKS - SHELL_UNSUPPORTED_HOOKS)
 
         specs = []
         try:
@@ -718,11 +718,11 @@ async def create_hook(body: HookCreate, profile: Optional[str] = None):
     # are served rather than silently arming the launch profile.
     profile = destructive_profile(profile, "POST /api/ops/hooks")
     event, command = _hook_body_fields(body)
-    valid_hooks = None
-    with contextlib.suppress(Exception):
-        from hermes_cli.plugins import VALID_HOOKS as valid_hooks
-    if valid_hooks is not None and event not in valid_hooks:
-        raise HTTPException(status_code=400, detail=f"Unknown event '{event}'. Valid: {', '.join(sorted(valid_hooks))}")
+    from hermes_cli.plugins import SHELL_UNSUPPORTED_HOOKS, VALID_HOOKS
+    if event in SHELL_UNSUPPORTED_HOOKS:
+        raise HTTPException(status_code=400, detail=f"Event '{event}' requires a Python plugin registered via PluginContext.register_hook")
+    if event not in VALID_HOOKS:
+        raise HTTPException(status_code=400, detail=f"Unknown event '{event}'. Valid: {', '.join(sorted(VALID_HOOKS - SHELL_UNSUPPORTED_HOOKS))}")
 
     def _run():
         with config_write_scope(profile):

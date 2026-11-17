@@ -39,6 +39,11 @@ class PluginRegistration:
     # re-discovery when the plugin no longer re-registers it.
     # See #91701.
     persistent: bool = False
+    # The registered callback itself, when the registration carries one (hooks
+    # registered via PluginContext.register_hook): lets owner-aware selection
+    # prove a live dispatch entry was registered through PluginContext rather
+    # than appended to a raw mapping.
+    callback: Optional[Callable] = field(default=None, repr=False)
     _disposed: bool = field(default=False, init=False, repr=False)
     _on_dispose: Optional[Callable[["PluginRegistration"], None]] = field(default=None, init=False, repr=False)
 

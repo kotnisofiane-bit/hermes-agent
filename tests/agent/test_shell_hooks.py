@@ -279,6 +279,23 @@ class TestParseHooksBlock:
         })
         assert specs == []
 
+    def test_unknown_event_warning_lists_only_shell_supported_events(self, caplog):
+        # The valid-events list in the warning must never advertise
+        # Python-plugin-only events as shell-configurable.
+        from hermes_cli.plugins import SHELL_UNSUPPORTED_HOOKS, VALID_HOOKS
+        with caplog.at_level("WARNING"):
+            specs = shell_hooks._parse_hooks_block({
+                "zz_no_such_event_zz": [{"command": "/bin/echo"}],
+            })
+        assert specs == []
+        record = next(
+            r for r in caplog.records
+            if "zz_no_such_event_zz" in r.getMessage() and "(valid: " in r.getMessage()
+        )
+        listed = record.getMessage().split("(valid: ", 1)[1].rstrip(")").split(", ")
+        assert listed == sorted(VALID_HOOKS - SHELL_UNSUPPORTED_HOOKS)
+        assert "prepare_context" not in listed
+
     def test_timeout_clamped_to_max(self):
         specs = shell_hooks._parse_hooks_block({
             "post_tool_call": [

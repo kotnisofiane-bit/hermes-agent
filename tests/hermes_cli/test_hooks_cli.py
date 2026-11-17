@@ -131,6 +131,17 @@ class TestHooksTest:
         assert '"action": "block"' in out
         assert '"message": "nope"' in out
 
+    def test_refuses_python_plugin_only_event(self, tmp_path):
+        """prepare_context is Python-plugin-only: `hooks test` must refuse it
+        before any hook subprocess is spawned."""
+        with patch.object(shell_hooks, "run_once") as run_once:
+            out = _run(SimpleNamespace(
+                hooks_action="test", event="prepare_context",
+                for_tool=None, payload_file=None,
+            ))
+        assert "PluginContext.register_hook" in out
+        run_once.assert_not_called()
+
 
 # ── revoke ────────────────────────────────────────────────────────────────
 

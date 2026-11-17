@@ -603,3 +603,103 @@ class TestDelivery:
         assert len(http_server.captured) == 1
         payload = json.loads(http_server.captured[0]["body"])
         assert payload["session_id"] == "exit_test"
+
+
+# ── prepare_context: plugin-only hook, never an outbound target ─────────
+
+
+def _mission_cap(tmp_path):
+    """A real ``BoundExecution`` carrying a mission sentinel — the capability
+    the B2B producer contract hands to exactly one plugin-owned callback."""
+    from agent.b2b_execution import BoundExecution
+
+    sentinel = "MISSION-SENTINEL-" + "9e4f" * 8
+    cap = BoundExecution(
+        profile="hub", session_id="b2b_" + "b" * 64,
+        binding_digest="b" * 64, attempt_id="att_" + "c" * 8,
+        run_id="run_x", sink=object(), created_at=0.0,
+        policy={
+            "profile_home": str(tmp_path),
+            "project": {"project_id": "p"},
+            "mission_request": {"objective": sentinel},
+        })
+    return cap, sentinel
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("events", [
+    ["prepare_context"], ["prepare_context", "pre_llm_call"]])
+async def test_prepare_context_outbound_target_refused_fail_closed(
+        http_server, events, tmp_path, monkeypatch, caplog):
+    """``prepare_context`` is a Python-plugin-only hook: a ``hooks.outbound``
+    target naming it is rejected WHOLE (even beside valid events — no partial
+    subscription), so a configured webhook can never be picked as the B2B
+    producer and the BoundExecution's mission data never leaves the process."""
+    from agent.b2b_execution import B2BTerminalRefusal
+    from gateway.platforms.api_server_b2b_context import (
+        _invoke_producer, run_bounded_context_preparation)
+    from hermes_cli.plugins import get_plugin_manager
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.discover_plugins", lambda *a, **k: None)
+    cfg = _cfg({"url": _url(http_server), "events": events})
+    registered = outbound_webhooks.register_from_config(cfg)
+
+    cap, _sentinel = _mission_cap(tmp_path)
+    with pytest.raises(B2BTerminalRefusal):
+        await run_bounded_context_preparation(lambda: _invoke_producer(cap))
+    outbound_webhooks.flush(timeout=5)
+
+    # First: the webhook received NOTHING — on the unfixed parser it fires as
+    # the "producer" and POSTs the serialized capability (the mission leak).
+    assert http_server.captured == []
+    # Then the configuration contract: the whole target was refused, no
+    # prepare_context callback was wired, and the refusal names the fix.
+    assert registered == []
+    assert get_plugin_manager().iter_hook_callbacks("prepare_context") == ()
+    assert any(
+        "PluginContext.register_hook" in record.getMessage()
+        for record in caplog.records), caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rejected_outbound_target_leaves_plugin_producer_selectable(
+        http_server, tmp_path, monkeypatch):
+    """A refused ``hooks.outbound`` entry must not count toward producer
+    ambiguity either: exactly one ``PluginContext``-registered callback (its
+    owner also registering ``pre_llm_call``) stays the provider — never
+    first-wins next to a config-owned callback."""
+    from gateway.platforms.api_server_b2b_context import (
+        _invoke_producer, run_bounded_context_preparation)
+    from hermes_cli.plugins import (
+        PluginContext, PluginManifest, get_plugin_manager)
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.discover_plugins", lambda *a, **k: None)
+    cfg = _cfg({"url": _url(http_server), "events": ["prepare_context"]})
+    assert outbound_webhooks.register_from_config(cfg) == []
+
+    manager = get_plugin_manager()
+    calls = []
+
+    def _prepare(*, execution):
+        calls.append(execution)
+        return {"view": {}, "rendered": "ctx",
+                "validate_configuration": lambda: True}
+
+    ctx = PluginContext(PluginManifest(name="unitctx-owner"), manager)
+    prepare_handle = ctx.register_hook("prepare_context", _prepare)
+    publisher_handle = ctx.register_hook("pre_llm_call", lambda **kw: None)
+    try:
+        cap, _s = _mission_cap(tmp_path)
+        result, found_manager, prepare = await run_bounded_context_preparation(
+            lambda: _invoke_producer(cap))
+        assert calls == [cap]
+        assert found_manager is manager
+        assert prepare is _prepare
+        assert callable(result["validate_configuration"])
+    finally:
+        prepare_handle.dispose()
+        publisher_handle.dispose()
+    outbound_webhooks.flush(timeout=5)
+    assert http_server.captured == []

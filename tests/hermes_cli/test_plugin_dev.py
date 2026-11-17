@@ -40,6 +40,35 @@ def test_doctor_uses_registration_to_reject_bad_hook_and_callback_signature(
     assert "must accept **kwargs" in messages
 
 
+def test_doctor_deduplicates_diagnostics_for_duplicate_hook_registrations(
+        tmp_path: Path,
+) -> None:
+    from hermes_cli.plugin_dev import doctor_plugin
+
+    plugin = tmp_path / "duplicate-hooks"
+    plugin.mkdir()
+    (plugin / "plugin.yaml").write_text("name: duplicate-hooks\n", encoding="utf-8")
+    (plugin / "__init__.py").write_text(
+        "def first(value):\n    return None\n\n"
+        "def second(value):\n    return None\n\n"
+        "def register(ctx):\n"
+        "    ctx.register_hook('typo_hook', first)\n"
+        "    ctx.register_hook('typo_hook', second)\n",
+        encoding="utf-8",
+    )
+
+    report = doctor_plugin(plugin)
+    messages = [finding.message for finding in report.findings]
+
+    assert messages.count("registered unknown hook 'typo_hook'") == 1
+    assert messages.count(
+        "hook callback 'first' for 'typo_hook' must accept **kwargs for forward compatibility"
+    ) == 1
+    assert messages.count(
+        "hook callback 'second' for 'typo_hook' must accept **kwargs for forward compatibility"
+    ) == 1
+
+
 def test_doctor_accepts_manifest_defaults_from_runtime_parser(tmp_path: Path) -> None:
     from hermes_cli.plugin_dev import doctor_plugin
 

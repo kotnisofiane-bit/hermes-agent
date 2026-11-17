@@ -18,6 +18,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import time
 from contextlib import suppress
 from typing import Any, Callable, Dict, Mapping, Optional
 
@@ -83,16 +84,21 @@ def guard_agent_construction(
             requested_model not in (None, project["model"]) or
             requested_provider not in (None, project["provider"])):
         raise B2BTerminalRefusal("b2b_policy_override")
-    # L2: governed construction is open only when the operator's real
-    # execution context for THIS project is in place AND the C1 producer has
-    # published it — b2b_execution_ready stays False until the producer is
-    # integrated, so every stale admitted cap keeps the same durable terminal
-    # refusal — before run_agent import, runtime/credential/tool resolution
-    # or memory checkout.
+    # P2: construction requires this capability's current native context
+    # preparation under its owning profile. Publication follows in the
+    # admitted worker's pre_llm_call hook. Missing or stale preparation
+    # refuses before run_agent import and runtime/credential/tool resolution —
+    # durably, with the preparation's own TYPED cause.
     from gateway.run import _load_gateway_config
-    if not b2b_execution_ready(project, _load_gateway_config()):
-        cap.sink.block("context_unavailable")
-        raise B2BTerminalRefusal("context_unavailable")
+    from gateway.platforms.api_server_b2b_context import (
+        assert_prepared_context_current)
+    try:
+        assert_prepared_context_current(cap, project)
+        if not b2b_execution_inputs_ready(project, _load_gateway_config()):
+            raise B2BTerminalRefusal("context_unavailable")
+    except B2BTerminalRefusal as exc:
+        cap.sink.block(str(exc))
+        raise
     return cap
 
 
@@ -158,25 +164,37 @@ def b2b_execution_inputs_ready(project: Any, config: Optional[Mapping]) -> bool:
 def b2b_execution_unavailable_code(project: Any, config: Optional[Mapping]) -> Optional[str]:
     """THE execution-unavailability classification for ONE project — the
     single source the POST admission gate and ``/health/detailed`` both
-    consult. ``None`` only when ``b2b_execution_ready`` opens the lane
-    (impossible until the C1 producer ships); ``execution_inputs_unavailable``
-    for a preparation hole; ``c1_producer_unavailable`` when preparation is
-    complete and only the missing producer keeps the lane closed."""
+    consult. ``None`` only when ``b2b_execution_ready`` opens the lane for
+    THIS attempt's bound capability. Codes: ``execution_inputs_unavailable``
+    for a preparation hole, ``c1_producer_unavailable`` when the installed
+    producer itself is absent/disabled, ``c1_context_required`` when the
+    producer is present but no
+    CURRENT mission-scoped context proof is bound to this capability — the
+    ordinary state for health checks, which carry no mission binding and can
+    never turn ``ready`` on presence alone."""
     if b2b_execution_ready(project, config):
         return None
-    if b2b_execution_inputs_ready(project, config):
+    if not b2b_execution_inputs_ready(project, config):
+        return "execution_inputs_unavailable"
+    from gateway.platforms.api_server_b2b_context import (
+        producer_available)
+    if not producer_available():
         return "c1_producer_unavailable"
-    return "execution_inputs_unavailable"
+    return "c1_context_required"
 
 
 def b2b_execution_ready(project: Any, config: Optional[Mapping]) -> bool:
-    """EXECUTION readiness for ONE validated project entry — CLOSED in this
-    delivery: the C1 context producer is not integrated, so no input set opens
-    execution and no config/env switch reopens it. Deliberately a single
-    predicate: the producer integration lands HERE (and only here), so every
-    caller — the pre-admission gate, the admitted-cap guard, health — fails
-    closed by construction until then."""
-    return False
+    """EXECUTION readiness for ONE validated project entry — proof-driven in
+    this delivery: operator inputs on disk AND a live, current, mission-scoped
+    context preparation attached to the CURRENT bound capability's sink
+    (``_context_preparation``, written by ``_launch_b2b_run`` before
+    admission). No bound capability — health checks, ordinary sessions —
+    answers False on any input set; no config/env switch reopens the lane."""
+    if not b2b_execution_inputs_ready(project, config):
+        return False
+    from agent.b2b_execution import current_execution
+    from gateway.platforms.api_server_b2b_context import prepared_context_ready
+    return prepared_context_ready(current_execution(), project)
 
 
 def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
@@ -189,15 +207,25 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
     every profile is evaluated under its OWN profile scope against its OWN
     serving config (A→B→A), and reported ``not-ready`` — never ``ready`` —
     with a typed code: ``execution_inputs_unavailable`` for any preparation
-    hole (including empty profiles/projects and evaluation errors) and
-    ``c1_producer_unavailable`` when preparation is complete and only the
-    missing C1 producer holds the lane closed. The aggregate is the fail-closed
-    combination: any ``execution_inputs_unavailable`` wins."""
+    hole (including empty profiles/projects and evaluation errors),
+    ``c1_producer_unavailable`` when the producer is absent, and
+    ``c1_context_required`` when it is present without a current mission
+    proof. The aggregate uses that fail-closed order."""
     state = _state_for(adapter)
     if state is None or not state.config.enabled:
         return {"b2b_execution": "not-configured", "b2b_execution_code": None,
                 "b2b_execution_profiles": {}}
+    # Fail-closed ordering: a preparation hole beats a missing producer,
+    # and that beats "no current mission proof" — health carries no
+    # capability binding, so ``ready``/``None`` codes are unreachable here
+    # by construction (no source/model probe is performed either).
+    severity = {"execution_inputs_unavailable": 0, "c1_producer_unavailable": 1,
+                "c1_context_required": 2}
     profiles: Dict[str, Any] = {}
+    # Pure introspection: every owning-profile scope below is entered WITHOUT
+    # plugin secret-source hydration — a blocked global hydration lock (e.g.
+    # a live bootstrap's external fetch) must never stall a health answer.
+    from gateway.platforms.api_server import _nonhydrating_profile_scopes
     for name, entry in state.config.profiles.items():
         code = "execution_inputs_unavailable"
         try:
@@ -205,23 +233,29 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
             # ``default``, which must resolve to the canonical default home
             # (``get_profile_dir("default")``), never the request's ambient
             # home a prefixed ``/p/<other>/`` request bound.
-            with adapter._profile_scope(name):
-                from gateway.run import _load_gateway_config
-                config = _load_gateway_config()
-                projects = entry.get("projects") or {}
-                if projects and all(
-                        b2b_execution_unavailable_code(project, config)
-                        == "c1_producer_unavailable"
-                        for project in projects.values()):
-                    code = "c1_producer_unavailable"
+            with _nonhydrating_profile_scopes(), adapter._profile_scope(name):
+                # Health carries NO mission binding: an ambient bound
+                # execution must never leak a ``ready`` verdict into a
+                # status query. Clear it for the evaluation; restore after.
+                from agent.b2b_execution import _execution_var
+                token = _execution_var.set(None)
+                try:
+                    from gateway.run import _load_gateway_config
+                    config = _load_gateway_config()
+                    projects = entry.get("projects") or {}
+                    if projects:
+                        code = min(
+                            (b2b_execution_unavailable_code(project, config) or "ready"
+                             for project in projects.values()),
+                            key=lambda c: severity.get(c, 3))
+                finally:
+                    _execution_var.reset(token)
         except Exception:
             code = "execution_inputs_unavailable"
         profiles[name] = {"state": "not-ready", "code": code}
-    aggregate = ("execution_inputs_unavailable"
-                 if not profiles or any(
-                     p["code"] == "execution_inputs_unavailable"
-                     for p in profiles.values())
-                 else "c1_producer_unavailable")
+    aggregate = min((p["code"] for p in profiles.values()),
+                    key=lambda c: severity.get(c, 3),
+                    default="execution_inputs_unavailable")
     return {"b2b_execution": "not-ready", "b2b_execution_code": aggregate,
             "b2b_execution_profiles": profiles}
 
@@ -338,13 +372,47 @@ async def construct_run_agent(adapter: Any, run: Any, construct_agent: Callable[
         # B2B: cold AIAgent.__init__ (httpx import, client build) must not
         # block the serving event loop — typed reads + control stay live.
         # copy_context carries the bound execution across the worker;
-        # _submit_api_worker holds the worker's lifetime count.
+        # _submit_bounded_api_worker holds the worker's lifetime count AND
+        # bounds the wait on the existing request window — a construction
+        # stuck inside plugin code refuses instead of hanging unbounded.
         from contextvars import copy_context
-        from gateway.platforms.api_server_runs import _submit_api_worker
+        from gateway.platforms.api_server_b2b import _REQUEST_TTL_S
+        from gateway.platforms.api_server_runs import _submit_bounded_api_worker
         ctor_context = copy_context()
-        return await _submit_api_worker(loop, lambda: ctor_context.run(construct_agent))
+        return await _submit_bounded_api_worker(
+            lambda: ctor_context.run(construct_agent), timeout=_REQUEST_TTL_S)
     finally:
         reset_execution(cap_token)
+
+
+async def execute_run_agent(adapter: Any, run: Any, callback: Callable[[], Any],
+                            loop) -> Any:
+    """Run the agent TURN body: the native counted executor hop on ordinary
+    lanes; on a B2B lane the same counted body inside a bounded
+    non-preparation worker — plugin sections, turn middleware and every
+    synchronous callback stay off the API loop AND inside a fail-closed
+    total window composed only of EXISTING budgets (two prospective source
+    windows + one pinned provider send + one source deadline). A typed
+    refusal durably blocks the attempt BEFORE propagating so a late worker
+    can never reach CAS/seal."""
+    state = _state_for(adapter)
+    cap = getattr(run, "b2b_execution", None) if (
+        state is not None and state.config.enabled) else None
+    if cap is None:
+        from gateway.platforms.api_server_runs import _submit_api_worker
+        return await _submit_api_worker(loop, callback)
+    from agent.b2b_execution import B2BTerminalRefusal
+    from gateway.platforms.api_server_b2b import (
+        _REQUEST_TTL_S, _SOURCE_DEADLINE_S)
+    from gateway.platforms.api_server_runs import _submit_bounded_api_worker
+    timeout = (2 * _REQUEST_TTL_S
+               + cap.policy_get("project").get("request_timeout_seconds", 5)
+               + _SOURCE_DEADLINE_S)
+    try:
+        return await _submit_bounded_api_worker(callback, timeout=timeout)
+    except B2BTerminalRefusal as exc:
+        cap.sink.block(str(exc))
+        raise
 
 
 def run_execution_resets(adapter: Any, run: Any) -> list:
@@ -439,7 +507,18 @@ async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[s
 
     token = bind_execution(cap)
     try:
-        with sink._adapter._profile_scope(cap.profile if cap.profile != "default" else None):
+        # Finalization scopes to the capability's OWN home WITHOUT hydrating
+        # plugin secret sources on the API loop — a health/B2B route can
+        # never queue behind a blocked external hydration here; every plugin
+        # callback below runs inside a bounded worker anyway.
+        from pathlib import Path
+        from gateway.run import _profile_runtime_scope
+        from gateway.platforms.api_server_b2b import (
+            _CONTEXT_RECHECK_SAFETY_S, _SOURCE_DEADLINE_S)
+        from gateway.platforms.api_server_b2b_context import (
+            run_bounded_context_operation)
+        with _profile_runtime_scope(
+                Path(cap.policy_get("profile_home")), hydrate_secrets=False):
             # First refusal wins: an attempt already blocked durably keeps its typed
             # reason - never reclassify it as a later, unrelated family.
             row = sink._store.b2b_attempt(profile=cap.profile, attempt_id=cap.attempt_id)
@@ -461,17 +540,30 @@ async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[s
                     result.get("final_response", "").strip() != public["text"].strip()):
                 return blocked("result_invalid")
             # The rechecker runs in the copied profile/capability scope; original context stays immutable.
-            # Bounded like the provider-boundary C1s: a blocking callback must
-            # refuse on the prospective before_seal window, never hang sealing.
-            fresh = await asyncio.to_thread(
-                recheck_context, cap, receipt,
-                deadline=sink.seal_recheck_deadline())
+            # Bounded like the provider-boundary C1s — on the shared
+            # non-preparation worker, never a default-executor hop: a blocking
+            # callback must refuse on the prospective before_seal window,
+            # never hang sealing. The inner ``source_window_closed`` deadline
+            # decides; the outer budget only adds scheduling slack.
+            recheck_deadline = sink.seal_recheck_deadline()
+            fresh = await run_bounded_context_operation(
+                lambda: recheck_context(
+                    cap, receipt, deadline=recheck_deadline),
+                timeout=max(0.0, recheck_deadline - time.monotonic())
+                        + _CONTEXT_RECHECK_SAFETY_S)
             source = await sink.resolve_before_seal()
             if source is None:
                 return blocked("source_before_seal_denied")
-            proposal = sink.seal(
-                source_before_seal=source, rechecked_view=fresh,
-                created_at=dt.datetime.now(dt.timezone.utc).isoformat())
+            # Seal is split so a worker NEVER owns durable proof: plugin
+            # validation and artifact material are prepared inside ONE
+            # bounded worker; only a TIMELY return lets the API thread run
+            # the host commit. A timed-out worker's material is discarded.
+            prepared = await run_bounded_context_operation(
+                lambda: sink._prepare_seal(
+                    source_before_seal=source, rechecked_view=fresh,
+                    created_at=dt.datetime.now(dt.timezone.utc).isoformat()),
+                timeout=_SOURCE_DEADLINE_S)
+            proposal = sink._commit_seal(prepared)
             return "completed", {**fields, "completed": True}, {
                 "output": json.dumps(parsed, ensure_ascii=False),
                 "b2b": {key: proposal[key] for key in ("proposal_id", "state", "created_at")}}

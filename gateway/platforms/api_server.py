@@ -31,6 +31,46 @@ from typing import Any, Dict, List, Optional, Tuple
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
 
+# Plugin secret-source hydration must never run on the API loop: it can park
+# on the global source cache lock behind an unrelated bootstrap's external
+# fetch. B2B routes and the health variants enter their profile scope with
+# hydration disabled; ``b2b_execution_status`` (already on a worker) enters
+# its per-profile introspection scopes under this ContextVar so arbitrary
+# ``adapter._profile_scope`` wrappers still resolve the same nonhydrating
+# scope — there is no hydrating fallback for introspection.
+_PROFILE_SCOPE_HYDRATE = ContextVar("_profile_scope_hydrate", default=True)
+
+
+@contextmanager
+def _nonhydrating_profile_scopes():
+    """Force ``APIServerAdapter._profile_scope`` calls in this dynamic scope
+    to skip plugin secret-source hydration (introspection only)."""
+    token = _PROFILE_SCOPE_HYDRATE.set(False)
+    try:
+        yield
+    finally:
+        _PROFILE_SCOPE_HYDRATE.reset(token)
+
+
+# Routes whose request scope must never hydrate plugin secret sources on the
+# loop: every B2B governed-lane route (the launch bootstrap hydrates inside
+# its own bounded worker) and the health variants.
+_B2B_HTTP_ROUTE_RE = re.compile(r"^/api/sessions/[^/]+/b2b-proposal(?:/|$)")
+_NONHYDRATING_ROUTE_PATHS = frozenset({"/health", "/health/detailed", "/v1/health"})
+
+
+def _nonhydrating_route_path(request) -> bool:
+    """True when this request's profile scope must be entered without plugin
+    secret-source hydration — the B2B governed-lane routes and health."""
+    path = request.path
+    declared = (request.match_info.get("profile") or "").strip()
+    if declared:
+        prefix = f"/p/{declared}"
+        if path.startswith(prefix):
+            path = path[len(prefix):] or "/"
+    return (path in _NONHYDRATING_ROUTE_PATHS
+            or _B2B_HTTP_ROUTE_RE.match(path) is not None)
+
 
 def _prefix_names_served_profile(profile: str) -> bool:
     """True when a /p/<profile>/ prefix names the profile this gateway serves. Fail closed: a
@@ -1534,25 +1574,32 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return profile if profile in served else _PROFILE_REJECTED
 
     @staticmethod
-    def _profile_scope(profile: Optional[str]):
+    def _profile_scope(profile: Optional[str], *, hydrate_secrets: bool = True):
         """Enter the multiplex profile runtime scope, or a no-op when unset. No prefix AND
         multiplexing active enters the DEFAULT profile's scope (an unscoped run would raise
         UnscopedSecretError on its first credential read); single-profile gateways no-op.
 
         Single-profile gateways keep the no-op — ``get_secret`` falls through to ``os.environ`` there,
         unchanged. See #61276.
+
+        ``hydrate_secrets=False`` skips plugin secret-source hydration — for
+        callers that must never run plugin code in this thread: B2B routes,
+        health, and pure introspection under ``_nonhydrating_profile_scopes``.
         """
+        hydrate = hydrate_secrets and _PROFILE_SCOPE_HYDRATE.get()
         if not profile:
             with suppress(Exception):
                 from agent.secret_scope import is_multiplex_active
                 if is_multiplex_active():
                     from gateway.run import _profile_runtime_scope
                     from hermes_constants import get_hermes_home
-                    return _profile_runtime_scope(get_hermes_home())
+                    return _profile_runtime_scope(
+                        get_hermes_home(), hydrate_secrets=hydrate)
             return nullcontext()
         from gateway.run import _profile_runtime_scope
         from hermes_cli.profiles import get_profile_dir
-        return _profile_runtime_scope(get_profile_dir(profile))
+        return _profile_runtime_scope(
+            get_profile_dir(profile), hydrate_secrets=hydrate)
 
     async def _handle_profile_ingress(self, request: "web.Request") -> "web.StreamResponse":
         """``/p/<profile>/<tail>`` → the served profile's shared-listener adapter (already scoped by the
@@ -1572,7 +1619,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 return web.json_response({"error": "Unknown or unconfigured profile"}, status=404)
             token = _api_request_profile.set(profile)
             try:
-                with self._profile_scope(profile):
+                # B2B routes and health enter their scope WITHOUT hydrating
+                # plugin secret sources on this loop thread — the launch's
+                # own bounded bootstrap performs the real hydration.
+                # Ordinary routes keep the original call shape: the flag is
+                # passed ONLY on the nonhydrating paths so the ContextVar
+                # can never leak ``False`` into a bootstrap worker.
+                if _nonhydrating_route_path(request):
+                    scope = self._profile_scope(profile, hydrate_secrets=False)
+                else:
+                    scope = self._profile_scope(profile)
+                with scope:
                     resolved_profile = profile or "default"
                     principal_token = _api_request_browser_control_principal.set(
                         self._derive_browser_control_principal(resolved_profile))

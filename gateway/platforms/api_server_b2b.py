@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import dataclasses
 import hashlib
 import hmac
@@ -45,6 +46,7 @@ _SOURCE_DEADLINE_S = 1.0
 _CONTEXT_RECHECK_SAFETY_S = 0.1
 _REQUEST_TTL_S = 10
 _MAX_WINDOW_S = 30
+
 _SIG_RE = re.compile(r"^[A-Za-z0-9_-]{86}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _SHA256_FIELD = re.compile(r"^(sha256:)?[0-9a-f]{64}$")
@@ -893,6 +895,9 @@ class _AttemptSink:
         self._fingerprint = _policy_digest(profile, entry, self.policy["project"], self.policy)
         self._before_provider = None
         self.context_receipt = None
+        # The frozen context preparation attached by _launch_b2b_run before
+        # admission; None on every sink the launch path did not prepare.
+        self._context_preparation = None
 
     def assert_current_policy(self) -> bool:
         state = _state_for(self._adapter)
@@ -908,8 +913,24 @@ class _AttemptSink:
                 entry.get("hermes_private_key_pem") != self.entry.get("hermes_private_key_pem")):
             return False
         project = entry.get("projects", {}).get(self.policy["project_binding_id"])
-        return (project is not None and
-                _policy_digest(self.profile, entry, project, self.policy) == self._fingerprint)
+        if not (project is not None and
+                _policy_digest(self.profile, entry, project, self.policy) == self._fingerprint):
+            return False
+        # P2: when a preparation is attached, the producer's live configuration
+        # must still satisfy the plugin's own validator — config drift revokes
+        # the lane like policy drift. A TYPED refusal is a durable terminal
+        # cause: block with that exact reason and rethrow, never flatten it.
+        preparation = self._context_preparation
+        if preparation is not None:
+            try:
+                if not preparation.assert_configuration_current():
+                    return False
+            except B2BTerminalRefusal as exc:
+                self.block(str(exc))
+                raise
+            except Exception:
+                return False
+        return True
 
     def _matches_source(self, resolved: Mapping[str, Any]) -> bool:
         fields = (
@@ -979,6 +1000,8 @@ class _AttemptSink:
 
     def cas_dispatch(self, *, request_digest: str, receipt: Any,
                      rechecked_view: Optional[Mapping[str, Any]] = None) -> bool:
+        from gateway.platforms.api_server_b2b_context import (
+            assert_context_source_current)
         resolved = self._before_provider
         if (receipt is not self.context_receipt or resolved is None or
                 not self._matches_source(resolved) or not self._source_matches_context(resolved) or
@@ -1013,6 +1036,11 @@ class _AttemptSink:
             # genuinely committed dispatch marker).
             self.block("source_window_closed")
             raise B2BTerminalRefusal("source_window_closed")
+        try:
+            assert_context_source_current(self._context_preparation)
+        except B2BTerminalRefusal as exc:
+            self.block(str(exc))
+            raise
         return self._store.b2b_cas_dispatch(
             profile=self.profile, attempt_id=self.attempt_id,
             source_record=source_record, dispatch_record=dispatch_record)
@@ -1050,6 +1078,14 @@ class _AttemptSink:
 
     def put_context(self, receipt: Any) -> None:
         """Persist the published context (view + rendered bytes + digest) once."""
+        from gateway.platforms.api_server_b2b_context import (
+            assert_context_source_current)
+        # The accepted receipt must BE the attached preparation's mission —
+        # same cap, same configuration, same source basis, inside the OC window.
+        preparation = self._context_preparation
+        if preparation is not None:
+            from agent.b2b_execution import current_execution
+            preparation.assert_publication(current_execution(), receipt)
         proof = context_proof(receipt.view)
         if (proof["context_digest"] != receipt.digest or
                 proof["source_basis_digest"] != receipt.source_basis_digest):
@@ -1059,6 +1095,7 @@ class _AttemptSink:
             "run_id": self.run_id, **proof,
             "rendered": receipt.rendered.decode("utf-8"), "turn_id": receipt.turn_id,
             "rendered_digest": receipt.rendered_digest})
+        assert_context_source_current(preparation)
         if not self._store.b2b_commit_context(
                 profile=self.profile, attempt_id=self.attempt_id, payload=payload):
             raise B2BTerminalRefusal("context_commit_failed")
@@ -1068,14 +1105,31 @@ class _AttemptSink:
         resolved, reason = await _resolve_source_async(
             self.entry, self.keys, "before_seal", attempt_id=self.attempt_id,
             profile=self.profile, session_id=self.session_id)
-        if (resolved is None or not self._matches_source(resolved) or
-                not self._source_matches_context(resolved)):
+        if resolved is None:
+            self.block("source_before_seal_denied")
+            return None
+        # The policy/validator match is plugin-owned code — bounded on a
+        # non-preparation worker, never inline on the API loop: a blocked
+        # validator refuses ``context_unavailable`` on ``_SOURCE_DEADLINE_S``
+        # instead of freezing the whole gateway.
+        from gateway.platforms.api_server_b2b_context import (
+            run_bounded_context_operation)
+        matched = await run_bounded_context_operation(
+            lambda: (self._matches_source(resolved) and
+                     self._source_matches_context(resolved)),
+            timeout=_SOURCE_DEADLINE_S)
+        if not matched:
             self.block("source_before_seal_denied")
             return None
         return resolved
 
-    def seal(self, *, source_before_seal: Mapping[str, Any], rechecked_view: Mapping[str, Any],
-             created_at: str) -> Dict[str, Any]:
+    def _prepare_seal(self, *, source_before_seal: Mapping[str, Any],
+                      rechecked_view: Mapping[str, Any], created_at: str) -> Dict[str, Any]:
+        """Plugin-validating seal PREPARATION: every check the attached
+        preparation's validator must pass plus the proposal/artifact
+        MATERIAL — never ``store.b2b_seal``. Runs ONLY inside a bounded
+        worker; material a timed-out worker produced is simply discarded,
+        so a straggler can never mint late durable proof."""
         receipt = self.context_receipt
         result = self._store.b2b_artifact(attempt_id=self.attempt_id, kind="provider_result")
         if (receipt is None or result is None or not self._matches_source(source_before_seal) or
@@ -1115,17 +1169,57 @@ class _AttemptSink:
         previous = verify_context_proof(dispatch.get("context_recheck"))
         assert_source_equivalent(previous["view"], fresh)
         proof = context_proof(fresh)
-        stored = self._store.b2b_seal(
-            profile=self.profile, attempt_id=self.attempt_id,
-            artifacts={
+        return {
+            "proposal": proposal,
+            "source_window": {
+                "request": {
+                    "issued_at": source_before_seal["_signed_request"]["issued_at"],
+                    "expires_at": source_before_seal["_signed_request"]["expires_at"]},
+                "response": {
+                    "issued_at": source_before_seal["_signed_response"]["issued_at"],
+                    "expires_at": source_before_seal["_signed_response"]["expires_at"]}},
+            "artifacts": {
                 "source_before_seal": _source_record(source_before_seal),
                 "context_recheck": json_utf8({
                     "format": "dubsar.b2b-context-recheck/2", "attempt_id": self.attempt_id,
                     "run_id": self.run_id, **proof}),
-                "proposal": json_utf8(proposal)})
+                "proposal": json_utf8(proposal)}}
+
+    def _commit_seal(self, prepared: Mapping[str, Any]) -> Dict[str, Any]:
+        """Host-only durable COMMIT — the sole ``store.b2b_seal`` caller.
+        Invoked exclusively by the API thread after a TIMELY
+        ``_prepare_seal`` return; a worker never owns this closure.
+
+        The signed source window is re-verified HERE on host data — the
+        async prepare→commit seam admits scheduling delay, so the window a
+        timely preparation observed may have closed by commit. Pure
+        timestamp arithmetic: no plugin callback, no revalidation."""
+        from gateway.platforms.api_server_b2b_context import (
+            assert_context_source_current)
+        window = prepared["source_window"]
+        now = time.time()
+        if not all(env["issued_at"] <= now < env["expires_at"] for env in
+                   (window["request"], window["response"])):
+            raise B2BTerminalRefusal("source_window_closed")
+        # The attached preparation's OC source deadline is rechecked on the
+        # host in the same breath — the seam lets the observation cross its
+        # own governed bound between the last validation and this commit.
+        # Pure timestamp comparison: no plugin callback, no _assert_stamp.
+        assert_context_source_current(self._context_preparation)
+        stored = self._store.b2b_seal(
+            profile=self.profile, attempt_id=self.attempt_id,
+            artifacts=dict(prepared["artifacts"]))
         if stored is None:
             raise B2BTerminalRefusal("seal_commit_failed")
         return json.loads(stored)
+
+    def seal(self, *, source_before_seal: Mapping[str, Any], rechecked_view: Mapping[str, Any],
+             created_at: str) -> Dict[str, Any]:
+        """Synchronous prepare+commit for direct callers/tests — the same
+        two stages ``_b2b_finalize`` splits across the bounded boundary."""
+        return self._commit_seal(self._prepare_seal(
+            source_before_seal=source_before_seal,
+            rechecked_view=rechecked_view, created_at=created_at))
 
 
 async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, keys,
@@ -1177,32 +1271,22 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
-    # L2-mw admission gate: the project identity is proven by the signed
-    # source, but execution stays CLOSED until the C1 producer ships. The
-    # refusal covers NEW admissions only — an already-durable attempt row is
-    # always served by the idempotent replay below (b2b_admit ->
-    # _replayed_response), so a lost-ACK retry never hears
-    # "execution_unavailable" for a committed lane. Readiness is classified
-    # by the single source (b2b_execution_unavailable_code — the same one
-    # /health/detailed reports) under the OWNING profile's scope against ITS
-    # serving config, off the event loop, BEFORE any admission/title/spawn
-    # durable write consumes the single attempt; any error entering the
-    # scope or reading the config is itself a typed execution_unavailable,
-    # never an untyped 500.
+    # P2 admission gate: NEW work proves its mission context BEFORE the single
+    # durable attempt is consumed — the sink/cap are built in memory first,
+    # then the bounded bootstrap enters the owning profile scope (secret
+    # hydration included), loads the gateway config and discovers plugins,
+    # and only THEN does the one bounded worker run the plugin-owned
+    # preparation — the real native read (the profile's prepare_context
+    # plugin callback, bound to THIS cap) AND its configuration validators —
+    # inside the captured scope, attach the frozen preparation to the sink,
+    # and consult readiness (the same single classifier /health/detailed
+    # reports). Any source/producer error is 503 execution_unavailable with
+    # NO binding/attempt/run/title/provider side effects — the in-memory
+    # sink/cap are simply dropped. An already-durable attempt row is always
+    # served by the idempotent replay below (b2b_admit -> _replayed_response),
+    # so a lost-ACK retry never hears "execution_unavailable" for a committed
+    # lane and never pays a context read.
     existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
-
-    def _execution_ready() -> bool:
-        try:
-            with adapter._profile_scope(profile):
-                from gateway.run import _load_gateway_config
-                config = _load_gateway_config()
-            from gateway.platforms.api_server_b2b_execution import (
-                b2b_execution_unavailable_code)
-            return b2b_execution_unavailable_code(project, config) is None
-        except Exception:
-            return False
-    if existing_attempt is None and not await _a.to_thread(_execution_ready):
-        return _deny(503, "execution_unavailable")
     policy = {
         "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
         "attempt_id": attempt_id, "profile_home": str(home),
@@ -1221,8 +1305,106 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     fingerprint = _policy_digest(profile, entry, project, policy)
     scope = _run_scope(profile, resolved["requester_id"], binding_digest)
     initial_status = {"status": "queued", "session_id": session_id, "created_at": time.time()}
+    sink = None
+    cap = None
     # Lost-ACK replay is allowed even while the original holds the final native worker slot.
     if existing_attempt is None:
+        from gateway.platforms.api_server_b2b_context import (
+            assert_context_source_current, run_bounded_context_operation,
+            run_bounded_context_preparation)
+        from gateway.run import _profile_runtime_scope
+        # The sink + cap exist ONLY in memory until b2b_admit commits the
+        # attempt — a failed preparation drops them with zero durable trace.
+        sink = _AttemptSink(adapter, store, profile=profile, entry=entry, keys=keys,
+                            attempt_id=attempt_id, session_id=session_id,
+                            binding_digest=binding_digest, run_id=run_id, policy=policy)
+        cap = BoundExecution(
+            profile=profile, session_id=session_id, binding_digest=binding_digest,
+            attempt_id=attempt_id, run_id=run_id, policy=dict(policy),
+            sink=sink, created_at=time.time())
+
+        def _bootstrap() -> Tuple[Optional[str], Any, Any]:
+            """Runs INSIDE the bounded NON-preparation worker, off the API
+            loop and the default executor, on the ``_REQUEST_TTL_S`` budget:
+            owning profile scope (secret hydration included), gateway config,
+            plugin discovery, and the non-plugin/inputs gates. Discovery and
+            hydration can legitimately take seconds; neither is plugin
+            PREPARATION code, so neither may spend the source budget. The
+            scoped context is captured ONCE and returned for the bounded
+            task to inherit."""
+            from gateway.run import _load_gateway_config
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
+            from gateway.platforms.api_server_b2b_execution import (
+                b2b_execution_inputs_ready)
+            try:
+                with adapter._profile_scope(profile):
+                    config = _load_gateway_config()
+                    discover_plugins()
+                    if get_plugin_manager().has_non_plugin_hook_subscribers():
+                        return "non_plugin_hook_subscribers", None, None
+                    if not b2b_execution_inputs_ready(project, config):
+                        return "execution_inputs_unavailable", None, None
+                    return None, config, contextvars.copy_context()
+            except Exception:
+                return "execution_unavailable", None, None
+
+        def _prepare() -> Optional[str]:
+            """Runs INSIDE the one bounded worker, under the scope the
+            bootstrap captured: the bound execution, THEN the plugin-owned
+            preparation (the native read) and readiness — the only code the
+            source budget covers. The ContextVar is always reset."""
+            from agent.b2b_execution import bind_execution, reset_execution
+            from gateway.platforms.api_server_b2b_execution import (
+                b2b_execution_unavailable_code)
+            from gateway.platforms.api_server_b2b_context import _prepare_b2b_context
+            try:
+                token = bind_execution(cap)
+                try:
+                    sink._context_preparation = _prepare_b2b_context(
+                        cap, resolved=resolved)
+                    unavailable = b2b_execution_unavailable_code(
+                        project, config)
+                    assert_context_source_current(sink._context_preparation)
+                    return unavailable
+                finally:
+                    reset_execution(token)
+            except B2BTerminalRefusal as exc:
+                return (str(exc) if str(exc) == "context_oc_source_stale"
+                        else "execution_unavailable")
+            except Exception:
+                return "execution_unavailable"
+        # The launch bootstrap, held off the API loop AND the default
+        # executor entirely: the bounded NON-preparation runner owns the
+        # wait on its own ``_REQUEST_TTL_S`` budget (never the
+        # ``_SOURCE_DEADLINE_S`` native-read budget). No capacity admission
+        # gates this request — a budget expiry fails THIS launch closed,
+        # nothing else.
+        try:
+            bootstrap_error, config, scope_ctx = await run_bounded_context_operation(
+                _bootstrap, timeout=_REQUEST_TTL_S)
+        except B2BTerminalRefusal:
+            return _deny(503, "execution_unavailable")
+        except Exception:
+            return _deny(503, "execution_unavailable")
+        if bootstrap_error == "non_plugin_hook_subscribers":
+            return _deny(503, "non_plugin_hook_subscribers")
+        if bootstrap_error is not None:
+            return _deny(503, "execution_unavailable")
+        try:
+            # The task — and therefore the worker it spawns — runs under the
+            # scope captured above: the owning profile's home, secrets and
+            # terminal scope without a second hydration.
+            preparation_task = scope_ctx.run(
+                _a.create_task,
+                run_bounded_context_preparation(_prepare))
+            preparation_error = await preparation_task
+        except B2BTerminalRefusal:
+            preparation_error = "execution_unavailable"
+        if preparation_error is not None:
+            return _deny(503, preparation_error)
+    if existing_attempt is None:
+        # Inherited generic API admission, kept at
+        # its original place — not a B2B capacity gate.
         limited = adapter._concurrency_limited_response()
         if limited is not None:
             return limited
@@ -1233,16 +1415,36 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     if not all(env["issued_at"] <= now < env["expires_at"] for env in
                (resolved["_signed_request"], resolved["_signed_response"])):
         return _deny(403, "source_denied")
+    if existing_attempt is None:
+        # Non-hydrating scope entry — introspection only, never plugin
+        # secret-source code on the loop.
+        try:
+            with _profile_runtime_scope(home, hydrate_secrets=False):
+                from hermes_cli.plugins import get_plugin_manager
+
+                has_non_plugin_hooks = (
+                    get_plugin_manager().has_non_plugin_hook_subscribers())
+        except Exception:
+            return _deny(503, "execution_unavailable")
+        if has_non_plugin_hooks:
+            return _deny(503, "non_plugin_hook_subscribers")
+    binding_row = {"profile": profile, "session_id": session_id,
+                   "binding_digest": binding_digest,
+                   "policy_json": json_utf8(policy).decode("utf-8")}
+    attempt_row = {"attempt_id": attempt_id, "binding_digest": binding_digest,
+                   "profile": profile, "session_id": session_id, "status": "admitted",
+                   "run_id": run_id, "requester_id": resolved["requester_id"],
+                   "source_bind": _source_record(resolved)}
+    if cap is not None:
+        try:
+            assert_context_source_current(sink._context_preparation)
+        except B2BTerminalRefusal as exc:
+            return _deny(503, str(exc))
     outcome = store.b2b_admit(
         profile=profile, session_id=session_id, binding_digest=binding_digest,
         attempt_id=attempt_id, fingerprint=fingerprint,
-        binding_row={"profile": profile, "session_id": session_id,
-                     "binding_digest": binding_digest,
-                     "policy_json": json_utf8(policy).decode("utf-8")},
-        attempt_row={"attempt_id": attempt_id, "binding_digest": binding_digest,
-                     "profile": profile, "session_id": session_id, "status": "admitted",
-                     "run_id": run_id, "requester_id": resolved["requester_id"],
-                     "source_bind": _source_record(resolved)},
+        binding_row=binding_row,
+        attempt_row=attempt_row,
         run_scope=scope, run_key=attempt_id, run_id=run_id,
         run_fingerprint=fingerprint, run_status=initial_status,
         owner_pid=getattr(adapter, "_run_owner_pid", 0),
@@ -1259,13 +1461,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     except Exception:
         store.b2b_update_attempt(profile=profile, attempt_id=attempt_id, status="failed")
         return _deny(500, "title_commit_failed")
-    sink = _AttemptSink(adapter, store, profile=profile, entry=entry, keys=keys,
-                        attempt_id=attempt_id, session_id=session_id,
-                        binding_digest=binding_digest, run_id=stored_run_id, policy=policy)
-    cap = BoundExecution(
-        profile=profile, session_id=session_id, binding_digest=binding_digest,
-        attempt_id=attempt_id, run_id=stored_run_id, policy=dict(policy),
-        sink=sink, created_at=time.time())
+    # The admitted winner's run_id is the chosen one — the sink/cap built
+    # pre-admission already carry it (a replayed outcome returned above).
     launched = await _spawn_run(adapter, request, cap=cap, resolved=resolved,
                                 session_id=session_id, run_id=stored_run_id, profile=profile)
     if launched is None:

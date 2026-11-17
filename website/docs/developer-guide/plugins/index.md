@@ -1068,6 +1068,26 @@ Each hook is documented in full on the **[Event Hooks reference](../../user-guid
 | `kanban_task_claimed` | A kanban task is claimed (dispatcher process, before the worker spawns) | `task_id: str, board: str \| None, assignee: str \| None, run_id: int \| None, profile_name: str` | ignored |
 | `kanban_task_completed` | A kanban task completes (worker process) | `task_id, board, assignee, run_id, profile_name, summary: str \| None` | ignored |
 | `kanban_task_blocked` | A kanban task is blocked (worker process) | `task_id, board, assignee, run_id, profile_name, reason: str \| None` | ignored |
+| `prepare_context` | The B2B execution lane prepares one capability's mission context before admission (Python plugins only) | `execution` (keyword-only) | mapping — see the contract below |
+
+#### `prepare_context` contract
+
+`prepare_context` is a **synchronous, keyword-only** capability hook, not an observer: the caller
+requires **exactly one** registered callback for the current profile — zero registrations means "no
+producer" and two or more is ambiguity; both fail closed. The callback is invoked as
+`prepare_context(*, execution)` and must return a mapping with:
+
+- `view` — the context view the host qualifies;
+- `rendered` — the rendered context bytes/text the worker will publish;
+- `validate_configuration` — a **zero-argument** callable that re-checks the plugin-owned
+  configuration the read was taken under. It must return the literal `True`, or raise a typed
+  refusal. Any other return value, and any error, fails closed. The validator must perform **no
+  publication and no native IO** — it re-proves configuration only.
+
+Invalid callbacks, callback errors, and malformed return values all fail closed. Like every hook,
+the registration is profile-scoped and leased: unloading the plugin (or a registration error)
+removes the callback and revokes preparations made under it. Context publication itself stays in
+the `pre_llm_call` lifecycle hook — `prepare_context` never publishes.
 
 Most hooks are fire-and-forget observers — their return values are ignored. The exceptions are `pre_llm_call`, which can inject context into the conversation, and `pre_tool_call`, which can return a block/approve directive.
 

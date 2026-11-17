@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from hermes_cli.middleware import OBSERVER_SCHEMA_VERSION
+from hermes_constants import hermes_home_key
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,10 @@ class _ConsumerDispatcher:
 
 
 _dispatcher_lock = threading.Lock()
-_dispatchers: dict[tuple[str, int], _ConsumerDispatcher] = {}
+# (owning profile's canonical home key, hook name, id(callback)) — one process
+# serves many profiles; lazy stale-pruning must never reap another home's
+# worker on the strength of ITS manager's callback list.
+_dispatchers: dict[tuple[str, str, int], _ConsumerDispatcher] = {}
 
 
 def _callback_name(callback: Callable[..., Any]) -> str:
@@ -67,23 +71,39 @@ def _worker(dispatcher: _ConsumerDispatcher) -> None:
             payload = dict(payload)
             payload.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
             try:
-                # The worker outlives every turn and serves every profile; run the callback in the
+                # The worker outlives every turn and serves its owning profile; run the callback in the
                 # enqueuing turn's contextvars so it sees that turn's profile scope (home override,
                 # secrets), not an unbound context that fail-closed plugin bindings refuse (#118538).
                 # ``copy()``: one snapshot fans out to N consumer threads and a Context can only be
                 # entered by one thread at a time.
-                context.copy().run(dispatcher.callback, **payload)
+                def invoke_if_registered() -> None:
+                    if any(callback is dispatcher.callback for callback in _dispatch_callbacks(dispatcher.hook_name)):
+                        dispatcher.callback(**payload)
+
+                context.copy().run(invoke_if_registered)
             except Exception as exc:
                 # Fires once per streaming delta: a mis-declared callback fails identically every
-                # time, so it goes through the manager's warn-once reporter (#111922).
+                # time, so it goes through the manager's warn-once reporter (#111922) — through
+                # the ENQUEUING profile's context so the report lands on the owning manager,
+                # not the launch/default home's.
                 from hermes_cli.plugins import get_plugin_manager
 
-                get_plugin_manager()._report_hook_failure(dispatcher.hook_name, dispatcher.callback, payload, exc)
+                context.copy().run(lambda: get_plugin_manager()._report_hook_failure(
+                    dispatcher.hook_name, dispatcher.callback, payload, exc))
         finally:
             dispatcher.events.task_done()
 
 
 def _registered_callbacks(hook_name: str) -> tuple[Callable[..., Any], ...]:
+    try:
+        from hermes_cli import plugins
+        return tuple(plugins.get_plugin_manager()._hooks.get(hook_name, ()))
+    except Exception:
+        logger.debug("plugin stream hook callback lookup failed: %s", hook_name, exc_info=True)
+        return ()
+
+
+def _dispatch_callbacks(hook_name: str) -> tuple[Callable[..., Any], ...]:
     try:
         from hermes_cli import plugins
         return plugins.iter_hook_callbacks(hook_name)
@@ -109,17 +129,24 @@ def _start_dispatcher(hook_name: str, callback: Callable[..., Any]) -> _Consumer
 
 def _dispatchers_for(hook_name: str) -> list[_ConsumerDispatcher]:
     """Live dispatcher per registered callback (restarting dead workers); stale
-    ones for unregistered callbacks are stopped outside the lock."""
-    callbacks = _registered_callbacks(hook_name)
-    if not callbacks:
-        return []
-
-    callback_ids = {id(callback) for callback in callbacks}
+    ones for unregistered callbacks are stopped outside the lock. Registration
+    and staleness are judged against the CURRENT profile home only — another
+    home's dispatcher is a different key, never a stale one."""
+    home = hermes_home_key()
+    registered_callback_ids = {
+        id(callback) for callback in _registered_callbacks(hook_name)
+    }
+    callbacks = _dispatch_callbacks(hook_name)
     ready: list[_ConsumerDispatcher] = []
     with _dispatcher_lock:
-        stale = [_dispatchers.pop(key) for key in list(_dispatchers) if key[0] == hook_name and key[1] not in callback_ids]
+        stale = [
+            _dispatchers.pop(key)
+            for key in list(_dispatchers)
+            if key[0] == home and key[1] == hook_name
+            and key[2] not in registered_callback_ids
+        ]
         for callback in callbacks:
-            key = (hook_name, id(callback))
+            key = (home, hook_name, id(callback))
             dispatcher = _dispatchers.get(key)
             if dispatcher is None or dispatcher.thread is None or not dispatcher.thread.is_alive():
                 dispatcher = _dispatchers[key] = _start_dispatcher(hook_name, callback)
@@ -146,11 +173,11 @@ def enqueue_plugin_stream_hook(hook_name: str, **payload: Any) -> bool:
 
 
 def has_stream_observer_hooks() -> bool:
-    return any(_registered_callbacks(name) for name in ("on_stream_start", "on_stream_delta", "on_stream_end"))
+    return any(_dispatch_callbacks(name) for name in ("on_stream_start", "on_stream_delta", "on_stream_end"))
 
 
 def has_reasoning_stream_observer_hooks() -> bool:
-    return stream_reasoning_deltas_enabled() and bool(_registered_callbacks("on_stream_delta"))
+    return stream_reasoning_deltas_enabled() and bool(_dispatch_callbacks("on_stream_delta"))
 
 
 def stream_reasoning_deltas_enabled() -> bool:

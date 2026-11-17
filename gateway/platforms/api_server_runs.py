@@ -46,6 +46,45 @@ def api_worker_live_count() -> int:
         return _API_WORKER_LIVE
 
 
+def _counted_api_worker(fn):
+    """Return ``(counted, discard)`` for one API-worker submission.
+
+    The count is taken on the submitting thread so it is live before any
+    worker can exit. ``counted`` marks itself started under the lock, runs
+    ``fn``, and decrements exactly once in its own ``finally`` — the true
+    worker exit. ``discard`` releases the count ONLY when the worker never
+    began: a raced late start then sees ``discarded`` and never invokes
+    ``fn``, while an already-running orphan stays counted until its real
+    exit. Both paths release at most once.
+    """
+    global _API_WORKER_LIVE
+    with _API_WORKER_LOCK:
+        _API_WORKER_LIVE += 1
+    state = {"started": False, "discarded": False}
+
+    def _counted():
+        with _API_WORKER_LOCK:
+            if state["discarded"]:
+                return None
+            state["started"] = True
+        try:
+            return fn()
+        finally:
+            global _API_WORKER_LIVE
+            with _API_WORKER_LOCK:
+                _API_WORKER_LIVE -= 1
+
+    def _discard():
+        global _API_WORKER_LIVE
+        with _API_WORKER_LOCK:
+            if state["started"] or state["discarded"]:
+                return
+            state["discarded"] = True
+            _API_WORKER_LIVE -= 1
+
+    return _counted, _discard
+
+
 def _submit_api_worker(loop, fn):
     """``loop.run_in_executor(None, fn)`` with the worker-lifetime count held for the submission.
 
@@ -55,23 +94,29 @@ def _submit_api_worker(loop, fn):
     -> RuntimeError) the worker never runs, so the count is released here instead — a leaked
     count would make the shutdown close gate skip the SessionDB close for the process lifetime.
     """
-    global _API_WORKER_LIVE
-    with _API_WORKER_LOCK:
-        _API_WORKER_LIVE += 1
-
-    def _counted():
-        try:
-            return fn()
-        finally:
-            global _API_WORKER_LIVE
-            with _API_WORKER_LOCK:
-                _API_WORKER_LIVE -= 1
-
+    counted, discard = _counted_api_worker(fn)
     try:
-        return loop.run_in_executor(None, _counted)
+        return loop.run_in_executor(None, counted)
     except BaseException:
-        with _API_WORKER_LOCK:
-            _API_WORKER_LIVE -= 1
+        discard()
+        raise
+
+
+async def _submit_bounded_api_worker(fn, *, timeout):
+    """B2B-only bounded submission: the SAME counted worker lifetime as
+    ``_submit_api_worker`` but driven by the bounded non-preparation runner
+    (daemon thread + copied context + polling wait), never the default
+    executor — every plugin callback inside ``fn`` stays off the API loop
+    AND inside a fail-closed deadline. On any unwinding the count is
+    released only when the worker never began; a live orphan stays counted
+    until its true exit."""
+    from gateway.platforms.api_server_b2b_context import (
+        run_bounded_context_operation)
+    counted, discard = _counted_api_worker(fn)
+    try:
+        return await run_bounded_context_operation(counted, timeout=timeout)
+    except BaseException:
+        discard()
         raise
 _ROOM_RETENTION_REQUEST_KEY = (
     RequestKey("hermes.room_run_retention_until", float) if RequestKey is not None
@@ -929,8 +974,10 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         agent = await _b2b_exec.construct_run_agent(self, run, _construct_agent, loop)
         self._active_run_agents[run_id] = agent
         approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
-        result, usage, served_runtime = await _submit_api_worker(
-            loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        result, usage, served_runtime = await _b2b_exec.execute_run_agent(
+            self, run,
+            lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server),
+            loop)
         if not isinstance(result, dict):
             result = {}
         status, fields = terminal_run_status(result)

@@ -34,8 +34,19 @@ def _make_stream_chunk(content=None, finish_reason=None):
     return SimpleNamespace(choices=[choice], model="test/model")
 
 
-def _callbacks(callbacks_by_hook):
-    return lambda name: tuple(callbacks_by_hook.get(name, ()))
+def _callbacks(callbacks_by_hook, monkeypatch):
+    patched_managers = set()
+
+    def dispatch(manager, name):
+        if id(manager) not in patched_managers:
+            monkeypatch.setattr(
+                manager, "_hooks",
+                {hook_name: list(callbacks) for hook_name, callbacks in callbacks_by_hook.items()},
+                raising=False)
+            patched_managers.add(id(manager))
+        return tuple(callbacks_by_hook.get(name, ()))
+
+    return dispatch
 
 
 def test_stream_delta_plugin_hook_is_queued_off_token_path(monkeypatch):
@@ -48,7 +59,7 @@ def test_stream_delta_plugin_hook_is_queued_off_token_path(monkeypatch):
         time.sleep(0.2)
         calls.append(("on_stream_delta", kwargs))
 
-    monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}))
+    monkeypatch.setattr("hermes_cli.plugins.PluginManager._dispatch_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}, monkeypatch))
 
     agent = _agent()
 
@@ -76,7 +87,7 @@ def test_stream_delta_plugin_hook_error_does_not_break_streaming(monkeypatch):
     def on_stream_delta(**_kwargs):
         raise RuntimeError("plugin failed")
 
-    monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}))
+    monkeypatch.setattr("hermes_cli.plugins.PluginManager._dispatch_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}, monkeypatch))
 
     agent = _agent()
     agent.stream_delta_callback = ui_deltas.append
@@ -101,7 +112,7 @@ def test_stream_hook_queue_drops_oldest_pending_event_when_full(monkeypatch):
         first_delivered.set()
         release_worker.wait(timeout=1.0)
 
-    monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}))
+    monkeypatch.setattr("hermes_cli.plugins.PluginManager._dispatch_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}, monkeypatch))
 
     assert enqueue_plugin_stream_hook("on_stream_delta", delta="first") is True
     assert first_delivered.wait(timeout=1.0)
@@ -134,8 +145,8 @@ def test_stream_hook_queue_isolated_per_consumer(monkeypatch):
         fast_delivered.append(kwargs["delta"])
 
     monkeypatch.setattr(
-        "hermes_cli.plugins.iter_hook_callbacks",
-        _callbacks({"on_stream_delta": [slow_consumer, fast_consumer]}),
+        "hermes_cli.plugins.PluginManager._dispatch_hook_callbacks",
+        _callbacks({"on_stream_delta": [slow_consumer, fast_consumer]}, monkeypatch),
     )
 
     assert enqueue_plugin_stream_hook("on_stream_delta", delta="first") is True
@@ -162,7 +173,7 @@ def test_reasoning_stream_delta_plugin_hook_is_opt_in(monkeypatch):
     def on_stream_delta(**kwargs):
         calls.append(("on_stream_delta", kwargs))
 
-    monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}))
+    monkeypatch.setattr("hermes_cli.plugins.PluginManager._dispatch_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}, monkeypatch))
 
     agent = _agent()
     agent._fire_reasoning_delta("private chain")
@@ -191,7 +202,7 @@ def test_interim_message_plugin_hook_is_queued(monkeypatch):
     def on_interim_message(**kwargs):
         calls.append(("on_interim_message", kwargs))
 
-    monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks", _callbacks({"on_interim_message": [on_interim_message]}))
+    monkeypatch.setattr("hermes_cli.plugins.PluginManager._dispatch_hook_callbacks", _callbacks({"on_interim_message": [on_interim_message]}, monkeypatch))
 
     agent = _agent()
     agent._emit_interim_assistant_message({"content": "I will inspect the files first."})
@@ -204,7 +215,7 @@ def test_interim_message_plugin_hook_is_queued(monkeypatch):
 
 
 def test_stream_plugin_hook_counts_as_stream_consumer(monkeypatch):
-    monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks", _callbacks({"on_stream_delta": [lambda **_kwargs: None]}))
+    monkeypatch.setattr("hermes_cli.plugins.PluginManager._dispatch_hook_callbacks", _callbacks({"on_stream_delta": [lambda **_kwargs: None]}, monkeypatch))
 
     agent = _agent()
 
@@ -212,7 +223,7 @@ def test_stream_plugin_hook_counts_as_stream_consumer(monkeypatch):
 
 
 def test_interim_message_plugin_hook_does_not_count_as_stream_consumer(monkeypatch):
-    monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks", _callbacks({"on_interim_message": [lambda **_kwargs: None]}))
+    monkeypatch.setattr("hermes_cli.plugins.PluginManager._dispatch_hook_callbacks", _callbacks({"on_interim_message": [lambda **_kwargs: None]}, monkeypatch))
 
     agent = _agent()
 
@@ -232,8 +243,8 @@ def test_stream_lifecycle_plugin_hooks_are_queued(monkeypatch):
         calls.append(("on_stream_end", kwargs))
 
     monkeypatch.setattr(
-        "hermes_cli.plugins.iter_hook_callbacks",
-        _callbacks({"on_stream_start": [on_stream_start], "on_stream_end": [on_stream_end]}),
+        "hermes_cli.plugins.PluginManager._dispatch_hook_callbacks",
+        _callbacks({"on_stream_start": [on_stream_start], "on_stream_end": [on_stream_end]}, monkeypatch),
     )
 
     agent = _agent()
@@ -261,13 +272,13 @@ def test_chat_completion_stream_emits_lifecycle_hooks(_mock_close, mock_create, 
     shutdown_plugin_stream_hook_dispatcher()
     calls = []
     monkeypatch.setattr(
-        "hermes_cli.plugins.iter_hook_callbacks",
+        "hermes_cli.plugins.PluginManager._dispatch_hook_callbacks",
         _callbacks(
             {
                 "on_stream_start": [lambda **kwargs: calls.append(("on_stream_start", kwargs))],
                 "on_stream_delta": [lambda **kwargs: calls.append(("on_stream_delta", kwargs))],
                 "on_stream_end": [lambda **kwargs: calls.append(("on_stream_end", kwargs))],
-            }
+            }, monkeypatch
         ),
     )
 
@@ -319,7 +330,7 @@ def test_bedrock_reasoning_delta_reaches_plugin_only_observer(monkeypatch):
     def on_stream_delta(**kwargs):
         calls.append(kwargs)
 
-    monkeypatch.setattr("hermes_cli.plugins.iter_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}))
+    monkeypatch.setattr("hermes_cli.plugins.PluginManager._dispatch_hook_callbacks", _callbacks({"on_stream_delta": [on_stream_delta]}, monkeypatch))
     monkeypatch.setattr("hermes_cli.config.cfg_get", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(
         "agent.bedrock_adapter._get_bedrock_runtime_client",
@@ -360,3 +371,64 @@ def test_bedrock_reasoning_delta_reaches_plugin_only_observer(monkeypatch):
 
     assert calls[0]["kind"] == "reasoning"
     assert calls[0]["delta"] == "bedrock reasoning"
+
+
+def test_stream_failure_reports_to_enqueuing_profile_manager(
+        monkeypatch, tmp_path):
+    """The warn-once failure report must land on the ENQUEUING profile's
+    manager (the captured context), never the ambient/launch home's — and the
+    dedup set must be that manager's."""
+    import hermes_cli.plugins as plugins_mod
+    from agent.plugin_stream_hooks import (
+        enqueue_plugin_stream_hook, shutdown_plugin_stream_hook_dispatcher)
+    from hermes_cli.plugins import PluginManager
+    from hermes_constants import (
+        get_hermes_home, reset_hermes_home_override, set_hermes_home_override)
+
+    shutdown_plugin_stream_hook_dispatcher()
+    home_a = tmp_path / "home-a"
+    home_b = tmp_path / "home-b"
+    home_a.mkdir()
+    home_b.mkdir()
+    manager_a = PluginManager("a")
+    manager_b = PluginManager("b")
+    managers = {home_a: manager_a, home_b: manager_b}
+
+    monkeypatch.setattr(
+        plugins_mod, "get_plugin_manager",
+        lambda: managers.get(get_hermes_home(), manager_a))
+
+    def _failing(**_kwargs):
+        raise RuntimeError("stream boom")
+
+    for manager in (manager_a, manager_b):
+        manager._hooks = {"on_stream_delta": [_failing]}
+        manager._dispatch_hook_callbacks = (
+            lambda _name: (_failing,))
+
+    reports = []
+    real_report = PluginManager._report_hook_failure
+    monkeypatch.setattr(
+        PluginManager, "_report_hook_failure",
+        lambda self, *a, **k: (
+            reports.append(self), real_report(self, *a, **k))[0])
+
+    token = set_hermes_home_override(home_b)
+    try:
+        assert enqueue_plugin_stream_hook("on_stream_delta", delta="x")
+    finally:
+        reset_hermes_home_override(token)
+    _wait_for(lambda: len(reports) >= 1)
+
+    # Same failure again: still reported to B (dedup is B's set — one entry).
+    token = set_hermes_home_override(home_b)
+    try:
+        assert enqueue_plugin_stream_hook("on_stream_delta", delta="x2")
+    finally:
+        reset_hermes_home_override(token)
+    _wait_for(lambda: len(reports) >= 2)
+    shutdown_plugin_stream_hook_dispatcher()
+
+    assert reports == [manager_b, manager_b]
+    assert len(manager_b._hook_failures_reported) == 1
+    assert not manager_a._hook_failures_reported

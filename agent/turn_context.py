@@ -742,6 +742,44 @@ def _ensure_session_row(agent: Any, pending_cli_message: Any) -> None:
     )
 
 
+def _b2b_require_hook_receipt(agent: Any, turn_id: str, parts: List[str]) -> str:
+    """P2 fail-closed check for a bound lane: after the lifecycle invoke, the
+    plugin must have PUBLISHED the receipt for THIS turn, the cap must carry a
+    registered recheck, and exactly one rendered contribution must equal the
+    receipt's bytes — a missing/rewritten/spilled/short-circuited or second
+    contribution refuses before the provider can see unvalidated content.
+    Ordinary lanes never reach here; B2B bytes are never spilled or modified."""
+    from agent.b2b_execution import B2BTerminalRefusal, require_execution
+    cap = require_execution(agent)
+    assert cap is not None  # require_execution raised otherwise
+    receipt = cap.context_receipt
+    reason = None
+    if receipt is None:
+        reason = "context_unavailable"
+    elif receipt.turn_id != turn_id or cap.current_turn_id != turn_id:
+        reason = "context_turn_mismatch"
+    elif not callable(getattr(cap, "_recheck", None)):
+        reason = "context_recheck_unavailable"
+    if reason is None:
+        expected = receipt.rendered.decode("utf-8")
+        matched = sum(1 for piece in parts if piece == expected)
+        extras = [piece for piece in parts if piece != expected]
+        if matched != 1 or extras:
+            reason = ("context_publication_conflict" if matched > 1
+                      else "context_absent_from_kwargs" if not matched
+                      else "context_publication_conflict")
+    if reason is not None:
+        sink = getattr(cap, "sink", None)
+        block = getattr(sink, "block", None)
+        if callable(block):
+            try:
+                block(reason)
+            except Exception:
+                pass  # durable write failed -- the typed refusal still surfaces
+        raise B2BTerminalRefusal(reason)
+    return receipt.rendered.decode("utf-8")
+
+
 def _collect_pre_llm_call_context(
     agent: Any, *, effective_task_id: str, turn_id: str, original_user_message: Any,
     messages: List[Any], conversation_history: Optional[List[Any]],
@@ -751,6 +789,11 @@ def _collect_pre_llm_call_context(
     runaway plugin can't inflate every subsequent turn's prompt."""
     if getattr(agent, "_persist_disabled", False):
         return ""
+    _b2b_mod = sys.modules.get("agent.b2b_execution")
+    _b2b_bound = (
+        getattr(agent, "_b2b_execution", None) is not None
+        or (_b2b_mod is not None and _b2b_mod.current_execution() is not None)
+    )
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
@@ -766,16 +809,18 @@ def _collect_pre_llm_call_context(
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
         )
-        try:
-            # Spill oversized per-hook context to disk so a runaway plugin can't inflate every subsequent
-            # turn's prompt. Ported from openai/codex PR #21069 ("Spill large hook outputs from context").
-            from tools.hook_output_spill import (
-                get_spill_config as _spill_cfg, spill_if_oversized as _spill_if_oversized
-            )
-            _spill_config_cached = _spill_cfg()
-        except Exception:
-            _spill_if_oversized = None  # type: ignore[assignment]
-            _spill_config_cached = None
+        _spill_if_oversized = None
+        if not _b2b_bound:
+            try:
+                # Spill oversized per-hook context to disk so a runaway plugin can't inflate every subsequent
+                # turn's prompt. Ported from openai/codex PR #21069 ("Spill large hook outputs from context").
+                from tools.hook_output_spill import (
+                    get_spill_config as _spill_cfg, spill_if_oversized as _spill
+                )
+                _spill_if_oversized = _spill
+                _spill_config_cached = _spill_cfg()
+            except Exception:
+                _spill_config_cached = None
         _ctx_parts: list[str] = []
         for r in _pre_results:
             if isinstance(r, dict) and r.get("context"):
@@ -784,6 +829,8 @@ def _collect_pre_llm_call_context(
                 _piece = r
             else:
                 continue
+            # B2B bytes are never spilled or rewritten — the exact-receipt
+            # check below owns them; ordinary lanes keep the spill guard.
             if _spill_if_oversized is not None:
                 try:
                     _piece = _spill_if_oversized(
@@ -793,10 +840,14 @@ def _collect_pre_llm_call_context(
                 except Exception as _spill_exc:
                     logger.warning("hook context spill failed: %s", _spill_exc)
             _ctx_parts.append(_piece)
-        return "\n\n".join(_ctx_parts)
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
-    return ""
+        _ctx_parts = []
+    if _b2b_bound:
+        # OUTSIDE the broad fail-open except: the typed refusal must never be
+        # swallowed — it escapes to the turn loop as the terminal refusal.
+        return _b2b_require_hook_receipt(agent, turn_id, _ctx_parts)
+    return "\n\n".join(_ctx_parts)
 
 
 def _merge_gateway_notes(
