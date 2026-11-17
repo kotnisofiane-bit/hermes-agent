@@ -425,7 +425,6 @@ BLOCK_REASONS = frozenset({
     "context_oc_projection", "context_oc_read_metadata",
     "context_oc_read_replayed", "context_oc_source_stale",
     "context_oc_unavailable", "context_oc_unqualified",
-    "context_preparation_stuck",
     "context_proof_invalid", "context_proof_missing",
     "context_publication_conflict", "context_recheck_already_registered",
     "context_recheck_unavailable", "context_relation_bounds",

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import dataclasses
 import http.server
 import json
 import logging
@@ -1765,10 +1766,9 @@ async def test_seal_plugin_validation_never_on_api_loop(
     finalize's plugin validation — the ``assert_current_policy`` inside both
     ``resolve_before_seal`` and final ``_prepare_seal`` — never runs on the
     API loop. A validator parked past ``_SOURCE_DEADLINE_S`` fails closed to
-    ``context_unavailable`` with ZERO abandoned-preparation count and no
-    durable seal material ever created — before AND after the worker finally
-    exits — while health still answers. The healthy arm proves the same
-    code path still commits real proof."""
+    ``context_unavailable`` with no durable seal material ever created —
+    before AND after the worker finally exits — while health still answers.
+    The healthy arm proves the same code path still commits real proof."""
     from pathlib import Path
     from types import SimpleNamespace
 
@@ -1810,6 +1810,17 @@ async def test_seal_plugin_validation_never_on_api_loop(
             lambda: b2b_ctx._prepare_b2b_context(
                 lane.cap, resolved={"mission_source_digest": "c" * 64}))
         lane.sink._context_preparation = prep
+
+        # The host-side OC recheck inside ``_commit_seal`` reads the
+        # API-server clock: freeze it inside the SAME OC window the frozen
+        # context clock produced (the unit view's source bound ends at
+        # 1793361610.0) and synchronize the signed before_seal envelopes so
+        # they stay valid across it — only genuine staleness may refuse.
+        monkeypatch.setattr(b2b, "time", _FakeClock(now=1793361605.0))
+        lane.resolved["_signed_request"] = {
+            "issued_at": 1793361604.0, "expires_at": 1793361670.0}
+        lane.resolved["_signed_response"] = {
+            "issued_at": 1793361604.0, "expires_at": 1793361670.0}
 
         probe._reset_probe()
         target_call = {"resolve_before_seal": 2, "seal_prepare": 3}.get(stage)
@@ -1880,8 +1891,7 @@ async def test_seal_plugin_validation_never_on_api_loop(
 
                 # While the plugin validator is STILL parked — gate proven
                 # unset before AND after each probe — real HTTP health
-                # answers promptly, the abandoned-preparation count stays
-                # exactly zero, and no seal material exists.
+                # answers promptly and no seal material exists.
                 assert not probe.VAL_GATE.is_set()
                 async with TestClient(TestServer(health_app)) as client:
                     plain = await asyncio.wait_for(
@@ -1903,14 +1913,13 @@ async def test_seal_plugin_validation_never_on_api_loop(
             outcome = await asyncio.wait_for(finalize_task, timeout=15.0)
             if stage != "healthy":
                 # The refusal landed on the main deadline — the gate is
-                # STILL unset, the worker still parked, the count still 0,
-                # and no durable seal material exists.
+                # STILL unset, the worker still parked, and no durable seal
+                # material exists.
                 assert not probe.VAL_GATE.is_set()
                 status_out, fields, extra = outcome
                 assert status_out == "failed"
                 assert fields["error"] == "context_unavailable"
                 assert extra is None
-                assert b2b_ctx.abandoned_preparation_count() == 0
                 for kind in ("source_before_seal", "context_recheck",
                              "proposal"):
                     assert lane.store.b2b_artifact(
@@ -1946,8 +1955,6 @@ async def test_seal_plugin_validation_never_on_api_loop(
             assert lane.store.b2b_attempt(
                 profile=lane.profile, attempt_id=lane.attempt_id)[
                     "status"] == "context_unavailable"
-            # The parked callback still counts NOTHING.
-            assert b2b_ctx.abandoned_preparation_count() == 0
             for _i, _c, thread in list(probe.VAL_WORKER_THREADS):
                 thread.join(timeout=10.0)
             # The now-exited worker cannot resurrect the attempt or mint
@@ -2000,5 +2007,131 @@ def test_commit_seal_rechecks_signed_window_host_only(tmp_path, monkeypatch):
         assert lane.store.b2b_attempt(
             profile=lane.profile, attempt_id=lane.attempt_id)[
                 "status"] == "result_received"
+    finally:
+        lane.store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("seam", ["final_validator", "host_resume"])
+async def test_commit_seal_host_oc_deadline_recheck(
+        tmp_path, monkeypatch, seam):
+    """An OC source observation that crosses its OWN deadline between the
+    last plugin validation and the host commit must refuse
+    ``context_oc_source_stale`` — a pure host-side timestamp comparison
+    against the attached preparation's ``source_deadline_ms`` immediately
+    before ``store.b2b_seal``, never another plugin callback. ``final_validator``
+    crosses the deadline inside the third (last) configuration validator;
+    ``host_resume`` crosses it between a timely ``_prepare_seal`` return and
+    ``_commit_seal``. The signed before_seal envelopes are synchronized to
+    stay valid throughout — ONLY the OC window closes. A paid provider
+    result already sits durable; the attempt still records the typed
+    ``context_stale`` verdict."""
+    from pathlib import Path
+    from types import SimpleNamespace
+    import hermes_cli.plugins as plugins_mod
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    from tests.gateway import (
+        test_api_server_b2b_context_capacity as probe)
+
+    lane = b2b_unit_fixtures.build_b2b_dispatch_lane(tmp_path)
+    try:
+        _commit_dispatch(lane)
+        text = _proposal_text()
+        parsed, reason = validate_proposal(
+            text, extract_allowed_refs(lane.receipt.view))
+        assert parsed is not None, reason
+        lane.sink.commit_result(text=text, parsed=parsed, reason=reason)
+        lane.adapter._profile_scope = lambda profile: contextlib.nullcontext()
+
+        # REAL registered producer + REAL _PreparedContext — attached AFTER
+        # dispatch and result so the gated validator's call indices stay
+        # fixed: call 1 = _prepare_b2b_context's creation assert, call 2 =
+        # the source match inside resolve_before_seal, call 3 = the source
+        # match inside _prepare_seal. No fourth call may ever exist.
+        home = Path(lane.policy["profile_home"])
+        probe._install_gated_validator(home)
+        empty_bundled = tmp_path / "no_bundled_plugins"
+        empty_bundled.mkdir(exist_ok=True)
+        monkeypatch.setattr(
+            plugins_mod, "get_bundled_plugins_dir", lambda: empty_bundled)
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
+        probe._reset_probe()
+
+        # The context clock is frozen inside the view's own 10 s freshness
+        # bound for the REAL preparation; afterwards BOTH module clocks share
+        # one controllable ``_FakeClock`` parked 1 ms inside the OC deadline —
+        # every ``_assert_window`` gate AND the host commit read it.
+        monkeypatch.setattr(
+            b2b_ctx, "time", SimpleNamespace(time=lambda: 1793361605.0))
+        prep = await b2b_ctx.run_bounded_context_preparation(
+            lambda: b2b_ctx._prepare_b2b_context(
+                lane.cap, resolved={"mission_source_digest": "c" * 64}))
+        oc_deadline_s = prep.source_deadline_ms / 1000.0
+        clock = _FakeClock(now=oc_deadline_s - 0.001)
+        monkeypatch.setattr(b2b_ctx, "time", clock)
+        monkeypatch.setattr(b2b, "time", clock)
+        resolved = dict(lane.resolved)
+        resolved["_signed_request"] = {
+            "issued_at": 1793361604.0, "expires_at": oc_deadline_s + 60.0}
+        resolved["_signed_response"] = {
+            "issued_at": 1793361604.0, "expires_at": oc_deadline_s + 60.0}
+
+        async def _resolved_source(*a, **k):
+            return resolved, "ok"
+
+        monkeypatch.setattr(b2b, "_resolve_source_async", _resolved_source)
+
+        if seam == "final_validator":
+            # The OC deadline crosses INSIDE the real plugin validator: the
+            # wrapper runs the plugin's own ``validate_configuration`` and
+            # advances the shared clock on its SECOND call — the final
+            # seal-time source match (call 1 is resolve_before_seal's).
+            real_validate = prep.validate_configuration
+            calls = [0]
+
+            def _advancing_validate():
+                calls[0] += 1
+                result = real_validate()
+                if calls[0] == 2:
+                    clock.now = oc_deadline_s
+                return result
+
+            prep = dataclasses.replace(
+                prep, validate_configuration=_advancing_validate)
+        else:
+            real_prepare = lane.sink._prepare_seal
+
+            def _resume_then_advance(**kwargs):
+                prepared = real_prepare(**kwargs)
+                clock.now = oc_deadline_s
+                return prepared
+
+            monkeypatch.setattr(
+                lane.sink, "_prepare_seal", _resume_then_advance)
+        lane.sink._context_preparation = prep
+
+        lane.cap.register_context_recheck(
+            lambda _cap: renew_unit_oc_read(lane.view, read_id=3))
+        loop_thread = threading.current_thread()
+
+        status_out, fields, extra = await bxe._b2b_finalize(
+            lane.cap, {"final_response": text}, "completed", {})
+        assert status_out == "failed"
+        assert fields["error"] == "context_oc_source_stale"
+        assert extra is None
+        # The paid result is durable; the attempt still records the typed
+        # ``context_stale`` verdict — the known refusal classification.
+        assert lane.store.b2b_attempt(
+            profile=lane.profile, attempt_id=lane.attempt_id)[
+                "status"] == "context_stale"
+        for kind in ("source_before_seal", "context_recheck", "proposal"):
+            assert lane.store.b2b_artifact(
+                attempt_id=lane.attempt_id, kind=kind) is None
+        # Exactly the three validator calls — the host commit added none —
+        # and every one ran off the API loop.
+        assert len(probe.VAL_WORKER_THREADS) == 3
+        assert all(t is not loop_thread
+                   for _i, _c, t in probe.VAL_WORKER_THREADS)
     finally:
         lane.store.close()

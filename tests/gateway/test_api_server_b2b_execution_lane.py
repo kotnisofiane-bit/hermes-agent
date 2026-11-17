@@ -1373,6 +1373,7 @@ class _UnitPreparation:
             current, configuration, publication)
         self._current_error = current_error or "source_window_closed"
         self._configuration_error = configuration_error
+        self.source_deadline_ms = 2 ** 62
 
     def assert_current(self, cap):
         if not self._current:
@@ -2211,67 +2212,6 @@ def test_construction_guard_blocks_with_typed_cause(
     lane.store.close()
 
 
-# --- Goal C: concurrency checked before the expensive preparation --------
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("position", ["early", "post_prepare"])
-async def test_launch_concurrency_check_order(
-        tmp_path, monkeypatch, opened, position):
-    """A NEW attempt checks capacity BEFORE the native preparation (early
-    limit -> real 429, zero prepares) and again after it (first call None ->
-    prepare runs once -> second call 429). Neither path writes the store,
-    titles the session, or spawns a worker."""
-    from aiohttp import web
-    from tests.gateway import test_api_server_b2b_admission as adm
-    from gateway.platforms import api_server_b2b_context as b2b_ctx
-    prof = adm._profile_home(tmp_path, monkeypatch, "hub")
-    _write_serving_config(prof)
-    adapter = adm._adapter(tmp_path, monkeypatch, "hub")
-    adapter._session_db = SessionDB(prof / "state.db")
-    opened.extend([adapter._session_db, adapter._run_idempotency_store])
-    lane = _ready_lane(tmp_path)
-    entry = _lane_entry(
-        lane, portal_issuer="portal-hub", hermes_issuer="hermes-hub")
-    session_id = "b2b_" + "b" * 64
-    adapter._session_db.create_session(session_id, "api_server")
-    resolved = _launch_resolved(lane, session_id=session_id)
-    obs = dict(resolved["observation_genesis"])
-    obs["id"], obs["profile"] = session_id, "hub"
-    resolved["observation_genesis"] = obs
-    resolved["session_id"] = session_id
-    resolved["binding_digest"] = session_id[4:]
-    resolved["attempt_id"] = b2b._attempt_id_for(session_id[4:])
-
-    prepares = []
-
-    def _prepare(cap, *, resolved):
-        prepares.append(cap)
-        return _UnitPreparation(cap)
-
-    monkeypatch.setattr(b2b_ctx, "_prepare_b2b_context", _prepare)
-    monkeypatch.setattr(b2b, "_spawn_run", _adm_tripwire("_spawn_run"))
-    limited = web.Response(status=429, text="capacity")
-    calls = iter([limited] if position == "early" else [None, limited])
-    monkeypatch.setattr(
-        adapter, "_concurrency_limited_response", lambda: next(calls))
-    store = adapter._run_idempotency_store
-    before = adm._store_counts(store)
-    response = await b2b._launch_b2b_run(
-        adapter, None, profile="hub", entry=entry, keys=b2b._KeyRing(entry),
-        session_id=session_id, binding_digest=session_id[4:],
-        attempt_id=resolved["attempt_id"], resolved=resolved,
-        store=store, db=adapter._session_db)
-    assert response.status == 429
-    if position == "early":
-        assert prepares == []
-    else:
-        assert len(prepares) == 1
-    assert adm._store_counts(store) == before
-    assert adapter._session_db.get_session(session_id)["title"] is None
-    lane.store.close()
-
-
 # --- run_bounded_context_preparation: the worker's own finish decides ------
 
 
@@ -2282,8 +2222,8 @@ async def test_bounded_preparation_judges_the_workers_own_finish(
     """The budget refusal compares the deadline to the WORKER's recorded
     finish instant, never to the polling loop's wake: a worker done 3 ms
     before the deadline is accepted even when the loop only wakes 7 ms after
-    it; one done 3 ms after is refused — and with the worker already exited
-    the abandon mark counts nothing."""
+    it; one done 3 ms after is refused — its already-exited worker leaves no
+    accounting behind."""
     from agent.b2b_execution import B2BTerminalRefusal
     from gateway.platforms import api_server_b2b_context as b2b_ctx
 
@@ -2322,4 +2262,3 @@ async def test_bounded_preparation_judges_the_workers_own_finish(
     else:
         assert result == "context_unavailable"
     assert workers and not workers[0].is_alive()
-    assert b2b_ctx.abandoned_preparation_count() == 0

@@ -19,7 +19,6 @@ import hmac
 import json
 import logging
 import re
-import threading
 import time
 import types
 import uuid
@@ -47,37 +46,6 @@ _SOURCE_DEADLINE_S = 1.0
 _CONTEXT_RECHECK_SAFETY_S = 0.1
 _REQUEST_TTL_S = 10
 _MAX_WINDOW_S = 30
-
-# Launch-bootstrap single-flight: exactly ONE bootstrap worker per canonical
-# home, held until the worker's REAL exit — never released by the caller's
-# bounded wait refusing, its cancellation, or a reply already sent. A second
-# bootstrap on the same home is refused at once instead of queueing behind
-# (or duplicating) the still-running one. The Event signals worker exit.
-_BOOTSTRAP_LOCK = threading.Lock()
-_BOOTSTRAP_IN_FLIGHT: Dict[str, "threading.Event"] = {}
-
-
-def _try_reserve_bootstrap(home_key: str) -> "Optional[threading.Event]":
-    """Reserve this home's ONE bootstrap slot before the worker exists —
-    ``None`` when a bootstrap (live OR merely timed-out) already owns it."""
-    with _BOOTSTRAP_LOCK:
-        if home_key in _BOOTSTRAP_IN_FLIGHT:
-            return None
-        slot = threading.Event()
-        _BOOTSTRAP_IN_FLIGHT[home_key] = slot
-        return slot
-
-
-def _release_bootstrap(home_key: str, slot: "threading.Event") -> None:
-    """Free the slot ONLY if this exact reservation still owns it — called
-    from the worker's finally (its true exit) and from the spawn path when
-    the worker never started. Identity-checked so a superseded reservation
-    can never evict a newer one."""
-    with _BOOTSTRAP_LOCK:
-        if _BOOTSTRAP_IN_FLIGHT.get(home_key) is slot:
-            del _BOOTSTRAP_IN_FLIGHT[home_key]
-    slot.set()
-
 
 _SIG_RE = re.compile(r"^[A-Za-z0-9_-]{86}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -843,7 +811,6 @@ _BLOCK_CONTEXT_STALE_REASONS = frozenset({
     "context_oc_unavailable", "context_oc_read_metadata",
     "context_oc_unqualified", "context_oc_projection",
     "context_oc_source_stale", "context_oc_read_replayed",
-    "context_preparation_stuck",
     "context_proof_missing", "context_proof_invalid",
     "context_accepted_unavailable",
     "context_accepted_malformed", "context_accepted_unqualified",
@@ -1222,6 +1189,14 @@ class _AttemptSink:
         if not all(env["issued_at"] <= now < env["expires_at"] for env in
                    (window["request"], window["response"])):
             raise B2BTerminalRefusal("source_window_closed")
+        # The attached preparation's OC source deadline is rechecked on the
+        # host in the same breath — the seam lets the observation cross its
+        # own governed bound between the last validation and this commit.
+        # Pure timestamp comparison: no plugin callback, no _assert_stamp.
+        preparation = self._context_preparation
+        if (preparation is not None
+                and int(time.time() * 1000) >= preparation.source_deadline_ms):
+            raise B2BTerminalRefusal("context_oc_source_stale")
         stored = self._store.b2b_seal(
             profile=self.profile, attempt_id=self.attempt_id,
             artifacts=dict(prepared["artifacts"]))
@@ -1243,7 +1218,7 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                           resolved: Dict[str, Any], store: Any, db: Any):
     """Keep the immutable empty origin, but accept worked sessions through their owned binding."""
     import asyncio as _a
-    from hermes_constants import get_hermes_home, hermes_home_key
+    from hermes_constants import get_hermes_home
     home = get_hermes_home().resolve()
     if (not getattr(db, "db_path", None) or str(db.db_path) == ":memory:" or
             db.db_path.resolve().parent != home):
@@ -1289,7 +1264,7 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         return _deny(404, "not_found")
     # P2 admission gate: NEW work proves its mission context BEFORE the single
     # durable attempt is consumed — the sink/cap are built in memory first,
-    # then the untimed bootstrap enters the owning profile scope (secret
+    # then the bounded bootstrap enters the owning profile scope (secret
     # hydration included), loads the gateway config and discovers plugins,
     # and only THEN does the one bounded worker run the plugin-owned
     # preparation — the real native read (the profile's prepare_context
@@ -1325,30 +1300,9 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     cap = None
     # Lost-ACK replay is allowed even while the original holds the final native worker slot.
     if existing_attempt is None:
-        # Cheap capacity check BEFORE the expensive native preparation — only
-        # for NEW attempts; the post-preparation check below still stands and
-        # no slot is reserved here.
-        limited = adapter._concurrency_limited_response()
-        if limited is not None:
-            return limited
-        # A home whose abandoned native reads already hit the bound refuses
-        # NEW launches too — refuse before discovery/preparation spends
-        # another doomed read. Durable replays bypass this gate entirely,
-        # and a scope-entry failure fails closed on the same typed refusal.
-        # hydrate_secrets=False: a full _profile_scope re-entry could run
-        # plugin secret-source code on the loop; the home is already fixed
-        # and db/home-verified above.
         from gateway.platforms.api_server_b2b_context import (
-            context_preparation_stuck, run_bounded_context_operation,
-            run_bounded_context_preparation)
+            run_bounded_context_operation, run_bounded_context_preparation)
         from gateway.run import _profile_runtime_scope
-        try:
-            with _profile_runtime_scope(home, hydrate_secrets=False):
-                preparation_stuck = context_preparation_stuck()
-        except Exception:
-            return _deny(503, "execution_unavailable")
-        if preparation_stuck:
-            return _deny(503, "execution_unavailable")
         # The sink + cap exist ONLY in memory until b2b_admit commits the
         # attempt — a failed preparation drops them with zero durable trace.
         sink = _AttemptSink(adapter, store, profile=profile, entry=entry, keys=keys,
@@ -1365,9 +1319,9 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             owning profile scope (secret hydration included), gateway config,
             plugin discovery, and the non-plugin/inputs gates. Discovery and
             hydration can legitimately take seconds; neither is plugin
-            PREPARATION code, so neither may spend the source budget or the
-            abandoned-preparation count. The scoped context is captured ONCE
-            and returned for the bounded task to inherit."""
+            PREPARATION code, so neither may spend the source budget. The
+            scoped context is captured ONCE and returned for the bounded
+            task to inherit."""
             from gateway.run import _load_gateway_config
             from hermes_cli.plugins import discover_plugins, get_plugin_manager
             from gateway.platforms.api_server_b2b_execution import (
@@ -1388,8 +1342,7 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             """Runs INSIDE the one bounded worker, under the scope the
             bootstrap captured: the bound execution, THEN the plugin-owned
             preparation (the native read) and readiness — the only code the
-            source budget and the abandoned count cover. The ContextVar is
-            always reset."""
+            source budget covers. The ContextVar is always reset."""
             from agent.b2b_execution import bind_execution, reset_execution
             from gateway.platforms.api_server_b2b_execution import (
                 b2b_execution_unavailable_code)
@@ -1404,43 +1357,27 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                     reset_execution(token)
             except Exception:
                 return "execution_unavailable"
-        # ONE bootstrap per canonical home, held off the API loop AND the
-        # default executor entirely: the bounded NON-preparation runner owns
-        # the wait on its own ``_REQUEST_TTL_S`` budget (never the
-        # ``_SOURCE_DEADLINE_S`` native-read budget). The slot is reserved
-        # BEFORE the worker exists and released only by the worker's real
-        # exit — a timed-out or cancelled launch still leaves its bootstrap
-        # excluded until the callback itself finishes.
-        bootstrap_key = hermes_home_key(home)
-        bootstrap_slot = _try_reserve_bootstrap(bootstrap_key)
-        if bootstrap_slot is None:
-            return _deny(503, "execution_unavailable")
-
-        def _bootstrap_guarded():
-            try:
-                return _bootstrap()
-            finally:
-                _release_bootstrap(bootstrap_key, bootstrap_slot)
-
+        # The launch bootstrap, held off the API loop AND the default
+        # executor entirely: the bounded NON-preparation runner owns the
+        # wait on its own ``_REQUEST_TTL_S`` budget (never the
+        # ``_SOURCE_DEADLINE_S`` native-read budget). No capacity admission
+        # gates this request — a budget expiry fails THIS launch closed,
+        # nothing else.
         try:
             bootstrap_error, config, scope_ctx = await run_bounded_context_operation(
-                _bootstrap_guarded, timeout=_REQUEST_TTL_S)
+                _bootstrap, timeout=_REQUEST_TTL_S)
         except B2BTerminalRefusal:
             return _deny(503, "execution_unavailable")
         except Exception:
-            # The spawn itself failed before the worker could own the slot —
-            # release is identity-checked, a no-op when the worker ran.
-            _release_bootstrap(bootstrap_key, bootstrap_slot)
             return _deny(503, "execution_unavailable")
         if bootstrap_error == "non_plugin_hook_subscribers":
             return _deny(503, "non_plugin_hook_subscribers")
         if bootstrap_error is not None:
             return _deny(503, "execution_unavailable")
         try:
-            # The task — and therefore the worker it spawns and the abandon
-            # count it may raise — run under the scope captured above: the
-            # owning profile's home, secrets and terminal scope without a
-            # second hydration.
+            # The task — and therefore the worker it spawns — runs under the
+            # scope captured above: the owning profile's home, secrets and
+            # terminal scope without a second hydration.
             preparation_task = scope_ctx.run(
                 _a.create_task,
                 run_bounded_context_preparation(_prepare))
@@ -1449,9 +1386,6 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             preparation_error = "execution_unavailable"
         if preparation_error is not None:
             return _deny(503, "execution_unavailable")
-        limited = adapter._concurrency_limited_response()
-        if limited is not None:
-            return limited
     # Signed proof can expire while session/DB checks were awaited: re-verify the
     # freshness window on BOTH envelopes immediately before the durable commit —
     # same predicate the CAS/seal paths apply to their own source reads.
@@ -1460,8 +1394,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                (resolved["_signed_request"], resolved["_signed_response"])):
         return _deny(403, "source_denied")
     if existing_attempt is None:
-        # Same non-hydrating scope as the early stuck gate — introspection
-        # only, never plugin secret-source code on the loop.
+        # Non-hydrating scope entry — introspection only, never plugin
+        # secret-source code on the loop.
         try:
             with _profile_runtime_scope(home, hydrate_secrets=False):
                 from hermes_cli.plugins import get_plugin_manager

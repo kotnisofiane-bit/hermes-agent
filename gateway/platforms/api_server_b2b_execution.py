@@ -167,9 +167,8 @@ def b2b_execution_unavailable_code(project: Any, config: Optional[Mapping]) -> O
     consult. ``None`` only when ``b2b_execution_ready`` opens the lane for
     THIS attempt's bound capability. Codes: ``execution_inputs_unavailable``
     for a preparation hole, ``c1_producer_unavailable`` when the installed
-    producer itself is absent/disabled, ``context_preparation_stuck`` when the
-    producer is present but the home's abandoned native reads already hit the
-    bound, ``c1_context_required`` when the producer is present but no
+    producer itself is absent/disabled, ``c1_context_required`` when the
+    producer is present but no
     CURRENT mission-scoped context proof is bound to this capability — the
     ordinary state for health checks, which carry no mission binding and can
     never turn ``ready`` on presence alone."""
@@ -178,11 +177,9 @@ def b2b_execution_unavailable_code(project: Any, config: Optional[Mapping]) -> O
     if not b2b_execution_inputs_ready(project, config):
         return "execution_inputs_unavailable"
     from gateway.platforms.api_server_b2b_context import (
-        context_preparation_stuck, producer_available)
+        producer_available)
     if not producer_available():
         return "c1_producer_unavailable"
-    if context_preparation_stuck():
-        return "context_preparation_stuck"
     return "c1_context_required"
 
 
@@ -211,21 +208,19 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
     serving config (A→B→A), and reported ``not-ready`` — never ``ready`` —
     with a typed code: ``execution_inputs_unavailable`` for any preparation
     hole (including empty profiles/projects and evaluation errors),
-    ``c1_producer_unavailable`` when the producer is absent,
-    ``context_preparation_stuck`` when the home's abandoned reads hit the
-    bound, and ``c1_context_required`` when it is present without a current
-    mission proof. The aggregate uses that fail-closed order."""
+    ``c1_producer_unavailable`` when the producer is absent, and
+    ``c1_context_required`` when it is present without a current mission
+    proof. The aggregate uses that fail-closed order."""
     state = _state_for(adapter)
     if state is None or not state.config.enabled:
         return {"b2b_execution": "not-configured", "b2b_execution_code": None,
                 "b2b_execution_profiles": {}}
-    # Fail-closed ordering: a preparation hole beats a missing producer, a
-    # missing producer beats a stuck preparation gate, and that beats "no
-    # current mission proof" — health carries no capability binding, so
-    # ``ready``/``None`` codes are unreachable here by construction (no
-    # source/model probe is performed either).
+    # Fail-closed ordering: a preparation hole beats a missing producer,
+    # and that beats "no current mission proof" — health carries no
+    # capability binding, so ``ready``/``None`` codes are unreachable here
+    # by construction (no source/model probe is performed either).
     severity = {"execution_inputs_unavailable": 0, "c1_producer_unavailable": 1,
-                "context_preparation_stuck": 2, "c1_context_required": 3}
+                "c1_context_required": 2}
     profiles: Dict[str, Any] = {}
     # Pure introspection: every owning-profile scope below is entered WITHOUT
     # plugin secret-source hydration — a blocked global hydration lock (e.g.

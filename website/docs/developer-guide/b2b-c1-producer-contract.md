@@ -55,7 +55,7 @@ Installed configuration, plugin presence, valid schema hashes and an inert
 constructor remain preparation, not evidence of readiness. A lane without a
 current mission-scoped proof reports `not-ready` with a typed code
 (`execution_inputs_unavailable`, `c1_producer_unavailable`,
-`context_preparation_stuck`, or `c1_context_required`) — health evaluation
+or `c1_context_required`) — health evaluation
 performs no plugin discovery or
 probe and cannot leak ambient execution state. A missing, crossed, stale,
 future-dated, late or otherwise unqualified source fails closed with
@@ -83,28 +83,31 @@ delay or another TTL.
 The POST's signed envelopes are checked again immediately before durable
 admission. Their short expiry does not govern preparation or publication after
 admission. Source authority is renewed by `before_provider`; the OC observation
-bound is never renewed. Typed preparation refusals reach the durable attempt
-classification without being replaced by a fixed `context_unavailable` reason.
-New attempts check capacity before native preparation and again afterwards,
-without reserving a slot; durable replay keeps its existing bypass.
+bound is never renewed: the attached preparation's `source_deadline_ms` is
+re-verified on the host immediately before the durable seal commit — pure
+timestamp arithmetic, never a plugin callback — so an observation that
+crosses its own bound during final validation or across the host-resume
+seam refuses `context_oc_source_stale` instead of sealing. Typed
+preparation refusals reach the durable attempt classification without
+being replaced by a fixed `context_unavailable` reason.
 
-The only preparation state the lane budgets is the ABANDONED native read — a
-worker whose caller already walked away when the standing source deadline
-passed (a late completion can never attach). Per canonical `hermes_home_key`,
-once 2 such orphaned workers exist (`_MAX_ABANDONED_PREPARATIONS`), NEW
-launches on that home are refused `503 execution_unavailable` before any
-discovery or native read, and health reports `context_preparation_stuck`
-until an orphan actually exits — the worker's own `finally` is the only
-release. Healthy reads never count, however many run concurrently, and the
-bound never consults `max_concurrent_runs`: it bites identically at 0.
-Known limitation: the bound gates new work only — it never kills or
-serializes reads already started, so several reads begun together can all
-become abandoned together and push the count past the cap; the gate then
-holds until enough orphans exit. A second known limitation is slow
-discovery: plugin discovery runs before the native source deadline starts,
-bounded only by the per-plugin loader timeout (10s), so a producer that is
-slow to discover delays every attempt's first read without tripping any
-preparation bound; no code extends that timer.
+Every B2B plugin operation in the launch and seal path runs inside its own
+daemon worker under `copy_context`, off the asyncio loop and off the
+loop's default executor, under an explicit per-request deadline judged on
+the worker's own finish instant: the bootstrap (secret-source hydration,
+gateway config, plugin discovery — `_REQUEST_TTL_S`), the native
+`prepare_context` read (`_SOURCE_DEADLINE_S`), and the seal-time
+recheck/source/policy validation. A request whose worker misses its
+deadline is refused — that request alone — and the daemon is never killed:
+its late result is discarded when the worker finally exits and can mint no
+durable artifact. There is no cross-request accounting: no abandoned
+counts, no stuck health state, no single-flight admission, and no
+interaction with the generic `/v1/runs` limiter — siblings on one home
+bootstrap and prepare concurrently. Known limitation: plugin discovery
+runs before the native source deadline starts, bounded only by the
+per-plugin loader timeout (10s), so a producer that is slow to discover
+delays every attempt's first read without tripping any preparation bound;
+no code extends that timer.
 
 `/1` OC receipts and view/capture instants are never
 source observation and refuse as `context_oc_unqualified`. Preparation also
@@ -244,6 +247,22 @@ tests; and any readiness claim from installed plugins, ambient capability or
 operator inputs alone. Merely supplying all operator inputs or changing
 health status cannot open execution — only a current, mission-scoped,
 source-fresh native proof bound to the attempt's own capability can.
+
+## Deferred scope (P2-cap)
+
+Removed from this change and explicitly deferred — none of these exists in
+the current lane:
+
+- **Bootstrap stuck health/recovery.** No `context_preparation_stuck`
+  health code and no health-side recovery for a bootstrap that outlives
+  its bound; the timed-out launch is refused and its worker's late result
+  is discarded.
+- **External `API_SERVER_KEY` recovery after hydration failure.**
+  Secret-source hydration that fails inside the bounded bootstrap refuses
+  that launch; recovering external key state is not revisited here.
+- **Expired-turn qualification/classification.** Turn-window expiry during
+  dispatch/finalization keeps its existing refusal classification; a
+  distinct qualification lane is deferred.
 
 ## Recorded verification
 
