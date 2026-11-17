@@ -101,9 +101,13 @@ recheck/source/policy validation. A request whose worker misses its
 deadline is refused — that request alone — and the daemon is never killed:
 its late result is discarded when the worker finally exits and can mint no
 durable artifact. There is no cross-request accounting: no abandoned
-counts, no stuck health state, no single-flight admission, and no
-interaction with the generic `/v1/runs` limiter — siblings on one home
-bootstrap and prepare concurrently. Known limitation: plugin discovery
+counts, no stuck health state, no single-flight admission, and no new B2B
+capacity gate — siblings on one home bootstrap and prepare concurrently.
+The inherited generic API admission (`gateway.api_server.max_concurrent_runs`, the same
+`429 rate_limit_exceeded` the other run routes apply) still guards a NEW
+attempt at its original place, after bounded preparation and before the
+signed-proof freshness recheck and durable admission; a durable replay
+bypasses it exactly as it always has. Known limitation: plugin discovery
 runs before the native source deadline starts, bounded only by the
 per-plugin loader timeout (10s), so a producer that is slow to discover
 delays every attempt's first read without tripping any preparation bound;

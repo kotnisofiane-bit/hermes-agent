@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -261,45 +260,3 @@ async def test_launch_rechecks_raw_hooks_added_during_preparation(
     assert len(preparations) == 1
     assert admission._store_counts(case.store) == before
     assert case.adapter._session_db.get_session(case.session_id)["title"] is None
-
-
-@pytest.mark.asyncio
-async def test_launch_refuses_real_concurrency_saturation_before_native_reads(
-        tmp_path, monkeypatch, opened):
-    case = _new_launch(tmp_path, monkeypatch, opened)
-    capacity_gate = asyncio.Event()
-    capacity_task = asyncio.create_task(capacity_gate.wait())
-    case.adapter._max_concurrent_runs = 1
-    case.adapter._active_run_tasks["run_test_capacity"] = capacity_task
-    from gateway.platforms import api_server_b2b_context as b2b_context
-
-    prepare_calls = []
-    native_read_calls = []
-
-    def _forbidden_prepare(*args, **kwargs):
-        prepare_calls.append((args, kwargs))
-        raise AssertionError("native preparation must not run at capacity")
-
-    def _forbidden_native_read(*args, **kwargs):
-        native_read_calls.append((args, kwargs))
-        raise AssertionError("native read must not run at capacity")
-
-    monkeypatch.setattr(
-        b2b_context, "_prepare_b2b_context", _forbidden_prepare)
-    monkeypatch.setattr(
-        b2b_context, "run_bounded_context_preparation", _forbidden_native_read)
-    before = admission._store_counts(case.store)
-
-    try:
-        response = await _launch(case)
-
-        assert response.status == 429
-        assert json.loads(response.body)["error"]["code"] == "rate_limit_exceeded"
-        assert prepare_calls == []
-        assert native_read_calls == []
-        assert admission._store_counts(case.store) == before
-        assert case.adapter._session_db.get_session(case.session_id)["title"] is None
-    finally:
-        capacity_gate.set()
-        await capacity_task
-        case.adapter._active_run_tasks.pop("run_test_capacity", None)

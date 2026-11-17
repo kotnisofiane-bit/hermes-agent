@@ -1386,6 +1386,12 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             preparation_error = "execution_unavailable"
         if preparation_error is not None:
             return _deny(503, "execution_unavailable")
+    if existing_attempt is None:
+        # Inherited generic API admission, kept at
+        # its original place — not a B2B capacity gate.
+        limited = adapter._concurrency_limited_response()
+        if limited is not None:
+            return limited
     # Signed proof can expire while session/DB checks were awaited: re-verify the
     # freshness window on BOTH envelopes immediately before the durable commit —
     # same predicate the CAS/seal paths apply to their own source reads.
