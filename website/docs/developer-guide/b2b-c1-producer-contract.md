@@ -66,9 +66,9 @@ non-measured or otherwise unqualified receipt, a captured rather than
 observed instant, a crossed or stale memory-context read, a render/bounds or
 schema/contract refusal, configuration drift, or any other
 `B2BTerminalRefusal` — and so does any untyped exception there
-(`gateway/platforms/api_server_b2b.py:1371-1375`). The single exception is
-`503 context_oc_source_stale`, relayed verbatim. Host code raises it at
-exactly three sites, all reachable before admission:
+(`gateway/platforms/api_server_b2b.py:1371-1375`). The only cause `_prepare`
+does not rewrite is `context_oc_source_stale`, relayed verbatim: host code
+raises it at exactly three sites, all reachable before admission:
 
 - the `/2` projection's age/instant coherence, checked by
   `_native_oc_read_metadata` (`agent/b2b_execution.py:225-229`) from
