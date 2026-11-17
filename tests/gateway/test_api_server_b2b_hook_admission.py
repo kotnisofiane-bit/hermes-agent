@@ -120,7 +120,7 @@ async def test_launch_refuses_non_plugin_outbound_hook_before_preparation(
     from gateway.platforms import api_server_b2b_context as b2b_context
 
     prepare_calls = []
-    monkeypatch.setattr(b2b_context, "prepare_b2b_context",
+    monkeypatch.setattr(b2b_context, "_prepare_b2b_context",
                         lambda *args, **kwargs: prepare_calls.append(args))
     monkeypatch.setattr(execution_lane.b2b, "_spawn_run", _forbidden("_spawn_run"))
     monkeypatch.setattr(case.adapter, "_create_agent", _forbidden("_create_agent"))
@@ -152,7 +152,7 @@ async def test_launch_refuses_non_plugin_shell_hook_without_execution(
     from gateway.platforms import api_server_b2b_context as b2b_context
 
     prepare_calls = []
-    monkeypatch.setattr(b2b_context, "prepare_b2b_context",
+    monkeypatch.setattr(b2b_context, "_prepare_b2b_context",
                         lambda *args, **kwargs: prepare_calls.append(args))
     monkeypatch.setattr(execution_lane.b2b, "_spawn_run", _forbidden("_spawn_run"))
     monkeypatch.setattr(case.adapter, "_create_agent", _forbidden("_create_agent"))
@@ -180,7 +180,7 @@ async def test_launch_refuses_raw_sentinel_on_unknown_hook(
         manager._hooks.setdefault("unknown_admission_probe", []).append(
             lambda **kwargs: None)
     prepare_calls = []
-    monkeypatch.setattr(b2b_context, "prepare_b2b_context",
+    monkeypatch.setattr(b2b_context, "_prepare_b2b_context",
                         lambda *args, **kwargs: prepare_calls.append(args))
     monkeypatch.setattr(execution_lane.b2b, "_spawn_run", _forbidden("_spawn_run"))
     before = admission._store_counts(case.store)
@@ -218,7 +218,7 @@ async def test_launch_allows_only_plugin_registered_hooks(
                      profile):
         return SimpleNamespace()
 
-    monkeypatch.setattr(b2b_context, "prepare_b2b_context", _prepare)
+    monkeypatch.setattr(b2b_context, "_prepare_b2b_context", _prepare)
     monkeypatch.setattr(execution_lane.b2b, "_spawn_run", _spawn)
 
     response = await _launch(case)
@@ -250,7 +250,7 @@ async def test_launch_rechecks_raw_hooks_added_during_preparation(
             "late_raw_admission_probe", []).append(lambda **kwargs: None)
         return execution_lane._UnitPreparation(cap)
 
-    monkeypatch.setattr(b2b_context, "prepare_b2b_context", _prepare)
+    monkeypatch.setattr(b2b_context, "_prepare_b2b_context", _prepare)
     monkeypatch.setattr(execution_lane.b2b, "_spawn_run", _forbidden("_spawn_run"))
     before = admission._store_counts(case.store)
 
@@ -285,7 +285,7 @@ async def test_launch_refuses_real_concurrency_saturation_before_native_reads(
         raise AssertionError("native read must not run at capacity")
 
     monkeypatch.setattr(
-        b2b_context, "prepare_b2b_context", _forbidden_prepare)
+        b2b_context, "_prepare_b2b_context", _forbidden_prepare)
     monkeypatch.setattr(
         b2b_context, "_bounded_native_read", _forbidden_native_read)
     before = admission._store_counts(case.store)

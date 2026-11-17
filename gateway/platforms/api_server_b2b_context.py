@@ -20,11 +20,13 @@ no preflight publish and reads no provider credentials.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Tuple
+from time import monotonic as _monotonic
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from agent.b2b_execution import (
     B2BTerminalRefusal, BoundExecution, CONTEXT_MAX_BYTES, _deep_freeze,
@@ -100,16 +102,19 @@ def producer_available() -> bool:
         return False
 
 
-def _bounded_native_read(cap: BoundExecution):
-    """The preparation's native read, bounded off-loop by the standing source
-    budget (pattern: ``recheck_context``). The callback runs on a daemon
-    thread under ``copy_context``; the caller Event-waits the budget and is
-    the ONLY attacher — a late completion can never admit anything. A caller
-    whose budget expires marks its worker abandoned against this home's
-    bounded count; a home already at ``_MAX_ABANDONED_PREPARATIONS`` orphans
-    refuses NEW reads ``context_preparation_stuck`` before any thread is
-    spawned."""
-    budget = _SOURCE_DEADLINE_S
+def _start_preparation(callback):
+    """Spawn THIS preparation's ONE native worker — a daemon thread running
+    ``callback`` under ``copy_context`` — and hand back ``(done, outcome,
+    abandon)``:
+
+    * ``done`` is set only when the worker TRULY exits;
+    * ``outcome`` carries ``{"value": ...}`` or ``{"error": BaseException}``;
+    * ``abandon()`` — idempotent, under ``_ABANDONED_LOCK`` — counts a
+      still-running worker against this home's bound exactly once.
+
+    The worker's own finally is the ONLY decrement, and a home already at
+    ``_MAX_ABANDONED_PREPARATIONS`` orphans refuses ``context_preparation_stuck``
+    before any thread is spawned."""
     home = hermes_home_key()
     # Per-call bookkeeping shared with the worker's finally, always under the
     # module lock: the worker frees this call's slot only if the caller
@@ -124,15 +129,7 @@ def _bounded_native_read(cap: BoundExecution):
 
     def _invoke() -> None:
         try:
-            found = _context_provider(discover=True)
-            if found is None:
-                raise B2BTerminalRefusal("context_unavailable")
-            manager, prepare = found
-            result = prepare(execution=cap)
-            if (not isinstance(result, Mapping)
-                    or not callable(result.get("validate_configuration"))):
-                raise B2BTerminalRefusal("context_unavailable")
-            outcome["value"] = result, manager, prepare
+            outcome["value"] = callback()
         except BaseException as exc:  # noqa: BLE001 -- normalized below
             outcome["error"] = exc
         finally:
@@ -148,20 +145,90 @@ def _bounded_native_read(cap: BoundExecution):
                         _ABANDONED_PREPARATIONS.pop(home, None)
             done.set()
 
-    threading.Thread(target=lambda: invoke_context.run(_invoke), daemon=True).start()
-    if not done.wait(budget):
+    def _abandon() -> None:
+        """The caller walked away while the worker still runs: count the
+        orphan ONCE — the worker's real exit performs the only decrement."""
         with _ABANDONED_LOCK:
-            if not state["finished"]:
+            if not state["finished"] and not state["abandoned"]:
                 state["abandoned"] = True
                 _ABANDONED_PREPARATIONS[home] = (
                     _ABANDONED_PREPARATIONS.get(home, 0) + 1)
-        raise B2BTerminalRefusal("context_unavailable")
+
+    threading.Thread(target=lambda: invoke_context.run(_invoke), daemon=True).start()
+    return done, outcome, _abandon
+
+
+def _preparation_result(outcome: Dict[str, Any]) -> Any:
+    """ONE normalization shared by both waiters: a typed refusal propagates
+    as-is; every other BaseException collapses to ``context_unavailable``."""
     exc = outcome.get("error")
     if exc is not None:
         if isinstance(exc, B2BTerminalRefusal):
             raise exc
         raise B2BTerminalRefusal("context_unavailable") from None
     return outcome["value"]
+
+
+def _bounded_native_read(cap: BoundExecution, *,
+                         callback: Optional[Callable[[], Any]] = None):
+    """The bounded preparation for SYNC callers (pattern: ``recheck_context``):
+    ``done.wait`` the standing source budget (``_SOURCE_DEADLINE_S``) on the
+    worker ``_start_preparation`` spawned. ``callback`` defaults to the
+    standing native read — ``_invoke_producer(cap)`` returning
+    ``(result, manager, prepare)``. A budget expiry marks the worker abandoned
+    and refuses ``context_unavailable`` — the caller is the ONLY attacher, a
+    late completion can never admit anything."""
+    if callback is None:
+        callback = lambda: _invoke_producer(cap)
+    done, outcome, abandon = _start_preparation(callback)
+    if not done.wait(_SOURCE_DEADLINE_S):
+        abandon()
+        raise B2BTerminalRefusal("context_unavailable")
+    return _preparation_result(outcome)
+
+
+async def run_bounded_context_preparation(callback):
+    """The SAME bounded preparation for the ASYNC launch path: await the
+    worker's ``done`` Event WITHOUT an executor and without a nested worker —
+    a monotonic deadline over a <=10 ms poll. A budget expiry marks the
+    worker abandoned and refuses ``context_unavailable``; a task cancellation
+    marks it the same way (the daemon is never killed — it stays counted
+    until its true exit) and propagates."""
+    deadline = _monotonic() + _SOURCE_DEADLINE_S
+    done, outcome, abandon = _start_preparation(callback)
+    try:
+        while not done.is_set():
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                abandon()
+                raise B2BTerminalRefusal("context_unavailable")
+            await asyncio.sleep(min(0.01, remaining))
+        if _monotonic() >= deadline:
+            # Fail closed: a result read past the budget refuses even if the
+            # worker finished just inside it.
+            abandon()
+            raise B2BTerminalRefusal("context_unavailable")
+    except BaseException:
+        # Cancellation (or any unwinding past the budget) counts the
+        # still-running worker — abandon() is idempotent.
+        abandon()
+        raise
+    return _preparation_result(outcome)
+
+
+def _invoke_producer(cap: BoundExecution):
+    """The native read itself — discovery + the profile's single owned
+    ``prepare_context`` callback + the result-shape gate. May only run inside
+    a bounded worker. Returns ``(result, manager, prepare)``."""
+    found = _context_provider(discover=True)
+    if found is None:
+        raise B2BTerminalRefusal("context_unavailable")
+    manager, prepare = found
+    result = prepare(execution=cap)
+    if (not isinstance(result, Mapping)
+            or not callable(result.get("validate_configuration"))):
+        raise B2BTerminalRefusal("context_unavailable")
+    return result, manager, prepare
 
 
 def _source_observed_ms(plain: Mapping[str, Any]) -> Tuple[int, int]:
@@ -286,17 +353,12 @@ class _PreparedContext:
             raise B2BTerminalRefusal("context_stale")
 
 
-def prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) -> _PreparedContext:
-    """Read + qualify the mission's context for THIS capability via the
-    profile's ``prepare_context`` callback, inside the standing source
-    budget. Returns the frozen preparation (the CALLER decides whether to
-    attach it — a late result attaches nothing) or raises
-    ``B2BTerminalRefusal`` — the caller maps it to ``execution_unavailable``.
-
-    No durable write, no admission, no agent, no provider call, no
-    ``publish_context``: this is source preparation only — actual publication
-    stays in the real ``pre_llm_call`` hook on the admitted worker's turn.
-    """
+def _prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) -> _PreparedContext:
+    """The preparation BODY — unbounded: it may only run inside the worker a
+    bounded runner (``_bounded_native_read`` /
+    ``run_bounded_context_preparation``) spawned, where the profile scope and
+    the bound execution ContextVar are already installed. The native read AND
+    every configuration validator execute on that one worker."""
     if not isinstance(cap, BoundExecution) or getattr(cap, "sink", None) is None:
         raise B2BTerminalRefusal("context_unavailable")
 
@@ -306,7 +368,7 @@ def prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) -> 
     if str(get_hermes_home().resolve()) != cap.policy_get("profile_home"):
         raise B2BTerminalRefusal("b2b_policy_changed")
 
-    result, manager, prepare = _bounded_native_read(cap)
+    result, manager, prepare = _invoke_producer(cap)
     view, rendered = result.get("view"), result.get("rendered")
     if not isinstance(view, Mapping):
         raise B2BTerminalRefusal("context_unavailable")
@@ -353,6 +415,21 @@ def prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) -> 
     # The plugin's configuration must not have drifted during the read.
     prepared.assert_current(cap)
     return prepared
+
+
+def prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) -> _PreparedContext:
+    """Read + qualify the mission's context for THIS capability via the
+    profile's ``prepare_context`` callback, inside the standing source
+    budget. Returns the frozen preparation (the CALLER decides whether to
+    attach it — a late result attaches nothing) or raises
+    ``B2BTerminalRefusal`` — the caller maps it to ``execution_unavailable``.
+
+    No durable write, no admission, no agent, no provider call, no
+    ``publish_context``: this is source preparation only — actual publication
+    stays in the real ``pre_llm_call`` hook on the admitted worker's turn.
+    """
+    return _bounded_native_read(
+        cap, callback=lambda: _prepare_b2b_context(cap, resolved=resolved))
 
 
 def assert_prepared_context_current(cap: Optional[BoundExecution], project: Any) -> None:

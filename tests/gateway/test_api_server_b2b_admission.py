@@ -772,7 +772,7 @@ async def test_b2b_proposal_post_replays_durable_attempt_before_readiness_guard(
             monkeypatch.setattr(
                 b2b_exec, "b2b_execution_inputs_ready", lambda *a, **k: True)
             monkeypatch.setattr(
-                b2b_ctx, "prepare_b2b_context",
+                b2b_ctx, "_prepare_b2b_context",
                 lambda cap, *, resolved: SimpleNamespace(
                     cap=cap, assert_current=lambda c: None,
                     assert_configuration_current=lambda: True,
@@ -789,8 +789,8 @@ async def test_b2b_proposal_post_replays_durable_attempt_before_readiness_guard(
             adapter._max_concurrent_runs = 1
             adapter._inflight_agent_runs = 1
             monkeypatch.setattr(
-                b2b_ctx, "prepare_b2b_context",
-                _tripwire("prepare_b2b_context"))
+                b2b_ctx, "_prepare_b2b_context",
+                _tripwire("_prepare_b2b_context"))
 
             # Lost-ACK retry against the CLOSED lane: replayed, not refused.
             resp = await post()
@@ -849,7 +849,7 @@ async def test_b2b_proposal_post_refuses_429_when_capacity_full(
                 assert_configuration_current=lambda: True,
                 assert_publication=lambda c, r: None)
 
-        monkeypatch.setattr(b2b_ctx, "prepare_b2b_context", _tracking_prepare)
+        monkeypatch.setattr(b2b_ctx, "_prepare_b2b_context", _tracking_prepare)
         if when == "before_prepare":
             adapter._inflight_agent_runs = 1
 

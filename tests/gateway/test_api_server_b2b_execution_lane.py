@@ -1535,7 +1535,7 @@ async def test_launch_prepare_refusal_denies_with_no_writes(
     def _refuse(cap, *, resolved):
         raise B2BTerminalRefusal("source_window_closed")
 
-    monkeypatch.setattr(b2b_ctx, "prepare_b2b_context", _refuse)
+    monkeypatch.setattr(b2b_ctx, "_prepare_b2b_context", _refuse)
     for target in ("_spawn_run",):
         monkeypatch.setattr(b2b, target, _adm_tripwire(target))
     monkeypatch.setattr(adapter, "_create_agent", _adm_tripwire("_create_agent"))
@@ -1676,7 +1676,7 @@ async def test_launch_attaches_preparation_to_winning_cap(
         captured["cap"] = cap
         return SimpleNamespace()  # stand-in task; never awaited by callers
 
-    monkeypatch.setattr(b2b_ctx, "prepare_b2b_context", _prepare)
+    monkeypatch.setattr(b2b_ctx, "_prepare_b2b_context", _prepare)
     monkeypatch.setattr(b2b, "_spawn_run", _spawn)
     store = adapter._run_idempotency_store
     response = await b2b._launch_b2b_run(
@@ -2230,7 +2230,7 @@ async def test_launch_concurrency_check_order(
         prepares.append(cap)
         return _UnitPreparation(cap)
 
-    monkeypatch.setattr(b2b_ctx, "prepare_b2b_context", _prepare)
+    monkeypatch.setattr(b2b_ctx, "_prepare_b2b_context", _prepare)
     monkeypatch.setattr(b2b, "_spawn_run", _adm_tripwire("_spawn_run"))
     limited = web.Response(status=429, text="capacity")
     calls = iter([limited] if position == "early" else [None, limited])

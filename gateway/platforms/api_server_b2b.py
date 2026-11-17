@@ -1248,10 +1248,14 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         # NEW launches too — refuse before discovery/preparation spends
         # another doomed read. Durable replays bypass this gate entirely,
         # and a scope-entry failure fails closed on the same typed refusal.
+        # hydrate_secrets=False: a full _profile_scope re-entry could run
+        # plugin secret-source code on the loop; the home is already fixed
+        # and db/home-verified above.
         from gateway.platforms.api_server_b2b_context import (
-            context_preparation_stuck)
+            context_preparation_stuck, run_bounded_context_preparation)
+        from gateway.run import _profile_runtime_scope
         try:
-            with adapter._profile_scope(profile):
+            with _profile_runtime_scope(home, hydrate_secrets=False):
                 preparation_stuck = context_preparation_stuck()
         except Exception:
             return _deny(503, "execution_unavailable")
@@ -1268,12 +1272,14 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             sink=sink, created_at=time.time())
 
         def _prepare() -> Optional[str]:
-            """Off-loop: owning profile scope + the bound execution, THEN
-            config/inputs/producer/readiness — the ContextVar is always reset."""
+            """Runs INSIDE the one bounded native worker: owning profile
+            scope (secret hydration included) + the bound execution, THEN
+            config/inputs/producer/readiness — all under the source budget.
+            The ContextVar is always reset."""
             from agent.b2b_execution import bind_execution, reset_execution
             from gateway.platforms.api_server_b2b_execution import (
                 b2b_execution_inputs_ready, b2b_execution_unavailable_code)
-            from gateway.platforms.api_server_b2b_context import prepare_b2b_context
+            from gateway.platforms.api_server_b2b_context import _prepare_b2b_context
             try:
                 with adapter._profile_scope(profile):
                     token = bind_execution(cap)
@@ -1287,14 +1293,17 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                             return "non_plugin_hook_subscribers"
                         if not b2b_execution_inputs_ready(project, config):
                             return "execution_inputs_unavailable"
-                        sink._context_preparation = prepare_b2b_context(
+                        sink._context_preparation = _prepare_b2b_context(
                             cap, resolved=resolved)
                         return b2b_execution_unavailable_code(project, config)
                     finally:
                         reset_execution(token)
             except Exception:
                 return "execution_unavailable"
-        preparation_error = await _a.to_thread(_prepare)
+        try:
+            preparation_error = await run_bounded_context_preparation(_prepare)
+        except B2BTerminalRefusal:
+            preparation_error = "execution_unavailable"
         if preparation_error == "non_plugin_hook_subscribers":
             return _deny(503, "non_plugin_hook_subscribers")
         if preparation_error is not None:
@@ -1310,8 +1319,10 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                (resolved["_signed_request"], resolved["_signed_response"])):
         return _deny(403, "source_denied")
     if existing_attempt is None:
+        # Same non-hydrating scope as the early stuck gate — introspection
+        # only, never plugin secret-source code on the loop.
         try:
-            with adapter._profile_scope(profile):
+            with _profile_runtime_scope(home, hydrate_secrets=False):
                 from hermes_cli.plugins import get_plugin_manager
 
                 has_non_plugin_hooks = (

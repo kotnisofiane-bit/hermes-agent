@@ -38,7 +38,18 @@ PREP_BARRIER = None
 PREP_EXIT = threading.Event()
 PREP_WORKER_THREADS = []
 
+# Validator probe state: the gated validator below blocks inside the plugin's
+# OWN validate_configuration — call number VAL_BLOCK_CALL of a preparation
+# parks on VAL_GATE (after VAL_BARRIER, when set) — so a launch can be held
+# inside a validator rather than inside the native read itself.
+VAL_GATE = threading.Event()
+VAL_WORKER_THREADS = []   # (preparation_index, call_index, Thread)
+VAL_BLOCK_CALL = 0        # which validate_configuration call parks; 0 = none
+VAL_BARRIER = None
+VAL_PROBE_LOCK = threading.Lock()
+
 _PRODUCER_PLUGIN_NAME = "stuck-producer"
+_VALIDATOR_PLUGIN_NAME = "stuck-validator"
 _PREPARATION_STAMP = "stamp-capacity"
 
 # Same contract as execution_lane._FAKE_PLUGIN_INIT, but the callback parks
@@ -79,13 +90,57 @@ def register(ctx):
     ctx.register_hook("pre_llm_call", lambda **kwargs: None)
 '''
 
+# Same producer, but its native read answers FAST and the park point moves
+# into the returned validate_configuration: call VAL_BLOCK_CALL of THIS
+# preparation's validator blocks (VAL_BARRIER rendezvous first, when set),
+# so the preparation is held hostage AFTER its read already produced a view.
+_GATED_VALIDATOR_INIT = '''\
+def register(ctx):
+    def prepare_context(*, execution):
+        import threading as _threading
+        from agent.b2b_execution import B2BTerminalRefusal
+        from tests.gateway import test_api_server_b2b_context_capacity as probe
+        from tests.gateway.b2b_process_harness import (
+            UNIT_RENDERED, build_unit_native_oc_view)
+        with probe.VAL_PROBE_LOCK:
+            index = len(probe.PREP_WORKER_THREADS)
+            probe.PREP_WORKER_THREADS.append(_threading.current_thread())
+        stamp = ctx.get_config("preparation_stamp")
+        calls = [0]
+
+        def validate_configuration():
+            calls[0] += 1
+            probe.VAL_WORKER_THREADS.append(
+                (index, calls[0], _threading.current_thread()))
+            if calls[0] == probe.VAL_BLOCK_CALL:
+                barrier = probe.VAL_BARRIER
+                if barrier is not None:
+                    barrier.wait(timeout=15.0)
+                probe.VAL_GATE.wait(timeout=30.0)
+            if ctx.get_config("preparation_stamp") != stamp:
+                raise B2BTerminalRefusal("b2b_policy_changed")
+            return True
+
+        view = build_unit_native_oc_view(
+            execution.policy, {"mission_source_digest": "c" * 64},
+            ordered=True)
+        return {"view": view, "rendered": UNIT_RENDERED,
+                "validate_configuration": validate_configuration}
+    ctx.register_hook("prepare_context", prepare_context)
+    ctx.register_hook("pre_llm_call", lambda **kwargs: None)
+'''
+
 
 def _reset_probe():
     PREP_GATE.clear()
     PREP_ENTERED.clear()
     PREP_EXIT.clear()
+    VAL_GATE.clear()
     globals()["PREP_BARRIER"] = None
+    globals()["VAL_BARRIER"] = None
+    globals()["VAL_BLOCK_CALL"] = 0
     del PREP_WORKER_THREADS[:]
+    del VAL_WORKER_THREADS[:]
 
 
 def _assert_refused_503(response):
@@ -98,6 +153,13 @@ def _install_gated_producer(profile_home):
         profile_home, name=_PRODUCER_PLUGIN_NAME, init=_GATED_PLUGIN_INIT)
     execution_lane._plugin_config(
         profile_home, stamp=_PREPARATION_STAMP, names=(_PRODUCER_PLUGIN_NAME,))
+
+
+def _install_gated_validator(profile_home):
+    execution_lane._write_fake_plugin(
+        profile_home, name=_VALIDATOR_PLUGIN_NAME, init=_GATED_VALIDATOR_INIT)
+    execution_lane._plugin_config(
+        profile_home, stamp=_PREPARATION_STAMP, names=(_VALIDATOR_PLUGIN_NAME,))
 
 
 def _freeze_preparation_clock(monkeypatch):
@@ -281,7 +343,6 @@ async def test_healthy_concurrent_launches_never_count_toward_the_cap(
     the producer barrier and both admit, at every ``max_concurrent_runs``
     value — a preparation-side gate must never refuse a healthy launch, and
     the abandoned count stays zero throughout."""
-    from gateway.platforms import api_server_b2b_context as b2b_ctx
     from hermes_cli.plugins import discover_plugins
 
     case_a = _new_launch(tmp_path, monkeypatch, opened)
@@ -317,8 +378,7 @@ async def test_healthy_concurrent_launches_never_count_toward_the_cap(
             "both launches' workers never entered the producer")
         assert len(set(PREP_WORKER_THREADS)) == 2
         # Both workers healthy and still running: the abandoned count stays 0.
-        if hasattr(b2b_ctx, "abandoned_preparation_count"):
-            assert _abandoned_count(adapter, "hub") == 0
+        assert _abandoned_count(adapter, "hub") == 0
         await asyncio.to_thread(barrier.wait, 10)
         r1, r2 = await asyncio.gather(t1, t2)
     finally:
@@ -328,8 +388,7 @@ async def test_healthy_concurrent_launches_never_count_toward_the_cap(
     assert getattr(r1, "status", None) == 200, r1
     assert getattr(r2, "status", None) == 200, r2
     assert len(spawned) == 2
-    if hasattr(b2b_ctx, "abandoned_preparation_count"):
-        assert _abandoned_count(adapter, "hub") == 0
+    assert _abandoned_count(adapter, "hub") == 0
 
 
 @pytest.mark.asyncio
@@ -428,9 +487,7 @@ async def test_system_exit_producer_normalizes_to_context_unavailable(
         _assert_refused_503(response)
         assert PREP_ENTERED.is_set()
         _join_prep_workers()
-        from gateway.platforms import api_server_b2b_context as b2b_ctx
-        if hasattr(b2b_ctx, "abandoned_preparation_count"):
-            assert _abandoned_count(adapter, "hub") == 0
+        assert _abandoned_count(adapter, "hub") == 0
 
         # Next launch, healthy producer with the gate open: full admit.
         PREP_EXIT.clear()
@@ -450,7 +507,6 @@ async def test_cancelled_launch_orphans_its_worker_until_it_exits(
     not kill the native-read worker — it becomes an abandoned preparation,
     counted until the worker actually exits; a follow-up launch after the
     orphan drains admits normally."""
-    from gateway.platforms import api_server_b2b_context as b2b_ctx
     from hermes_cli.plugins import discover_plugins
 
     case = _new_launch(tmp_path, monkeypatch, opened)
@@ -476,13 +532,12 @@ async def test_cancelled_launch_orphans_its_worker_until_it_exits(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert spawned == []
-    # The orphaned worker abandons itself once its own read budget ends.
-    if hasattr(b2b_ctx, "abandoned_preparation_count"):
-        deadline = time.monotonic() + 10.0
-        while _abandoned_count(adapter, "hub") == 0 and (
-                time.monotonic() < deadline):
-            await asyncio.sleep(0.02)
-        assert _abandoned_count(adapter, "hub") == 1
+    # The orphaned worker is counted as abandoned once its caller walked away.
+    deadline = time.monotonic() + 10.0
+    while _abandoned_count(adapter, "hub") == 0 and (
+            time.monotonic() < deadline):
+        await asyncio.sleep(0.02)
+    assert _abandoned_count(adapter, "hub") == 1
     # One orphan does NOT block the gate: the next launch's worker must
     # reach the producer too — then complete once the gate opens.
     second = asyncio.create_task(_launch(case))
@@ -495,8 +550,7 @@ async def test_cancelled_launch_orphans_its_worker_until_it_exits(
     finally:
         PREP_GATE.set()
         _join_prep_workers()
-    if hasattr(b2b_ctx, "abandoned_preparation_count"):
-        assert _abandoned_count(adapter, "hub") == 0
+    assert _abandoned_count(adapter, "hub") == 0
     second_response = await second
     assert getattr(second_response, "status", None) == 200, second_response
 
@@ -572,3 +626,237 @@ async def test_health_classification_orders_inputs_then_producer_then_stuck(
     finally:
         PREP_GATE.set()
         _join_prep_workers()
+
+
+def _install_multi_b2b_state(adapter, lane, *names):
+    """Rebind the adapter's b2b state so health evaluates ALL named homes —
+    with operator inputs that are actually ON DISK (the ready lane's contract
+    root + My Work roots) so the stuck code can surface past inputs."""
+    from gateway.platforms.api_server_b2b import _B2BState, validate_b2b_config
+    extra = admission._b2b_extra(*names)
+    for _name in names:
+        _project = extra["b2b"]["profiles"][_name]["projects"]["b2b-bench"]
+        _project["context_contract_root"] = (
+            lane.project["context_contract_root"])
+        _project["project_context"] = dict(
+            lane.project["project_context"],
+            project_id=_project["project_id"])
+    adapter._b2b_state = _B2BState(validate_b2b_config(extra))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block_call", [1, 2])
+async def test_blocked_validator_abandons_the_whole_preparation(
+        tmp_path, monkeypatch, opened, block_call):
+    """The plugin's ``validate_configuration`` — the initial
+    ``prepared.assert_current`` call (block_call=1) OR the readiness
+    re-validation (block_call=2) — parks inside the SAME bounded worker as
+    the native read: once the source budget expires the WHOLE preparation
+    is abandoned as a unit (503 + one counted orphan), never only its read
+    phase. At the bound the early gate refuses NEW launches without
+    spending a read, health names ``context_preparation_stuck`` /
+    ``c1_context_required`` WITHOUT another validator call, B still admits
+    on its own home, and once the orphans actually exit A admits again."""
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    from gateway.platforms.api_server_b2b_execution import (
+        b2b_execution_status)
+    from hermes_cli.plugins import discover_plugins
+
+    case_a = _new_launch(tmp_path, monkeypatch, opened)
+    case_a.db = case_a.adapter._session_db
+    adapter = case_a.adapter
+    adapter._max_concurrent_runs = 0
+    _install_multi_b2b_state(adapter, case_a.lane, "hub", "ci")
+    case_b = _profile_case(
+        tmp_path, monkeypatch, opened, adapter, case_a.lane, "ci", "c")
+
+    _freeze_preparation_clock(monkeypatch)
+    # A source budget far under the test's external timeout: the launch must
+    # refuse on ITS OWN bound, not on the harness's patience.
+    monkeypatch.setattr(b2b_ctx, "_SOURCE_DEADLINE_S", 0.2)
+    _install_gated_validator(case_a.profile_home)
+    # B keeps an ordinary working producer — it must admit while A is stuck.
+    execution_lane._write_fake_plugin(case_b.profile_home, name="ci-producer")
+    execution_lane._plugin_config(case_b.profile_home, names=("ci-producer",))
+    with adapter._profile_scope("hub"):
+        discover_plugins()
+    with adapter._profile_scope("ci"):
+        discover_plugins()
+
+    _reset_probe()
+    globals()["VAL_BLOCK_CALL"] = block_call
+    spawned = []
+    monkeypatch.setattr(
+        execution_lane.b2b, "_spawn_run", _spawn_recorder(spawned))
+    before = admission._store_counts(case_a.store)
+    changes_before = case_a.store._conn.total_changes
+
+    try:
+        # Each launch abandons ONE preparation — the native read answered
+        # fast; the validator parked the whole worker past the budget.
+        response = await asyncio.wait_for(
+            _launch_profile(case_a, "hub"), timeout=2.0)
+        _assert_refused_503(response)
+        assert _abandoned_count(adapter, "hub") == 1
+        response = await asyncio.wait_for(
+            _launch_profile(case_a, "hub"), timeout=2.0)
+        _assert_refused_503(response)
+        assert _abandoned_count(adapter, "hub") == 2
+
+        # Thread identity: within EACH preparation, prepare_context and its
+        # every validate_configuration call ran on the ONE same worker.
+        per_preparation = {}
+        for index, _call, thread in VAL_WORKER_THREADS:
+            per_preparation.setdefault(index, set()).add(thread)
+        assert per_preparation and all(
+            threads == {PREP_WORKER_THREADS[index]}
+            for index, threads in per_preparation.items())
+
+        # At the bound the early gate refuses BEFORE any read — the prepare
+        # call count stays put — and health classifies purely by
+        # introspection: no extra validator call on either home.
+        reads_before = len(PREP_WORKER_THREADS)
+        validator_calls_before = len(VAL_WORKER_THREADS)
+        _assert_refused_503(await _launch_profile(case_a, "hub"))
+        assert len(PREP_WORKER_THREADS) == reads_before
+        status = b2b_execution_status(adapter)
+        assert status["b2b_execution_profiles"]["hub"]["code"] == (
+            "context_preparation_stuck")
+        assert status["b2b_execution_profiles"]["ci"]["code"] == (
+            "c1_context_required")
+        request = SimpleNamespace(
+            headers={"Authorization": "Bearer " + admission._API_KEY})
+        detailed = await adapter._handle_health_detailed(request)
+        assert detailed.status == 200
+        profiles = json.loads(detailed.body)["b2b_execution_profiles"]
+        assert profiles["hub"]["code"] == "context_preparation_stuck"
+        assert len(VAL_WORKER_THREADS) == validator_calls_before
+
+        # No binding/attempt/run/title/provider side effect while stuck, and
+        # B still admits on its own home.
+        assert admission._store_counts(case_a.store) == before
+        assert case_a.store._conn.total_changes == changes_before
+        assert case_a.db.get_session(case_a.session_id)["title"] is None
+        assert spawned == []
+        response_b = await _launch_profile(case_b, "ci")
+        assert response_b.status == 200, response_b.body
+    finally:
+        # Even on timeout/assertion: release every parked validator and join
+        # every real worker — nothing outlives the test.
+        VAL_GATE.set()
+        _join_prep_workers()
+
+    assert _abandoned_count(adapter, "hub") == 0
+    response = await _launch_profile(case_a, "hub")
+    assert response.status == 200, response.body
+    assert case_a.db.get_session(case_a.session_id)["title"] == (
+        "B2B " + case_a.session_id)
+
+
+def test_blocked_validators_cannot_starve_the_default_executor(
+        tmp_path, monkeypatch, opened):
+    """Eight preparations parked inside their plugin's validator must not
+    consume a SINGLE default-executor slot: a REAL generic
+    /api/sessions/{id} route on ANOTHER profile keeps answering through
+    asyncio.to_thread + SessionDB while all eight are still blocked. The
+    eight launches then hit their (large) source budget together — eight
+    counted orphans, over the bound because already-started reads are never
+    capped — and every count drains once the workers truly exit."""
+    asyncio.run(_executor_starvation_scenario(tmp_path, monkeypatch, opened))
+
+
+async def _executor_starvation_scenario(tmp_path, monkeypatch, opened):
+    from concurrent.futures import ThreadPoolExecutor
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+    from hermes_cli.plugins import discover_plugins
+
+    # Bound the loop's default executor to exactly the launch count: if a
+    # preparation parked on it, the executor would be FULL — deterministic.
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=8))
+    case_a = _new_launch(tmp_path, monkeypatch, opened)
+    case_a.db = case_a.adapter._session_db
+    adapter = case_a.adapter
+    adapter._max_concurrent_runs = 0
+    case_b = _profile_case(
+        tmp_path, monkeypatch, opened, adapter, case_a.lane, "ci", "c")
+    # The session lives ONLY in ci's own database — the separation proof.
+    case_b.db.create_session("ci_plain_session", "api_server")
+    assert case_a.db.get_session("ci_plain_session") is None
+    # A's launches carry their explicit db; with the adapter's default db
+    # dropped, the generic route must follow the existing per-home cache.
+    adapter._session_db = None
+
+    _freeze_preparation_clock(monkeypatch)
+    # A generous budget: the eight preparations must still be parked when the
+    # generic route answers, and all eight must refuse as a group only once
+    # the budget genuinely expires.
+    monkeypatch.setattr(b2b_ctx, "_SOURCE_DEADLINE_S", 5.0)
+    _install_gated_validator(case_a.profile_home)
+    with adapter._profile_scope("hub"):
+        discover_plugins()
+
+    _reset_probe()
+    globals()["VAL_BLOCK_CALL"] = 1
+    # The barrier lets ALL eight validators enter before any parks on the
+    # gate — genuinely simultaneous orphans, not a serialization artefact.
+    globals()["VAL_BARRIER"] = threading.Barrier(8)
+    monkeypatch.setattr(
+        execution_lane.b2b, "_spawn_run", _spawn_recorder([]))
+
+    app = web.Application()
+
+    async def _ci_get_session(request):
+        with adapter._profile_scope("ci"):
+            return await adapter._handle_get_session(request)
+
+    app.router.add_get("/p/ci/api/sessions/{session_id}", _ci_get_session)
+
+    tasks = [asyncio.create_task(_launch_profile(case_a, "hub"))
+             for _ in range(8)]
+    try:
+        deadline = time.monotonic() + 10.0
+        while len(VAL_WORKER_THREADS) < 8 and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        assert len(VAL_WORKER_THREADS) == 8
+        assert len({entry[2] for entry in VAL_WORKER_THREADS}) == 8
+
+        # A REAL generic route on another profile keeps serving while the
+        # validators hold their workers — its to_thread/SessionDB hop must
+        # not queue behind preparation.
+        async with TestClient(TestServer(app)) as client:
+            response = await asyncio.wait_for(
+                client.get(
+                    "/p/ci/api/sessions/ci_plain_session",
+                    headers={
+                        "Authorization": "Bearer " + admission._API_KEY}),
+                timeout=2.0)
+            assert response.status == 200
+            payload = await response.json()
+        assert payload["session"]["id"] == "ci_plain_session"
+
+        # Thread identity holds under the fix — asserted AFTER the route so a
+        # tree without it fails on the starvation it is meant to prove.
+        assert all(
+            entry[2] is PREP_WORKER_THREADS[entry[0]]
+            for entry in VAL_WORKER_THREADS)
+
+        responses = await asyncio.wait_for(
+            asyncio.gather(*tasks), timeout=15.0)
+        for refused in responses:
+            _assert_refused_503(refused)
+        # The bound refuses NEW preparations; eight already-started reads may
+        # all be abandoned at once — the exact contract, never clamped.
+        assert _abandoned_count(adapter, "hub") == 8
+    finally:
+        # ALWAYS release — even on timeout — so no worker outlives the test.
+        VAL_GATE.set()
+        if VAL_BARRIER is not None:
+            VAL_BARRIER.abort()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        _join_prep_workers()
+        adapter._close_cached_session_dbs()
+
+    assert _abandoned_count(adapter, "hub") == 0
