@@ -568,43 +568,36 @@ def _no_memory_view(policy):
     return reseal_unit_context_view(view)
 
 
-@pytest.mark.parametrize("mutation,reason", [
-    (None, None), ("memory_dict", "context_memory_unexpected"),
-    ("memory_null", "context_memory_unexpected"),
-    ("accepted_context", "context_memory_unexpected"),
-    ("missing_mode", "context_memory_mode"),
-    ("bad_mode", "context_memory_mode"),
-    ("namespaces", "context_namespaces"),
-    ("coverage", "context_memory_mode"),
-    ("coverage_unhashable", "context_memory_mode"),
-    ("relation_count", "context_relation_bounds"),
-    ("relation_count_bool", "context_relation_bounds"),
+@pytest.mark.parametrize("mutate,reason", [
+    pytest.param(lambda view: None, None, id="qualified"),
+    pytest.param(lambda view: view.update(memory={}),
+                 "context_memory_unexpected", id="memory-dict"),
+    pytest.param(lambda view: view.update(memory=None),
+                 "context_memory_unexpected", id="memory-null"),
+    pytest.param(lambda view: view.update(accepted_context={}),
+                 "context_memory_unexpected", id="accepted-context"),
+    pytest.param(lambda view: view.pop("memory_mode"),
+                 "context_memory_mode", id="missing-mode"),
+    pytest.param(lambda view: view.update(memory_mode="required"),
+                 "context_memory_mode", id="bad-mode"),
+    pytest.param(lambda view: view.update(namespaces_searched=["ns"]),
+                 "context_namespaces", id="namespaces"),
+    pytest.param(lambda view: view["coverage"]["capabilities"].append("memory"),
+                 "context_memory_mode", id="coverage"),
+    pytest.param(lambda view: view["coverage"].update(
+                     capabilities=[{}, "operational_context"]),
+                 "context_memory_mode", id="coverage-unhashable"),
+    pytest.param(lambda view: view["bounds"].update(relation_count=1),
+                 "context_relation_bounds", id="relation-count"),
+    pytest.param(lambda view: view["bounds"].update(relation_count=False),
+                 "context_relation_bounds", id="relation-count-bool"),
 ])
-def test_no_memory_context_qualification_and_recorded_proof(mutation, reason):
+def test_no_memory_context_qualification_and_recorded_proof(mutate, reason):
     policy = _unit_policy()
     policy["project"]["memory_mode"] = "none"
     cap = _cap(policy=policy)
     view = _no_memory_view(cap.policy)
-    if mutation == "memory_dict":
-        view["memory"] = {}
-    elif mutation == "memory_null":
-        view["memory"] = None
-    elif mutation == "accepted_context":
-        view["accepted_context"] = {}
-    elif mutation == "missing_mode":
-        del view["memory_mode"]
-    elif mutation == "bad_mode":
-        view["memory_mode"] = "required"
-    elif mutation == "namespaces":
-        view["namespaces_searched"] = ["ns"]
-    elif mutation == "coverage":
-        view["coverage"]["capabilities"].append("memory")
-    elif mutation == "coverage_unhashable":
-        view["coverage"]["capabilities"] = [{}, "operational_context"]
-    elif mutation == "relation_count":
-        view["bounds"]["relation_count"] = 1
-    elif mutation == "relation_count_bool":
-        view["bounds"]["relation_count"] = False
+    mutate(view)
     reseal_unit_context_view(view)
     if reason is not None:
         for qualify in (lambda: be.qualify_context_view(cap, view),

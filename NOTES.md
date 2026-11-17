@@ -185,3 +185,52 @@ Les references de cette section correspondent aux SHA de base ci-dessus.
   non justifie. origin/main toujours au SHA de base (comparaison 0/0).
 - Rapport final ecrit APRES les tests et la revue ; prochaine operation :
   commit/push de feat/b2b-context-no-memory puis creation d'une seule PR.
+- Reprise post-review (retour inline 4604053935) :
+  - `test_no_memory_context_qualification_and_recorded_proof` refactorise :
+    parametres `mutate` callables + `reason` + ids pytest explicites,
+    suppression du dispatch par nom (regle ladder >=4). Assertions et
+    `reseal_unit_context_view` inchanges ; aucun invariant ajoute/retire.
+  - Verification : `TMPDIR=/srv/dubsar-lots/b2b-l14-nomem/tmp scripts/run_tests.sh -j 1 --file-retries 0 tests/agent/test_b2b_execution.py tests/gateway/test_api_server_b2b_memory_mode.py`
+    -> 108 reussis, 0 echec en 13.5 s. Journal :
+    `/srv/dubsar-lots/b2b-l14-nomem/evidence/review_table_checks.log`.
+- Runtime natif provisionne dans le lot (`native-runtime/`), isole :
+  - `native-runtime/mywork` = dubsar-my-work @ `526f2c76`, `deps.lock.json`
+    resolu par `scripts/bootstrap-deps.mjs` (sources locales) :
+    `.deps/dubsar-memory` @ `c7886578`, `.deps/dubsar-contracts-*` @
+    `9044b1b1`/`448c1c04`/`59e93bb9`, `npm ci --ignore-scripts` atteste pour
+    `dubsar-contracts-b2b-mission-identity`. `packages/` = symlinks pins.
+  - `native-runtime/contracts` = dubsar-contracts @ `9044b1b1fd38` (detache).
+  - `native-runtime/sources-memory` = clone source dubsar-memory.
+  - `packages/dubsar-workbench-launcher` : `npm ci --ignore-scripts` (pg 8.16.3
+    via son package-lock versionne) — seule dependance JS externe du repo.
+  - PostgreSQL 16.10 (`/opt/dubsar-tools/pg`) : `initdb -A trust -U lotrunner`
+    dans `native-runtime/pgdata`, ecoute `127.0.0.1:25432` (>=20000), socket
+    `native-runtime/pgsock`, log `native-runtime/pg.log`. Instance jetable du
+    lot, aucune DB partagee : les fixtures creent/droppent leurs bases
+    `p2_*`. Arret : `/opt/dubsar-tools/pg/bin/pg_ctl -D /srv/dubsar-lots/b2b-l14-nomem/native-runtime/pgdata stop`.
+  - Node `/opt/dubsar-tools/node24/bin/node` v24.19.0 (binaire machine,
+    lecture seule). Runtime JSON : `native-runtime/.p2-native-runtime.json`.
+  - Premier essai : 9 erreurs d'amorcage kernel, `Cannot find module 'pg'`
+    (dependance workbench-launcher non installee) ; correction env ci-dessus
+    (un seul `npm ci` pinned), kernel verifie manuellement (ready +
+    helper.sock + migrations PG).
+  - Commande exacte :
+    `B2B_TEST_MY_WORK_ROOT=/srv/dubsar-lots/b2b-l14-nomem/native-runtime TMPDIR=/srv/dubsar-lots/b2b-l14-nomem/tmp timeout --kill-after=10s 890s scripts/run_tests.sh -j 1 --file-retries 0 --include-integration -m 'integration or not integration' tests/gateway/test_api_server_b2b_native.py`
+    -> 9 reussis, 0 echec, 0 skip en 39.4 s. Journal :
+    `/srv/dubsar-lots/b2b-l14-nomem/evidence/native_provisioned.log`.
+    Le parcours natif reel (kernel OC + PG + helper + producteur profile
+    patche par le fixture) s'execute ; cela ne livre pas le producteur
+    `none` natif, hors perimetre inchange.
+- Revue du correctif de reprise terminee et acceptee : mutateurs en table,
+  memes invariants, production inchangee. Retour inline 4604053935 traite ;
+  reponse publiee sur la PR13 (discussion_r4604150683).
+- Preuves finales : 108 tests des deux fichiers renforces reussis apres
+  refactorisation ; 9 tests natifs reussis, sans skip, sur runtime isole.
+  PostgreSQL du lot arrete proprement apres verification ; donnees et logs
+  conserves, aucune suppression. Aucun processus du lot laisse actif.
+- Controle Vision reitere avant push : principes 1/3/4/5/6/9/10/11 respectes
+  dans le perimetre, citations de preuve actualisees. origin/main reste au
+  SHA de base. La CI distante comporte encore des jobs en attente : seule
+  la verification locale terminee est revendiquee.
+- Rapport actualise en DERNIERE ecriture apres ces notes et l'arret du
+  runtime. Publication du correctif sur la PR existante13, aucune nouvelle PR.

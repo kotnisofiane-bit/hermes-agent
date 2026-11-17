@@ -4,7 +4,7 @@
 
 - Depot : `kotnisofiane-bit/hermes-agent`.
 - Base : `71b87d463e5b88ed76d70fb5edea961d06c07e4d` (`main`).
-- Branche : `feat/b2b-context-no-memory`, une seule PR vers `main`, sans fusion.
+- Branche : `feat/b2b-context-no-memory`, PR unique https://github.com/kotnisofiane-bit/hermes-agent/pull/13 vers `main`, sans fusion.
 - Decision produit du 16 novembre 2026 : premier parcours sans memoire ni RAG.
 - Inventaire prealable fichier:ligne et historique de verification : `NOTES.md`.
 
@@ -53,12 +53,31 @@ Les journaux bruts restent dans le dossier du lot `../evidence/`.
 | Meme commande apres implementation | GREEN : 17 reussis | `../evidence/green.log` |
 | Suites ciblees, 8 fichiers de tests + repertoire natif demande | 549 reussis, 0 echec | `../evidence/final_unit.log` |
 | Complements de preuve apres revue, 2 fichiers complets | 108 reussis, 0 echec | `../evidence/review_checks.log` |
-| Integration native explicitement selectionnee | 9 ignores : runtime My Work non provisionne | `../evidence/native_integration.log` |
+| Revue : mutateurs directement dans pytest.param, 2 fichiers complets | 108 reussis, 0 echec | `../evidence/review_table_checks.log` |
+| Integration native avant provisionnement (historique) | 9 ignores : runtime My Work non provisionne | `../evidence/native_integration.log` |
+| Integration native apres provisionnement isole | 9 reussis, 0 echec, 0 ignore | `../evidence/native_provisioned.log` |
 | `git diff --check` | propre | controle final de la passe de revue |
 
 Les 108 tests sont une reexecution des deux fichiers renforces, pas 108 tests
 supplementaires a additionner aux 549. Les complements ne modifient pas le code
 de production deja couvert par les suites.
+
+La reprise de revue remplace uniquement le dispatch par nom des mutations par
+une table de mutateurs callables, conforme a `AGENTS.md:252-253`. Les 108 tests
+des deux fichiers ont ete rejoues avec succes, invariants inchanges. Le retour
+inline 4604053935 est traite sur la meme PR. Aucune modification de production
+n'intervient dans cette reprise ; les suites deja vertes restent applicables.
+
+Le runtime natif est maintenant provisionne dans `../native-runtime/` : My Work
+`526f2c76`, Contracts `9044b1b1`, dependances aux pins de `deps.lock.json`, profil
+source clean `05d7394c78f9761f1d4c6f2d4805e6e9a0042e18`, Node24 et PostgreSQL16.10.
+Les 9 cas natifs ont tous ete executes avec succes, sans skip, sur une instance
+jetable du lot a `127.0.0.1:25432`, sans service partage ni Docker. Un premier
+amorcage avait echoue faute du module `pg` ; l'installation verrouillee des
+dependances du runtime resout ce blocage, sans changement des tests ni des pins.
+PostgreSQL est arrete proprement apres verification ; les donnees et journaux
+restent dans le lot. Ce parcours natif teste le producteur historique : il ne
+livre pas le producteur natif `none`, qui reste hors perimetre.
 
 Couverture : `tests/agent/test_b2b_execution.py`, nouveau
 `tests/gateway/test_api_server_b2b_memory_mode.py`, suites existantes timeout,
@@ -85,9 +104,10 @@ producteur DOUBLE. Ce n'est pas une preuve du futur producteur externe.
 - Le lecteur My Work B2B appartient a un lot separe : aucune implementation ici.
 - Le producteur natif `none` n'est pas livre dans cette PR. Le profil actuel
   n'enregistre pas le hook de preparation ; le chemin installe reste ferme.
-- `B2B_TEST_MY_WORK_ROOT` est absent : les 9 cas natifs sont ignores explicitement,
-  pas declares verts. Aucun runtime PostgreSQL/My Work ni base partagee n'a ete
-  fabrique pour contourner ce manque. Aucun E2E natif `none` n'est revendique.
+- Les 9 cas natifs passent apres provisionnement de `B2B_TEST_MY_WORK_ROOT` dans
+  le lot ; le skip initial est conserve comme historique, pas comme resultat
+  final. Aucun E2E natif `none` n'est revendique : seul le producteur historique
+  est disponible dans le fixture epingle. Aucune source partagee modifiee.
 - Aucun deploiement, modele reel, parcours navigateur Portal, affichage approbateur
   ou qualification de l'isolation reseau n'est revendique.
 - Aucun changement de `.github/workflows/`, aucun Docker/sudo, aucun nettoyage de
@@ -105,7 +125,7 @@ resolus par ce lot.
 | 3 | respecte | `gateway/platforms/api_server_b2b_execution.py:336-350` : aucun outil ni acces metier ajoute ; `gateway/platforms/api_server_b2b_context.py:157-182` refuse un ancien producteur avant invocation, sans nouveau client externe. |
 | 4 | respecte | `agent/b2b_execution.py:151-166,258-278` : le mode reste dans la base comparee ; `gateway/platforms/api_server_b2b.py:734-735` l'inclut dans la politique ; `gateway/platforms/api_server_b2b_context.py:217-234` conserve la fenetre OC. Aucune qualification de l'approbation Core ajoutee. |
 | 5 | respecte | `agent/b2b_execution.py:242-290,705-750` : empreintes et controle du mode dans les preuves ; `gateway/platforms/api_server_b2b.py:817-818,1088-1111` : refus classes et contexte exact persiste. |
-| 6 | respecte | `tests/agent/test_b2b_execution.py:618-632` : rendu exact et mode conserves dans le recu publie ; `gateway/platforms/api_server_b2b.py:1102-1106` conserve vue et rendu. Aucune nouvelle vue approbateur ni affichage modele/tokens revendique. |
+| 6 | respecte | `tests/agent/test_b2b_execution.py:611-625` : rendu exact et mode conserves dans le recu publie ; `gateway/platforms/api_server_b2b.py:1102-1106` conserve vue et rendu. Aucune nouvelle vue approbateur ni affichage modele/tokens revendique. |
 | 9 | respecte | `gateway/platforms/api_server_b2b_execution.py:331-350` : meme modele/provider/base_url du catalogue et aucune passerelle alternative ajoutee. |
 | 10 | respecte dans le perimetre Hermes | `agent/b2b_execution.py:713-735,800-806` : absence totale des blocs memoire et correspondance avec le choix operateur ; `tests/gateway/test_api_server_b2b_memory_mode.py:139-152,192` : zero E/S memoire/reseau du chemin teste. Pas de preuve de sandbox, du futur plugin externe ni de fermeture reseau de production. |
 | 11 | respecte | `website/docs/developer-guide/b2b-c1-producer-contract.md:252-308` : contrat, responsabilites et limites explicites ; RED/GREEN, suites et skips distingues dans ce rapport, aucune revendication de deploiement. |
@@ -117,8 +137,13 @@ n'est avance dans la grille produit.
 
 ## Cloture
 
-Revue du diff et controle Vision acceptes. `origin/main` est toujours au SHA de
-base au dernier controle (aucun ecart). `NOTES.md` est tenu ; ce rapport est la
-derniere modification de fichier du lot, apres implementation, tests et revue.
-Les operations restantes sont le commit, le push de la branche et l'ouverture de
-l'unique PR ; aucune fusion ni mise en production.
+Revue du diff, traitement du retour inline et controle Vision acceptes.
+`origin/main` reste au SHA de base au dernier controle. Les suites locales
+requises sont executees, y compris 9/9 cas natifs sans skip. La CI distante
+comporte encore des jobs en attente au dernier controle : aucune CI globale
+verte n'est revendiquee.
+
+`NOTES.md` est tenu ; ce rapport est la derniere modification de fichier du lot,
+apres implementation, tests, revue et arret du runtime. Les operations restantes
+sont le commit et le push du correctif puis l'actualisation de la PR13 existante ;
+aucune nouvelle PR, fusion ni mise en production.
