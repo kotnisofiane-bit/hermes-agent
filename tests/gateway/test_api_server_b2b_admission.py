@@ -776,7 +776,8 @@ async def test_b2b_proposal_post_replays_durable_attempt_before_readiness_guard(
                 lambda cap, *, resolved: SimpleNamespace(
                     cap=cap, assert_current=lambda c: None,
                     assert_configuration_current=lambda: True,
-                    assert_publication=lambda c, r: None))
+                    assert_publication=lambda c, r: None,
+                    source_deadline_ms=2 ** 62))
             resp = await post()
             assert resp.status == 200, await resp.text()
             first = await resp.json()

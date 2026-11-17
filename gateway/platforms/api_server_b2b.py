@@ -1000,6 +1000,8 @@ class _AttemptSink:
 
     def cas_dispatch(self, *, request_digest: str, receipt: Any,
                      rechecked_view: Optional[Mapping[str, Any]] = None) -> bool:
+        from gateway.platforms.api_server_b2b_context import (
+            assert_context_source_current)
         resolved = self._before_provider
         if (receipt is not self.context_receipt or resolved is None or
                 not self._matches_source(resolved) or not self._source_matches_context(resolved) or
@@ -1034,6 +1036,11 @@ class _AttemptSink:
             # genuinely committed dispatch marker).
             self.block("source_window_closed")
             raise B2BTerminalRefusal("source_window_closed")
+        try:
+            assert_context_source_current(self._context_preparation)
+        except B2BTerminalRefusal as exc:
+            self.block(str(exc))
+            raise
         return self._store.b2b_cas_dispatch(
             profile=self.profile, attempt_id=self.attempt_id,
             source_record=source_record, dispatch_record=dispatch_record)
@@ -1071,6 +1078,8 @@ class _AttemptSink:
 
     def put_context(self, receipt: Any) -> None:
         """Persist the published context (view + rendered bytes + digest) once."""
+        from gateway.platforms.api_server_b2b_context import (
+            assert_context_source_current)
         # The accepted receipt must BE the attached preparation's mission —
         # same cap, same configuration, same source basis, inside the OC window.
         preparation = self._context_preparation
@@ -1086,6 +1095,7 @@ class _AttemptSink:
             "run_id": self.run_id, **proof,
             "rendered": receipt.rendered.decode("utf-8"), "turn_id": receipt.turn_id,
             "rendered_digest": receipt.rendered_digest})
+        assert_context_source_current(preparation)
         if not self._store.b2b_commit_context(
                 profile=self.profile, attempt_id=self.attempt_id, payload=payload):
             raise B2BTerminalRefusal("context_commit_failed")
@@ -1184,6 +1194,8 @@ class _AttemptSink:
         async prepare→commit seam admits scheduling delay, so the window a
         timely preparation observed may have closed by commit. Pure
         timestamp arithmetic: no plugin callback, no revalidation."""
+        from gateway.platforms.api_server_b2b_context import (
+            assert_context_source_current)
         window = prepared["source_window"]
         now = time.time()
         if not all(env["issued_at"] <= now < env["expires_at"] for env in
@@ -1193,10 +1205,7 @@ class _AttemptSink:
         # host in the same breath — the seam lets the observation cross its
         # own governed bound between the last validation and this commit.
         # Pure timestamp comparison: no plugin callback, no _assert_stamp.
-        preparation = self._context_preparation
-        if (preparation is not None
-                and int(time.time() * 1000) >= preparation.source_deadline_ms):
-            raise B2BTerminalRefusal("context_oc_source_stale")
+        assert_context_source_current(self._context_preparation)
         stored = self._store.b2b_seal(
             profile=self.profile, attempt_id=self.attempt_id,
             artifacts=dict(prepared["artifacts"]))
@@ -1301,7 +1310,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     # Lost-ACK replay is allowed even while the original holds the final native worker slot.
     if existing_attempt is None:
         from gateway.platforms.api_server_b2b_context import (
-            run_bounded_context_operation, run_bounded_context_preparation)
+            assert_context_source_current, run_bounded_context_operation,
+            run_bounded_context_preparation)
         from gateway.run import _profile_runtime_scope
         # The sink + cap exist ONLY in memory until b2b_admit commits the
         # attempt — a failed preparation drops them with zero durable trace.
@@ -1352,9 +1362,15 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                 try:
                     sink._context_preparation = _prepare_b2b_context(
                         cap, resolved=resolved)
-                    return b2b_execution_unavailable_code(project, config)
+                    unavailable = b2b_execution_unavailable_code(
+                        project, config)
+                    assert_context_source_current(sink._context_preparation)
+                    return unavailable
                 finally:
                     reset_execution(token)
+            except B2BTerminalRefusal as exc:
+                return (str(exc) if str(exc) == "context_oc_source_stale"
+                        else "execution_unavailable")
             except Exception:
                 return "execution_unavailable"
         # The launch bootstrap, held off the API loop AND the default
@@ -1385,7 +1401,7 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         except B2BTerminalRefusal:
             preparation_error = "execution_unavailable"
         if preparation_error is not None:
-            return _deny(503, "execution_unavailable")
+            return _deny(503, preparation_error)
     if existing_attempt is None:
         # Inherited generic API admission, kept at
         # its original place — not a B2B capacity gate.
@@ -1412,16 +1428,23 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             return _deny(503, "execution_unavailable")
         if has_non_plugin_hooks:
             return _deny(503, "non_plugin_hook_subscribers")
+    binding_row = {"profile": profile, "session_id": session_id,
+                   "binding_digest": binding_digest,
+                   "policy_json": json_utf8(policy).decode("utf-8")}
+    attempt_row = {"attempt_id": attempt_id, "binding_digest": binding_digest,
+                   "profile": profile, "session_id": session_id, "status": "admitted",
+                   "run_id": run_id, "requester_id": resolved["requester_id"],
+                   "source_bind": _source_record(resolved)}
+    if cap is not None:
+        try:
+            assert_context_source_current(sink._context_preparation)
+        except B2BTerminalRefusal as exc:
+            return _deny(503, str(exc))
     outcome = store.b2b_admit(
         profile=profile, session_id=session_id, binding_digest=binding_digest,
         attempt_id=attempt_id, fingerprint=fingerprint,
-        binding_row={"profile": profile, "session_id": session_id,
-                     "binding_digest": binding_digest,
-                     "policy_json": json_utf8(policy).decode("utf-8")},
-        attempt_row={"attempt_id": attempt_id, "binding_digest": binding_digest,
-                     "profile": profile, "session_id": session_id, "status": "admitted",
-                     "run_id": run_id, "requester_id": resolved["requester_id"],
-                     "source_bind": _source_record(resolved)},
+        binding_row=binding_row,
+        attempt_row=attempt_row,
         run_scope=scope, run_key=attempt_id, run_id=run_id,
         run_fingerprint=fingerprint, run_status=initial_status,
         owner_pid=getattr(adapter, "_run_owner_pid", 0),

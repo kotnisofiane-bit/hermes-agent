@@ -209,6 +209,13 @@ def _assert_source_window(plain: Mapping[str, Any]) -> Tuple[int, int]:
     return observed_ms, deadline_ms
 
 
+def assert_context_source_current(preparation: Any) -> None:
+    """Host-only OC deadline check; never invoke the plugin at a commit."""
+    if (preparation is not None
+            and int(time.time() * 1000) >= preparation.source_deadline_ms):
+        raise B2BTerminalRefusal("context_oc_source_stale")
+
+
 @dataclass(frozen=True)
 class _PreparedContext:
     """The frozen proof bound to ONE capability's sink: the qualified view,
@@ -257,13 +264,13 @@ class _PreparedContext:
     def _assert_window(self) -> None:
         """The source's own observation deadline governs every gate; it is
         never extended by TTL or provider waiting."""
-        if int(time.time() * 1000) >= self.source_deadline_ms:
-            raise B2BTerminalRefusal("context_oc_source_stale")
+        assert_context_source_current(self)
 
     def assert_current(self, cap: Optional[BoundExecution]) -> None:
         self._assert_frame(cap)
         self._assert_window()
         self._assert_stamp()
+        self._assert_window()
 
     def assert_configuration_current(self) -> bool:
         """Recheck for the sink's policy gates (which run under the owning
@@ -274,6 +281,7 @@ class _PreparedContext:
         self._assert_frame(self.cap)
         self._assert_window()
         self._assert_stamp()
+        self._assert_window()
         return True
 
     def assert_publication(self, cap: Optional[BoundExecution], receipt: Any) -> None:
