@@ -106,7 +106,7 @@ def _registered_callbacks(hook_name: str) -> tuple[Callable[..., Any], ...]:
 def _dispatch_callbacks(hook_name: str) -> tuple[Callable[..., Any], ...]:
     try:
         from hermes_cli import plugins
-        return plugins.get_plugin_manager()._dispatch_hook_callbacks(hook_name)
+        return plugins.iter_hook_callbacks(hook_name)
     except Exception:
         logger.debug("plugin stream hook callback lookup failed: %s", hook_name, exc_info=True)
         return ()

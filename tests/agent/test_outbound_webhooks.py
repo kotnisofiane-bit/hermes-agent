@@ -626,16 +626,18 @@ def _mission_cap(tmp_path):
     return cap, sentinel
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("events", [
     ["prepare_context"], ["prepare_context", "pre_llm_call"]])
-def test_prepare_context_outbound_target_refused_fail_closed(
+async def test_prepare_context_outbound_target_refused_fail_closed(
         http_server, events, tmp_path, monkeypatch, caplog):
     """``prepare_context`` is a Python-plugin-only hook: a ``hooks.outbound``
     target naming it is rejected WHOLE (even beside valid events — no partial
     subscription), so a configured webhook can never be picked as the B2B
     producer and the BoundExecution's mission data never leaves the process."""
     from agent.b2b_execution import B2BTerminalRefusal
-    from gateway.platforms.api_server_b2b_context import _bounded_native_read
+    from gateway.platforms.api_server_b2b_context import (
+        _invoke_producer, run_bounded_context_preparation)
     from hermes_cli.plugins import get_plugin_manager
 
     monkeypatch.setattr(
@@ -645,7 +647,7 @@ def test_prepare_context_outbound_target_refused_fail_closed(
 
     cap, _sentinel = _mission_cap(tmp_path)
     with pytest.raises(B2BTerminalRefusal):
-        _bounded_native_read(cap)
+        await run_bounded_context_preparation(lambda: _invoke_producer(cap))
     outbound_webhooks.flush(timeout=5)
 
     # First: the webhook received NOTHING — on the unfixed parser it fires as
@@ -660,13 +662,15 @@ def test_prepare_context_outbound_target_refused_fail_closed(
         for record in caplog.records), caplog.text
 
 
-def test_rejected_outbound_target_leaves_plugin_producer_selectable(
+@pytest.mark.asyncio
+async def test_rejected_outbound_target_leaves_plugin_producer_selectable(
         http_server, tmp_path, monkeypatch):
     """A refused ``hooks.outbound`` entry must not count toward producer
     ambiguity either: exactly one ``PluginContext``-registered callback (its
     owner also registering ``pre_llm_call``) stays the provider — never
     first-wins next to a config-owned callback."""
-    from gateway.platforms.api_server_b2b_context import _bounded_native_read
+    from gateway.platforms.api_server_b2b_context import (
+        _invoke_producer, run_bounded_context_preparation)
     from hermes_cli.plugins import (
         PluginContext, PluginManifest, get_plugin_manager)
 
@@ -688,7 +692,8 @@ def test_rejected_outbound_target_leaves_plugin_producer_selectable(
     publisher_handle = ctx.register_hook("pre_llm_call", lambda **kw: None)
     try:
         cap, _s = _mission_cap(tmp_path)
-        result, found_manager, prepare = _bounded_native_read(cap)
+        result, found_manager, prepare = await run_bounded_context_preparation(
+            lambda: _invoke_producer(cap))
         assert calls == [cap]
         assert found_manager is manager
         assert prepare is _prepare

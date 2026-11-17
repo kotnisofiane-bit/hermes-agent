@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import dataclasses
 import hashlib
 import hmac
@@ -1205,11 +1206,14 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         return _deny(404, "not_found")
     # P2 admission gate: NEW work proves its mission context BEFORE the single
     # durable attempt is consumed — the sink/cap are built in memory first,
-    # then prepare_b2b_context does the real native read (the profile's
-    # prepare_context plugin callback, bound to THIS cap) inside the owning
-    # profile scope, attaches the frozen preparation to the sink, and only
-    # then is readiness (the same single classifier /health/detailed reports)
-    # consulted. Any source/producer error is 503 execution_unavailable with
+    # then the untimed bootstrap enters the owning profile scope (secret
+    # hydration included), loads the gateway config and discovers plugins,
+    # and only THEN does the one bounded worker run the plugin-owned
+    # preparation — the real native read (the profile's prepare_context
+    # plugin callback, bound to THIS cap) AND its configuration validators —
+    # inside the captured scope, attach the frozen preparation to the sink,
+    # and consult readiness (the same single classifier /health/detailed
+    # reports). Any source/producer error is 503 execution_unavailable with
     # NO binding/attempt/run/title/provider side effects — the in-memory
     # sink/cap are simply dropped. An already-durable attempt row is always
     # served by the idempotent replay below (b2b_admit -> _replayed_response),
@@ -1271,41 +1275,66 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             attempt_id=attempt_id, run_id=run_id, policy=dict(policy),
             sink=sink, created_at=time.time())
 
-        def _prepare() -> Optional[str]:
-            """Runs INSIDE the one bounded native worker: owning profile
-            scope (secret hydration included) + the bound execution, THEN
-            config/inputs/producer/readiness — all under the source budget.
-            The ContextVar is always reset."""
-            from agent.b2b_execution import bind_execution, reset_execution
+        def _bootstrap() -> Tuple[Optional[str], Any, Any]:
+            """Runs OUTSIDE the bounded worker — one untimed to_thread hop:
+            owning profile scope (secret hydration included), gateway config,
+            plugin discovery, and the non-plugin/inputs gates. Discovery and
+            hydration can legitimately take seconds; neither is plugin
+            PREPARATION code, so neither may spend the source budget or the
+            abandoned-preparation count. The scoped context is captured ONCE
+            and returned for the bounded task to inherit."""
+            from gateway.run import _load_gateway_config
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
             from gateway.platforms.api_server_b2b_execution import (
-                b2b_execution_inputs_ready, b2b_execution_unavailable_code)
-            from gateway.platforms.api_server_b2b_context import _prepare_b2b_context
+                b2b_execution_inputs_ready)
             try:
                 with adapter._profile_scope(profile):
-                    token = bind_execution(cap)
-                    try:
-                        from gateway.run import _load_gateway_config
-                        from hermes_cli.plugins import discover_plugins, get_plugin_manager
+                    config = _load_gateway_config()
+                    discover_plugins()
+                    if get_plugin_manager().has_non_plugin_hook_subscribers():
+                        return "non_plugin_hook_subscribers", None, None
+                    if not b2b_execution_inputs_ready(project, config):
+                        return "execution_inputs_unavailable", None, None
+                    return None, config, contextvars.copy_context()
+            except Exception:
+                return "execution_unavailable", None, None
 
-                        config = _load_gateway_config()
-                        discover_plugins()
-                        if get_plugin_manager().has_non_plugin_hook_subscribers():
-                            return "non_plugin_hook_subscribers"
-                        if not b2b_execution_inputs_ready(project, config):
-                            return "execution_inputs_unavailable"
-                        sink._context_preparation = _prepare_b2b_context(
-                            cap, resolved=resolved)
-                        return b2b_execution_unavailable_code(project, config)
-                    finally:
-                        reset_execution(token)
+        def _prepare() -> Optional[str]:
+            """Runs INSIDE the one bounded worker, under the scope the
+            bootstrap captured: the bound execution, THEN the plugin-owned
+            preparation (the native read) and readiness — the only code the
+            source budget and the abandoned count cover. The ContextVar is
+            always reset."""
+            from agent.b2b_execution import bind_execution, reset_execution
+            from gateway.platforms.api_server_b2b_execution import (
+                b2b_execution_unavailable_code)
+            from gateway.platforms.api_server_b2b_context import _prepare_b2b_context
+            try:
+                token = bind_execution(cap)
+                try:
+                    sink._context_preparation = _prepare_b2b_context(
+                        cap, resolved=resolved)
+                    return b2b_execution_unavailable_code(project, config)
+                finally:
+                    reset_execution(token)
             except Exception:
                 return "execution_unavailable"
+        bootstrap_error, config, scope_ctx = await _a.to_thread(_bootstrap)
+        if bootstrap_error == "non_plugin_hook_subscribers":
+            return _deny(503, "non_plugin_hook_subscribers")
+        if bootstrap_error is not None:
+            return _deny(503, "execution_unavailable")
         try:
-            preparation_error = await run_bounded_context_preparation(_prepare)
+            # The task — and therefore the worker it spawns and the abandon
+            # count it may raise — run under the scope captured above: the
+            # owning profile's home, secrets and terminal scope without a
+            # second hydration.
+            preparation_task = scope_ctx.run(
+                _a.create_task,
+                run_bounded_context_preparation(_prepare))
+            preparation_error = await preparation_task
         except B2BTerminalRefusal:
             preparation_error = "execution_unavailable"
-        if preparation_error == "non_plugin_hook_subscribers":
-            return _deny(503, "non_plugin_hook_subscribers")
         if preparation_error is not None:
             return _deny(503, "execution_unavailable")
         limited = adapter._concurrency_limited_response()

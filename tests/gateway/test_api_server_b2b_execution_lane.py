@@ -1125,7 +1125,7 @@ def test_health_detailed_reports_b2b_not_ready_off_loop(
 # P2 — context preparation + proof-driven readiness + hook receipt enforcement
 #
 # The producer plugin is NOT installed under the unit homes below, so
-# prepare_b2b_context's real fail-closed refusal is exercised directly; the
+# _prepare_b2b_context's real fail-closed refusal is exercised directly; the
 # preparation OBJECT is stubbed where marked UNIT (attachment plumbing only —
 # no readiness is faked through the production gate).
 # ---------------------------------------------------------------------------
@@ -1319,15 +1319,18 @@ def test_pre_llm_hook_ordinary_lane_unchanged(tmp_path, monkeypatch):
     lane.store.close()
 
 
-# --- prepare_b2b_context / prepared_context_ready / producer_available ------
+# --- _prepare_b2b_context / prepared_context_ready / producer_available ----
 
-def test_prepare_b2b_context_refuses_without_producer(tmp_path):
+@pytest.mark.asyncio
+async def test_bounded_preparation_refuses_without_producer(tmp_path):
     """Real call, real failure: no installed dubsar-agent-context under this
     home -> typed context_unavailable, and NOTHING is attached to the sink."""
-    from gateway.platforms.api_server_b2b_context import prepare_b2b_context
+    from gateway.platforms.api_server_b2b_context import (
+        _prepare_b2b_context, run_bounded_context_preparation)
     lane = _ready_lane(tmp_path)
     with pytest.raises(B2BTerminalRefusal) as exc:
-        prepare_b2b_context(lane.cap, resolved=lane.resolved)
+        await run_bounded_context_preparation(
+            lambda: _prepare_b2b_context(lane.cap, resolved=lane.resolved))
     assert str(exc.value) == "context_unavailable"
     assert lane.sink._context_preparation is None
     lane.store.close()
@@ -1567,7 +1570,7 @@ async def test_launch_prepare_refusal_denies_with_no_writes(
     "raw_direct_callback"])
 async def test_launch_refuses_producer_without_plugin_owned_pair(
         tmp_path, monkeypatch, opened, scenario):
-    """REAL plugin discovery (no stubbed prepare_b2b_context): only a
+    """REAL plugin discovery (no stubbed _prepare_b2b_context): only a
     ``prepare_context`` registered through ``PluginContext.register_hook``
     whose SAME plugin also registered ``pre_llm_call`` may produce. Every
     other shape refuses 503 execution_unavailable BEFORE admission — no
@@ -1921,30 +1924,37 @@ def _prepare_resolved(now_s):
                                  "expires_at": now_s + 29}}
 
 
-def test_prepare_context_hook_generic_producer(tmp_path, fake_plugin_home):
+@pytest.mark.asyncio
+async def test_prepare_context_hook_generic_producer(tmp_path,
+                                                     fake_plugin_home):
     """REAL discovery: an unrelated directory plugin registering
     ``prepare_context`` under THIS home supplies the mission view — the
-    returned preparation is bound to this cap and passes its own gates."""
+    returned preparation is bound to this cap and passes its own gates.
+    Discovery runs explicitly BEFORE the bounded call, as the production
+    bootstrap does."""
     from hermes_cli.plugins import discover_plugins
     from gateway.platforms import api_server_b2b_context as b2b_ctx
     lane = _ready_lane(tmp_path)
     discover_plugins()
     assert b2b_ctx.producer_available() is True
-    prep = b2b_ctx.prepare_b2b_context(
-        lane.cap, resolved=_prepare_resolved(fake_plugin_home.now[0]))
+    prep = await b2b_ctx.run_bounded_context_preparation(
+        lambda: b2b_ctx._prepare_b2b_context(
+            lane.cap, resolved=_prepare_resolved(fake_plugin_home.now[0])))
     assert prep.cap is lane.cap
     prep.assert_current(lane.cap)
     assert prep.assert_configuration_current() is True
     lane.store.close()
 
 
-def test_prepare_context_profile_scope_a_b_a(tmp_path, monkeypatch,
-                                             fake_plugin_home):
+@pytest.mark.asyncio
+async def test_prepare_context_profile_scope_a_b_a(tmp_path, monkeypatch,
+                                                   fake_plugin_home):
     """Profile scope is the plugin manager's own: a proof produced under home
     A fails closed while home B is active (different manager, foreign
     callback), is valid again on return to A's cached manager — and a cap
     minted under A can never be PREPARED under B: the host binding refuses
-    before B's own producer callback may run."""
+    before B's own producer callback may run. Each home's discovery runs
+    explicitly BEFORE its bounded call, as the production bootstrap does."""
     from hermes_cli.plugins import discover_plugins
     from hermes_constants import (
         reset_hermes_home_override, set_hermes_home_override)
@@ -1960,8 +1970,11 @@ def test_prepare_context_profile_scope_a_b_a(tmp_path, monkeypatch,
     previous_multiplex = is_multiplex_active()
     set_multiplex_active(True)
     try:
-        prep = b2b_ctx.prepare_b2b_context(
-            lane.cap, resolved=_prepare_resolved(fake_plugin_home.now[0]))
+        discover_plugins()
+        prep = await b2b_ctx.run_bounded_context_preparation(
+            lambda: b2b_ctx._prepare_b2b_context(
+                lane.cap,
+                resolved=_prepare_resolved(fake_plugin_home.now[0])))
         token_b = set_hermes_home_override(home_b)
         try:
             discover_plugins()
@@ -1969,9 +1982,10 @@ def test_prepare_context_profile_scope_a_b_a(tmp_path, monkeypatch,
             # here: the host refuses before B's callback can run.
             assert b2b_ctx.producer_available() is True
             with pytest.raises(B2BTerminalRefusal) as exc:
-                b2b_ctx.prepare_b2b_context(
-                    lane.cap,
-                    resolved=_prepare_resolved(fake_plugin_home.now[0]))
+                await b2b_ctx.run_bounded_context_preparation(
+                    lambda: b2b_ctx._prepare_b2b_context(
+                        lane.cap,
+                        resolved=_prepare_resolved(fake_plugin_home.now[0])))
             assert str(exc.value) == "b2b_policy_changed"
             with pytest.raises(B2BTerminalRefusal):
                 prep.assert_current(lane.cap)
@@ -1987,7 +2001,8 @@ def test_prepare_context_profile_scope_a_b_a(tmp_path, monkeypatch,
     lane.store.close()
 
 
-def test_prepare_context_config_mutation_and_unload_reject(
+@pytest.mark.asyncio
+async def test_prepare_context_config_mutation_and_unload_reject(
         tmp_path, fake_plugin_home):
     """The returned validator re-reads plugin-owned configuration: mutating
     the entry's settings revokes the proof (typed b2b_policy_changed), and
@@ -1996,8 +2011,9 @@ def test_prepare_context_config_mutation_and_unload_reject(
     from gateway.platforms import api_server_b2b_context as b2b_ctx
     lane = _ready_lane(tmp_path)
     discover_plugins()
-    prep = b2b_ctx.prepare_b2b_context(
-        lane.cap, resolved=_prepare_resolved(fake_plugin_home.now[0]))
+    prep = await b2b_ctx.run_bounded_context_preparation(
+        lambda: b2b_ctx._prepare_b2b_context(
+            lane.cap, resolved=_prepare_resolved(fake_plugin_home.now[0])))
     _plugin_config(fake_plugin_home.home, stamp="stamp-b")
     with pytest.raises(B2BTerminalRefusal):
         prep.assert_current(lane.cap)
@@ -2011,8 +2027,9 @@ def test_prepare_context_config_mutation_and_unload_reject(
     lane.store.close()
 
 
-def test_prepare_context_ambiguity_fails_closed(tmp_path, monkeypatch,
-                                                fake_plugin_home):
+@pytest.mark.asyncio
+async def test_prepare_context_ambiguity_fails_closed(tmp_path, monkeypatch,
+                                                      fake_plugin_home):
     """Exactly ONE prepare_context callback is permitted per profile: a second
     registering plugin makes the producer unavailable — never first-wins."""
     from hermes_cli.plugins import discover_plugins
@@ -2024,8 +2041,10 @@ def test_prepare_context_ambiguity_fails_closed(tmp_path, monkeypatch,
     discover_plugins()
     assert b2b_ctx.producer_available() is False
     with pytest.raises(B2BTerminalRefusal) as exc:
-        b2b_ctx.prepare_b2b_context(
-            lane.cap, resolved=_prepare_resolved(fake_plugin_home.now[0]))
+        await b2b_ctx.run_bounded_context_preparation(
+            lambda: b2b_ctx._prepare_b2b_context(
+                lane.cap,
+                resolved=_prepare_resolved(fake_plugin_home.now[0])))
     assert str(exc.value) == "context_unavailable"
     lane.store.close()
 
@@ -2251,3 +2270,56 @@ async def test_launch_concurrency_check_order(
     assert adm._store_counts(store) == before
     assert adapter._session_db.get_session(session_id)["title"] is None
     lane.store.close()
+
+
+# --- run_bounded_context_preparation: the worker's own finish decides ------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish_offset_s", [-0.003, 0.003])
+async def test_bounded_preparation_judges_the_workers_own_finish(
+        tmp_path, monkeypatch, finish_offset_s):
+    """The budget refusal compares the deadline to the WORKER's recorded
+    finish instant, never to the polling loop's wake: a worker done 3 ms
+    before the deadline is accepted even when the loop only wakes 7 ms after
+    it; one done 3 ms after is refused — and with the worker already exited
+    the abandon mark counts nothing."""
+    from agent.b2b_execution import B2BTerminalRefusal
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+
+    clock = [10_000.0]
+    deadline = clock[0] + b2b_ctx._SOURCE_DEADLINE_S
+    monkeypatch.setattr(b2b_ctx, "_monotonic", lambda: clock[0])
+
+    release = threading.Event()
+    workers = []
+
+    def _callback():
+        workers.append(threading.current_thread())
+        release.wait(timeout=10.0)
+        return "prepared"
+
+    real_sleep = asyncio.sleep
+
+    async def _late_wake(_delay):
+        # The worker finishes at deadline+offset while the loop is asleep...
+        clock[0] = deadline + finish_offset_s
+        release.set()
+        end = time.monotonic() + 10.0
+        while (not workers or workers[0].is_alive()) and (
+                time.monotonic() < end):
+            await real_sleep(0.001)
+        # ...then the loop wakes past the deadline either way.
+        clock[0] = deadline + 0.007
+
+    monkeypatch.setattr(asyncio, "sleep", _late_wake)
+    try:
+        result = await b2b_ctx.run_bounded_context_preparation(_callback)
+    except B2BTerminalRefusal as exc:
+        result = str(exc)
+    if finish_offset_s < 0:
+        assert result == "prepared"
+    else:
+        assert result == "context_unavailable"
+    assert workers and not workers[0].is_alive()
+    assert b2b_ctx.abandoned_preparation_count() == 0

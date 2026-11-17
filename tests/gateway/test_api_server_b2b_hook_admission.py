@@ -287,7 +287,7 @@ async def test_launch_refuses_real_concurrency_saturation_before_native_reads(
     monkeypatch.setattr(
         b2b_context, "_prepare_b2b_context", _forbidden_prepare)
     monkeypatch.setattr(
-        b2b_context, "_bounded_native_read", _forbidden_native_read)
+        b2b_context, "run_bounded_context_preparation", _forbidden_native_read)
     before = admission._store_counts(case.store)
 
     try:

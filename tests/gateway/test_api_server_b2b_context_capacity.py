@@ -17,6 +17,7 @@ import copy
 import json
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -47,6 +48,12 @@ VAL_WORKER_THREADS = []   # (preparation_index, call_index, Thread)
 VAL_BLOCK_CALL = 0        # which validate_configuration call parks; 0 = none
 VAL_BARRIER = None
 VAL_PROBE_LOCK = threading.Lock()
+
+# Bootstrap probe state: REGISTER_* parks a plugin's OWN register() (cold
+# discovery) or a patched _load_gateway_config — bootstrap work that must
+# stay OUTSIDE the bounded preparation.
+REGISTER_GATE = threading.Event()
+REGISTER_ENTERED = threading.Event()
 
 _PRODUCER_PLUGIN_NAME = "stuck-producer"
 _VALIDATOR_PLUGIN_NAME = "stuck-validator"
@@ -130,12 +137,25 @@ def register(ctx):
     ctx.register_hook("pre_llm_call", lambda **kwargs: None)
 '''
 
+# The ordinary fast producer, but the park point is register() itself: a
+# COLD discovery is held inside plugin-owned register code — bootstrap work,
+# never preparation.
+_COLD_REGISTER_INIT = execution_lane._FAKE_PLUGIN_INIT.replace(
+    "def register(ctx):\n",
+    "def register(ctx):\n"
+    "    from tests.gateway import (\n"
+    "        test_api_server_b2b_context_capacity as probe)\n"
+    "    probe.REGISTER_ENTERED.set()\n"
+    "    probe.REGISTER_GATE.wait(timeout=30.0)\n", 1)
+
 
 def _reset_probe():
     PREP_GATE.clear()
     PREP_ENTERED.clear()
     PREP_EXIT.clear()
     VAL_GATE.clear()
+    REGISTER_GATE.clear()
+    REGISTER_ENTERED.clear()
     globals()["PREP_BARRIER"] = None
     globals()["VAL_BARRIER"] = None
     globals()["VAL_BLOCK_CALL"] = 0
@@ -231,6 +251,35 @@ def _abandoned_count(adapter, profile):
     from gateway.platforms.api_server_b2b_context import (
         abandoned_preparation_count)
     with adapter._profile_scope(profile):
+        return abandoned_preparation_count()
+
+
+def _profile_scope_unhydrated(profile_home):
+    """A real profile scope that NEVER hydrates secret sources — the test
+    loop must not queue on the global secret-source lock it holds shut, and
+    a hydrating introspection would mask a lock-wait regression."""
+    from gateway.run import _profile_runtime_scope
+    return _profile_runtime_scope(profile_home, hydrate_secrets=False)
+
+
+async def _launch_unhydrated(case, profile):
+    """``_launch_profile`` without the hydrating scope entry — same real
+    launch, credentials left to the production bootstrap/worker."""
+    with _profile_scope_unhydrated(case.profile_home):
+        return await execution_lane.b2b._launch_b2b_run(
+            case.adapter, None, profile=profile, entry=case.entry,
+            keys=execution_lane.b2b._KeyRing(case.entry),
+            session_id=case.session_id, binding_digest=case.session_id[4:],
+            attempt_id=case.resolved["attempt_id"], resolved=case.resolved,
+            store=case.store, db=case.db)
+
+
+def _abandoned_count_unhydrated(profile_home):
+    """The abandoned count for ONE home, introspected under a non-hydrating
+    scope — never behind the secret-source lock."""
+    from gateway.platforms.api_server_b2b_context import (
+        abandoned_preparation_count)
+    with _profile_scope_unhydrated(profile_home):
         return abandoned_preparation_count()
 
 
@@ -860,3 +909,158 @@ async def _executor_starvation_scenario(tmp_path, monkeypatch, opened):
         adapter._close_cached_session_dbs()
 
     assert _abandoned_count(adapter, "hub") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["plugin_register", "gateway_config"])
+async def test_bootstrap_work_past_budget_never_counts(
+        tmp_path, monkeypatch, opened, stage):
+    """Bootstrap work — a COLD plugin discovery held inside the plugin's own
+    ``register``, or the gateway config load — is OUTSIDE the bounded
+    preparation: held past the whole source budget the launch stays pending
+    with ZERO counted abandonments, then admits once the work finishes. The
+    register arm performs no ``discover_plugins`` of its own: the single
+    real launch does the cold discovery itself."""
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+
+    case = _new_launch(tmp_path, monkeypatch, opened)
+    case.db = case.adapter._session_db
+    adapter = case.adapter
+
+    _freeze_preparation_clock(monkeypatch)
+    monkeypatch.setattr(b2b_ctx, "_SOURCE_DEADLINE_S", 0.2)
+    _reset_probe()
+    if stage == "plugin_register":
+        execution_lane._write_fake_plugin(
+            case.profile_home, init=_COLD_REGISTER_INIT)
+    else:
+        execution_lane._write_fake_plugin(case.profile_home)
+        import gateway.run as gateway_run
+        real_load = gateway_run._load_gateway_config
+
+        def _slow_load(*args, **kwargs):
+            REGISTER_ENTERED.set()
+            REGISTER_GATE.wait(timeout=30.0)
+            return real_load(*args, **kwargs)
+
+        monkeypatch.setattr(
+            gateway_run, "_load_gateway_config", _slow_load)
+    execution_lane._plugin_config(
+        case.profile_home, stamp=_PREPARATION_STAMP)
+
+    spawned = []
+    monkeypatch.setattr(
+        execution_lane.b2b, "_spawn_run", _spawn_recorder(spawned))
+
+    task = asyncio.create_task(_launch(case))
+    try:
+        deadline = time.monotonic() + 10.0
+        while not REGISTER_ENTERED.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        assert REGISTER_ENTERED.is_set(), f"{stage} never started"
+        # Held past the WHOLE bounded budget: nothing counted — the count is
+        # checked FIRST so a regression reports the abandonment it counted.
+        await asyncio.sleep(0.2 + 0.4)
+        assert _abandoned_count_unhydrated(case.profile_home) == 0
+        assert not task.done()
+    finally:
+        REGISTER_GATE.set()
+    response = await asyncio.wait_for(task, timeout=10.0)
+    assert response.status == 200, response.body
+    assert len(spawned) == 1
+    assert _abandoned_count_unhydrated(case.profile_home) == 0
+
+
+@pytest.mark.asyncio
+async def test_secret_source_lock_wait_counts_nothing_on_either_home(
+        tmp_path, monkeypatch, opened):
+    """Profile A's external-secret hydration parks inside the inner
+    implementation — under the REAL global ``_SECRET_SOURCE_CACHE_LOCK`` —
+    past the whole source budget while B's launch queues behind the SAME
+    lock. NEITHER wait is preparation plugin code: zero counted abandonments
+    on either home, and both admit once the hydration actually finishes."""
+    import hermes_cli.env_loader as env_loader
+    from gateway.platforms import api_server_b2b_context as b2b_ctx
+
+    case_a = _new_launch(tmp_path, monkeypatch, opened)
+    case_a.db = case_a.adapter._session_db
+    adapter = case_a.adapter
+    adapter._max_concurrent_runs = 0
+    _install_multi_b2b_state(adapter, case_a.lane, "hub", "ci")
+    case_b = _profile_case(
+        tmp_path, monkeypatch, opened, adapter, case_a.lane, "ci", "c")
+
+    _freeze_preparation_clock(monkeypatch)
+    monkeypatch.setattr(b2b_ctx, "_SOURCE_DEADLINE_S", 0.2)
+    execution_lane._write_fake_plugin(case_a.profile_home)
+    execution_lane._plugin_config(
+        case_a.profile_home, stamp=_PREPARATION_STAMP)
+    execution_lane._write_fake_plugin(case_b.profile_home)
+    execution_lane._plugin_config(
+        case_b.profile_home, stamp=_PREPARATION_STAMP)
+
+    # Hold A's hydration inside the inner implementation — under the REAL
+    # global lock — so B's hydration queues on the same lock acquisition.
+    real_inner = env_loader._hydrate_profile_secret_sources
+    hydrate_gate = threading.Event()
+    hydrate_entered = threading.Event()
+    a_home = str(case_a.profile_home.resolve())
+
+    def _blocked_inner(home):
+        if str(Path(home).resolve()) == a_home:
+            hydrate_entered.set()
+            hydrate_gate.wait(timeout=30.0)
+        return real_inner(home)
+
+    monkeypatch.setattr(
+        env_loader, "_hydrate_profile_secret_sources", _blocked_inner)
+
+    # A spy on the PUBLIC entry point — the real global lock stays intact:
+    # it proves B actually REACHED its hydration attempt (and is therefore
+    # queued on the lock A holds), which a bare pending task cannot show.
+    real_public = env_loader.hydrate_profile_secret_sources
+    b_hydrate_attempted = threading.Event()
+    b_home = str(case_b.profile_home.resolve())
+
+    def _spy_public(home):
+        if str(Path(home).resolve()) == b_home:
+            b_hydrate_attempted.set()
+        return real_public(home)
+
+    monkeypatch.setattr(
+        env_loader, "hydrate_profile_secret_sources", _spy_public)
+
+    spawned = []
+    monkeypatch.setattr(
+        execution_lane.b2b, "_spawn_run", _spawn_recorder(spawned))
+
+    task_a = asyncio.create_task(_launch_unhydrated(case_a, "hub"))
+    try:
+        deadline = time.monotonic() + 10.0
+        while not hydrate_entered.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.005)
+        assert hydrate_entered.is_set(), "A's hydration never started"
+        task_b = asyncio.create_task(_launch_unhydrated(case_b, "ci"))
+        deadline = time.monotonic() + 10.0
+        while not b_hydrate_attempted.is_set() and (
+                time.monotonic() < deadline):
+            await asyncio.sleep(0.005)
+        assert b_hydrate_attempted.is_set(), (
+            "B never reached its hydration attempt")
+        # BOTH waits exceed the WHOLE bounded budget; the counts are checked
+        # BEFORE the pending state so a regression reports the abandonment
+        # it counted rather than just a finished task.
+        await asyncio.sleep(0.2 + 0.5)
+        assert _abandoned_count_unhydrated(case_a.profile_home) == 0
+        assert _abandoned_count_unhydrated(case_b.profile_home) == 0
+        assert not task_a.done()
+        assert not task_b.done()
+    finally:
+        hydrate_gate.set()
+    response_a, response_b = await asyncio.wait_for(
+        asyncio.gather(task_a, task_b), timeout=15.0)
+    assert response_a.status == 200, response_a.body
+    assert response_b.status == 200, response_b.body
+    assert sorted(p for p, _run, _s in spawned) == ["ci", "hub"]
+    assert _abandoned_count_unhydrated(case_a.profile_home) == 0
+    assert _abandoned_count_unhydrated(case_b.profile_home) == 0
