@@ -154,6 +154,22 @@ async def run_bounded_context_operation(callback, *, timeout):
     return await _bounded_worker_result(done, outcome, deadline)
 
 
+def _assert_producer_memory_mode(cap: BoundExecution, prepare: Any) -> None:
+    """The cap's catalogue mode must be honored by THIS producer BEFORE it
+    runs. ``none`` requires the callback's explicit opt-in tuple
+    ``b2b_memory_modes``; a producer that never declared support — or whose
+    support was withdrawn after stamping — is refused before any invocation,
+    never executed then cleaned up. The opt-in is a trusted-producer
+    contract, not a sandbox for arbitrary plugin code."""
+    mode = cap.policy_get("project", {}).get("memory_mode", "required")
+    if mode not in ("required", "none"):
+        raise B2BTerminalRefusal("context_memory_mode")
+    if mode == "none":
+        supported = getattr(prepare, "b2b_memory_modes", ())
+        if not isinstance(supported, tuple) or "none" not in supported:
+            raise B2BTerminalRefusal("context_memory_mode")
+
+
 def _invoke_producer(cap: BoundExecution):
     """The native read itself — the profile's single owned ``prepare_context``
     callback + the result-shape gate. May only run inside a bounded worker.
@@ -162,6 +178,7 @@ def _invoke_producer(cap: BoundExecution):
     if found is None:
         raise B2BTerminalRefusal("context_unavailable")
     manager, prepare = found
+    _assert_producer_memory_mode(cap, prepare)
     result = prepare(execution=cap)
     if (not isinstance(result, Mapping)
             or not callable(result.get("validate_configuration"))):
@@ -252,6 +269,8 @@ class _PreparedContext:
         found = _context_provider()
         if found is None or found[0] is not self.manager or found[1] is not self.prepare:
             raise B2BTerminalRefusal("context_unavailable")
+        # Opt-in removal after stamping fails closed like config drift.
+        _assert_producer_memory_mode(self.cap, self.prepare)
         try:
             current = self.validate_configuration()
         except B2BTerminalRefusal:

@@ -11,6 +11,7 @@ import copy
 import tempfile
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -540,6 +541,151 @@ def test_recorded_memory_freshness_full_qualification_boundary(
     with pytest.raises(B2BTerminalRefusal) as exc:
         be.verify_context_proof(be.context_proof(view))
     assert str(exc.value) == reason
+
+
+# ---------------------------------------------------------------------------
+# Explicit no-memory variant — dubsar.agent-context/2.r2.no-memory/1 selected
+# by the operator catalogue (project.memory_mode). Every view below is an
+# explicit UNIT DOUBLE built on the same pinned r2 blobs; no real producer or
+# Memory service is involved.
+# ---------------------------------------------------------------------------
+
+_NO_MEMORY_FORMAT = "dubsar.agent-context/2.r2.no-memory/1"
+
+
+def _no_memory_view(policy):
+    """UNIT DOUBLE: the no-memory shape of the unit native OC view — the
+    variant format, ``memory_mode: none``, no ``memory``/``accepted_context``
+    block, empty searched/refused namespaces, My Work + OC capabilities only
+    and a zero relation count."""
+    view = build_unit_native_oc_view(policy, {}, ordered=True)
+    del view["memory"]
+    view.pop("accepted_context", None)
+    view.update(format=_NO_MEMORY_FORMAT, memory_mode="none",
+                namespaces_searched=[], namespaces_refused=[])
+    view["coverage"]["capabilities"] = ["my_work", "operational_context"]
+    view["bounds"]["relation_count"] = 0
+    return reseal_unit_context_view(view)
+
+
+@pytest.mark.parametrize("mutation,reason", [
+    (None, None), ("memory_dict", "context_memory_unexpected"),
+    ("memory_null", "context_memory_unexpected"),
+    ("accepted_context", "context_memory_unexpected"),
+    ("missing_mode", "context_memory_mode"),
+    ("bad_mode", "context_memory_mode"),
+    ("namespaces", "context_namespaces"),
+    ("coverage", "context_memory_mode"),
+    ("coverage_unhashable", "context_memory_mode"),
+    ("relation_count", "context_relation_bounds"),
+    ("relation_count_bool", "context_relation_bounds"),
+])
+def test_no_memory_context_qualification_and_recorded_proof(mutation, reason):
+    policy = _unit_policy()
+    policy["project"]["memory_mode"] = "none"
+    cap = _cap(policy=policy)
+    view = _no_memory_view(cap.policy)
+    if mutation == "memory_dict":
+        view["memory"] = {}
+    elif mutation == "memory_null":
+        view["memory"] = None
+    elif mutation == "accepted_context":
+        view["accepted_context"] = {}
+    elif mutation == "missing_mode":
+        del view["memory_mode"]
+    elif mutation == "bad_mode":
+        view["memory_mode"] = "required"
+    elif mutation == "namespaces":
+        view["namespaces_searched"] = ["ns"]
+    elif mutation == "coverage":
+        view["coverage"]["capabilities"].append("memory")
+    elif mutation == "coverage_unhashable":
+        view["coverage"]["capabilities"] = [{}, "operational_context"]
+    elif mutation == "relation_count":
+        view["bounds"]["relation_count"] = 1
+    elif mutation == "relation_count_bool":
+        view["bounds"]["relation_count"] = False
+    reseal_unit_context_view(view)
+    if reason is not None:
+        for qualify in (lambda: be.qualify_context_view(cap, view),
+                        lambda: be.verify_context_proof(be.context_proof(view))):
+            with pytest.raises(B2BTerminalRefusal) as exc:
+                qualify()
+            assert str(exc.value) == reason
+        return
+    assert be.qualify_context_view(cap, view) == view
+    assert be.verify_context_proof(be.context_proof(view))["view"] == view
+    fresh = renew_unit_oc_read(view)
+    be.assert_source_equivalent(view, fresh)
+    agent = _bound_agent(cap)
+    cap.register_context_recheck(lambda execution: fresh)
+    token = bind_execution(cap)
+    try:
+        receipt = cap.publish_context(view, UNIT_RENDERED, turn_id="t1")
+        assert be.recheck_context(cap, receipt) == fresh
+    finally:
+        reset_execution(token)
+    assert agent._b2b_execution is cap
+    assert receipt is cap.sink.context_receipt
+    assert "memory" not in receipt.view
+    assert receipt.view["memory_mode"] == "none"
+    assert receipt.rendered == UNIT_RENDERED.encode("utf-8")
+    assert "memory_mode" in be.source_basis(view)
+    assert "memory" not in be.source_basis(view)
+    assert be.json_utf8(view) != be.json_utf8(fresh)
+    changed = copy.deepcopy(fresh)
+    changed["memory_mode"] = "required"
+    reseal_unit_context_view(changed)
+    with pytest.raises(B2BTerminalRefusal, match="^context_stale$"):
+        be.assert_source_equivalent(view, changed)
+    # Inverse fallback: a fully valid r2 memory view under a ``none`` policy
+    # refuses — mode matching runs in both directions, never a silent re-add.
+    r2 = build_context_view(cap.policy, {})
+    with pytest.raises(B2BTerminalRefusal, match="^context_memory_mode$"):
+        be.qualify_context_view(cap, r2)
+    # The variant specialization does not widen the schema or skip the pins:
+    # an unrecognized field is still schema-invalid and a corrupted blob is
+    # still a contract failure (this test's own extracted copy, not a shared
+    # root — ``extract_contract_root`` rewrites it from the pinned blobs).
+    unknown = copy.deepcopy(view)
+    unknown["unrecognized_context_field"] = True
+    reseal_unit_context_view(unknown)
+    with pytest.raises(B2BTerminalRefusal, match="^context_schema_invalid$"):
+        be.qualify_context_view(cap, unknown)
+    schema_path = (Path(cap.policy_get("project")["context_contract_root"]) /
+                   "agent-context-r2.schema.json")
+    schema_path.write_bytes(schema_path.read_bytes() + b" ")
+    with pytest.raises(B2BTerminalRefusal, match="^context_contract_unavailable$"):
+        be.qualify_context_view(cap, view)
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_memory_mode_required_never_falls_back(configured):
+    """``required`` (absent or explicit) never degrades to the no-memory
+    contract: an empty relation set is ``context_memory_missing`` at BOTH
+    seams, a missing block is schema-invalid at qualification and malformed
+    at durable proof, and a no-memory-shaped view mismatches the policy."""
+    policy = _unit_policy()
+    if configured:
+        policy["project"]["memory_mode"] = "required"
+    cap = _cap(policy=policy)
+    empty = build_context_view(cap.policy, {})
+    empty["memory"]["relations"] = []
+    empty["bounds"]["relation_count"] = 0
+    reseal_unit_context_view(empty)
+    for qualify in (lambda: be.qualify_context_view(cap, empty),
+                    lambda: be.verify_context_proof(be.context_proof(empty))):
+        with pytest.raises(B2BTerminalRefusal, match="^context_memory_missing$"):
+            qualify()
+    absent = copy.deepcopy(empty)
+    del absent["memory"]
+    reseal_unit_context_view(absent)
+    with pytest.raises(B2BTerminalRefusal, match="^context_schema_invalid$"):
+        be.qualify_context_view(cap, absent)
+    with pytest.raises(B2BTerminalRefusal, match="^context_memory_malformed$"):
+        be.verify_context_proof(be.context_proof(absent))
+    with pytest.raises(B2BTerminalRefusal, match="^context_memory_mode$"):
+        be.qualify_context_view(cap, _no_memory_view(cap.policy))
 
 
 # ---------------------------------------------------------------------------
