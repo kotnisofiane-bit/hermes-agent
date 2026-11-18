@@ -440,7 +440,6 @@ BLOCK_REASONS = frozenset({
     "context_authority_mismatch", "context_catalogue_mismatch",
     "context_changed_before_sdk", "context_contract_unavailable",
     "context_contradictions", "context_digest_invalid",
-    "context_documents",
     "context_identity_mismatch", "context_identity_source",
     "context_memory_malformed", "context_memory_malformed_api",
     "context_memory_malformed_globals", "context_memory_malformed_limits",

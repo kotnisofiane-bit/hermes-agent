@@ -15,17 +15,22 @@ Memory, a provider, or any network beyond the one loopback source exchange.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import hashlib
 import os
 import re
+import threading
 import urllib.request
+import uuid
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from agent.b2b_execution import (
-    BLOCK_REASONS, SOURCE_BASIS_CONTRACT, json_utf8)
+    SOURCE_BASIS_CONTRACT, json_utf8)
 from agent.memory_manager import MemoryManager
 from gateway.config import PlatformConfig
 from gateway.platforms import api_server_b2b as b2b
@@ -140,7 +145,7 @@ def _prepare_lane(tmp_path, monkeypatch, opened, *, plugin_init,
     snapshot so native-session drift is exercised through the real checks."""
     prof = adm._profile_home(tmp_path, monkeypatch, "hub")
     portal_priv, _, portal_pub = make_keypair()
-    _, hermes_priv_pem, hermes_pub = make_keypair()
+    hermes_priv, hermes_priv_pem, hermes_pub = make_keypair()
     requester_id = "1" * 24
     project_id = "b2b-bench"
     basis = {"format": "dubsar.b2b-agent-session-binding/1",
@@ -171,11 +176,12 @@ def _prepare_lane(tmp_path, monkeypatch, opened, *, plugin_init,
         _write_fake_plugin(prof, name=_PLUGIN_NAME, init=plugin_init)
         _plugin_config(prof, names=(_PLUGIN_NAME,))
 
-    lane = SimpleNamespace(purposes=[])
+    lane = SimpleNamespace(purposes=[], request_envs=[])
 
     def _body_for(request_env):
         req = request_env["body"]
         lane.purposes.append(req.get("purpose"))
+        lane.request_envs.append(request_env)
         obs = {
             "id": req["session_id"], "source": "api_server", "title": None,
             "model": None, "parent_session_id": None,
@@ -222,6 +228,7 @@ def _prepare_lane(tmp_path, monkeypatch, opened, *, plugin_init,
     lane.adapter = adapter
     lane.source = source
     lane.prof = prof
+    lane.hermes_priv = hermes_priv
     lane.session_id = session_id
     lane.attempt_id = attempt_id
     lane.binding = binding
@@ -238,7 +245,10 @@ def _prepare_headers(attempt_id):
 
 
 def _prepare_body(attempt_id, binding):
-    return {"attempt_id": attempt_id, "binding_digest": binding}
+    """The closed three-key prepare body — the caller-minted UUIDv4
+    ``request_id`` the signed attestation must echo exactly."""
+    return {"attempt_id": attempt_id, "binding_digest": binding,
+            "request_id": str(uuid.uuid4())}
 
 
 def _memory_forbids(monkeypatch):
@@ -310,6 +320,7 @@ async def test_b2b_prepare_post_attests_preparation_with_zero_writes(
         changes_before = store._conn.total_changes
 
         payloads = []
+        posted = []
         async with TestClient(TestServer(adm._app(adapter))) as client:
             # Process-cold first request: plugin discovery + bounded-worker
             # machinery warm up once per process — a cold 1s-budget overrun
@@ -320,14 +331,44 @@ async def test_b2b_prepare_post_attests_preparation_with_zero_writes(
                 json=_prepare_body(lane.attempt_id, lane.binding),
                 headers=_prepare_headers(lane.attempt_id))
             for _ in range(2):
+                sent = _prepare_body(lane.attempt_id, lane.binding)
+                posted.append(sent)
                 resp = await client.post(
                     f"/p/hub/api/sessions/{lane.session_id}/b2b-prepare",
-                    json=_prepare_body(lane.attempt_id, lane.binding),
+                    json=sent,
                     headers=_prepare_headers(lane.attempt_id))
                 payloads.append(await resp.json())
                 assert resp.status == 200, payloads[-1]
 
-        first, second = payloads
+        # The answer is a REAL signed envelope — cryptographically verified
+        # here with the lane's own public key, never trusted on shape alone.
+        # request_envs[0] is the warmup exchange; each asserted POST pairs
+        # with its own fresh signed source exchange.
+        first_env, second_env = payloads
+        for envelope, sent, request_env in zip(
+                (first_env, second_env), posted, lane.request_envs[1:]):
+            assert set(envelope) == b2b._ENVELOPE_KEYS
+            assert envelope["version"] == b2b._VERSION
+            assert envelope["operation"] == "prepared"
+            assert envelope["issuer"] == "hermes-hub"
+            assert envelope["audience"] == "portal-hub"
+            assert envelope["request_id"] == sent["request_id"]
+            assert (isinstance(envelope["issued_at"], int)
+                    and not isinstance(envelope["issued_at"], bool)
+                    and isinstance(envelope["expires_at"], int)
+                    and not isinstance(envelope["expires_at"], bool)
+                    and envelope["issued_at"] < envelope["expires_at"])
+            unsigned = {key: value for key, value in envelope.items()
+                        if key != "signature"}
+            lane.hermes_priv.public_key().verify(
+                base64.urlsafe_b64decode(envelope["signature"] + "=="),
+                b2b._DOMAIN + canonical(unsigned))
+            body = envelope["body"]
+            assert body["source_request_id"] == request_env["request_id"]
+            assert body["source_request_digest"] == hashlib.sha256(
+                canonical(request_env)).hexdigest()
+
+        first, second = first_env["body"], second_env["body"]
         assert set(first) == _PREPARATION_KEYS
         assert first["object"] == "b2b.preparation"
         assert first["status"] == "prepared"
@@ -400,7 +441,8 @@ async def test_b2b_prepare_post_attests_ordered_documents(
                 headers=_prepare_headers(lane.attempt_id))
             payload = await resp.json()
             assert resp.status == 200, payload
-        assert payload["documents"] == [
+        assert payload["operation"] == "prepared"
+        assert payload["body"]["documents"] == [
             {"native_ref": d["native_ref"], "revision": 1,
              "digest": d["native_digest"]} for d in documents]
         assert adm._store_counts(store) == counts_before
@@ -413,7 +455,7 @@ async def test_b2b_prepare_post_attests_ordered_documents(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", [
     "digest_mismatch", "extra_key", "foreign_ref", "missing_proof",
-    "proof_order", "not_list"])
+    "proof_order", "not_list", "bad_unicode"])
 async def test_b2b_prepare_post_refuses_invalid_documents(
         tmp_path, monkeypatch, opened, case):
     """A malformed, drifted or unproven document attestation refuses closed —
@@ -433,6 +475,8 @@ async def test_b2b_prepare_post_refuses_invalid_documents(
     elif case == "proof_order":
         documents = [base]
         refs = [base["native_digest"], base["native_ref"]]
+    elif case == "bad_unicode":
+        documents, refs = [dict(base, text="\ud800")], _proofs([base])
     else:  # not_list
         documents, refs = "not-a-list", _proofs([base])
     lane = _prepare_lane(
@@ -452,8 +496,8 @@ async def test_b2b_prepare_post_refuses_invalid_documents(
                 headers=_prepare_headers(lane.attempt_id))
             payload = await resp.json()
             assert resp.status == 503, payload
-            assert payload.get("error") == "execution_unavailable"
-            assert payload.get("code") == "execution_unavailable"
+            assert payload.get("error") == "context_documents"
+            assert payload.get("code") == "context_documents"
         assert adm._store_counts(store) == counts_before
         assert store._conn.total_changes == changes_before
         assert adapter._session_db.get_session(
@@ -708,15 +752,258 @@ async def test_prepare_purpose_accepted_unknown_refused(
         lane.source.stop()
 
 
-def test_context_documents_reason_is_classified():
-    """The new ``context_documents`` refusal belongs to the emitted universe
-    and classifies durably as context_stale — both tables carry it."""
-    assert "context_documents" in BLOCK_REASONS
-    assert b2b._BLOCK_STATUS["context_documents"] == "context_stale"
-
-
 def test_prepare_route_registered(tmp_path, monkeypatch):
     """The route table exposes the prepare-only POST (mirrored under /p/)."""
     adapter = adm._adapter(tmp_path, monkeypatch, "hub")
     paths = {(method, path) for method, path, _ in b2b.b2b_http_routes(adapter)}
     assert ("POST", "/api/sessions/{session_id}/b2b-prepare") in paths
+
+
+# ---------------------------------------------------------------------------
+# N3 pass 2 — request_id contract, last-mile race, shared document gate,
+# hydration placement
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutate,error", [
+    pytest.param(lambda body: body.pop("request_id"), "invalid_body",
+                 id="missing"),
+    pytest.param(lambda body: body.update(extra=1), "invalid_body",
+                 id="extra_key"),
+    pytest.param(lambda body: body.update(request_id="not-a-uuid"),
+                 "invalid_request_id", id="not_uuid"),
+    pytest.param(lambda body: body.update(request_id=12345),
+                 "invalid_request_id", id="not_str"),
+    pytest.param(lambda body: body.update(
+        request_id="00000000-0000-1000-8000-000000000000"),
+        "invalid_request_id", id="not_v4"),
+    pytest.param(lambda body: body.update(
+        request_id="123e4567-e89b-42d3-a456-426614174000".upper()),
+        "invalid_request_id", id="uppercase"),
+])
+async def test_b2b_prepare_post_request_id_validation(
+        tmp_path, monkeypatch, opened, mutate, error):
+    """The prepare body is a closed three-key shape whose ``request_id`` is
+    a bounded UUIDv4 — anything else refuses 400 BEFORE the source exchange
+    or any durable effect."""
+    lane = _prepare_lane(tmp_path, monkeypatch, opened,
+                         plugin_init=_plugin_init())
+    adapter = lane.adapter
+    try:
+        body = _prepare_body(lane.attempt_id, lane.binding)
+        mutate(body)
+        monkeypatch.setattr(
+            b2b, "_resolve_source_async", _never("_resolve_source_async"))
+        store = adapter._run_idempotency_store
+        counts_before = adm._store_counts(store)
+        async with TestClient(TestServer(adm._app(adapter))) as client:
+            resp = await client.post(
+                f"/p/hub/api/sessions/{lane.session_id}/b2b-prepare",
+                json=body, headers=_prepare_headers(lane.attempt_id))
+            payload = await resp.json()
+            assert resp.status == 400, payload
+            assert payload["error"] == error
+        assert lane.purposes == []
+        assert adm._store_counts(store) == counts_before
+    finally:
+        lane.source.stop()
+
+
+@pytest.mark.asyncio
+async def test_b2b_prepare_post_refuses_when_proposal_admits_mid_preparation(
+        tmp_path, monkeypatch, opened):
+    """Last-mile race: a proposal that admits the same tuple while THIS
+    prepare is held AFTER its real bounded preparation makes the prepare
+    answer 409 already_admitted — never a stale signed attestation minted
+    beside an owned admission."""
+    lane = _prepare_lane(tmp_path, monkeypatch, opened,
+                         plugin_init=_plugin_init())
+    adapter = lane.adapter
+    store = adapter._run_idempotency_store
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = b2b._b2b_run_bounded_preparation
+
+    async def _gated(_adapter, *, profile, project, cap, sink, resolved):
+        denied = await original(
+            _adapter, profile=profile, project=project, cap=cap, sink=sink,
+            resolved=resolved)
+        if (resolved["_signed_request"]["body"]["purpose"] == "prepare"
+                and denied is None):
+            entered.set()
+            await release.wait()
+        return denied
+
+    spawn_calls = []
+
+    async def _spawn_spy(*a, **k):
+        spawn_calls.append((a, k))
+        return SimpleNamespace(done=lambda: True)
+
+    try:
+        _freeze_oc_window(monkeypatch)
+        monkeypatch.setattr(b2b, "_b2b_run_bounded_preparation", _gated)
+        monkeypatch.setattr(b2b, "_spawn_run", _spawn_spy)
+        async with TestClient(TestServer(adm._app(adapter))) as client:
+            prepare_task = asyncio.ensure_future(client.post(
+                f"/p/hub/api/sessions/{lane.session_id}/b2b-prepare",
+                json=_prepare_body(lane.attempt_id, lane.binding),
+                headers=_prepare_headers(lane.attempt_id)))
+            try:
+                await asyncio.wait_for(entered.wait(), 30)
+                admitted = await client.post(
+                    f"/p/hub/api/sessions/{lane.session_id}/b2b-proposal",
+                    json={"attempt_id": lane.attempt_id,
+                          "binding_digest": lane.binding},
+                    headers=_prepare_headers(lane.attempt_id))
+                admitted_payload = await admitted.json()
+                assert admitted.status == 200, admitted_payload
+                assert admitted_payload["status"] == "admitted"
+            finally:
+                release.set()
+            response = await prepare_task
+            payload = await response.json()
+            assert response.status == 409, payload
+            assert payload["error"] == "already_admitted"
+        # Exactly one run was scheduled — the proposal's — and the prepare
+        # minted no attestation beside the owned admission.
+        assert len(spawn_calls) == 1
+        assert lane.purposes == ["prepare", "bind"]
+        assert store.b2b_binding(
+            session_id=lane.session_id, profile="hub") is not None
+        assert store.b2b_attempt(
+            profile="hub", attempt_id=lane.attempt_id) is not None
+    finally:
+        lane.source.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_manifest", [False, True])
+async def test_b2b_proposal_post_gates_cited_documents(
+        tmp_path, monkeypatch, opened, has_manifest):
+    """The SAME document proof bar gates b2b-proposal as b2b-prepare — a
+    piece cited in the signed mission_request without a verified manifest
+    refuses 503 context_documents BEFORE admission; a verified manifest
+    admits and spawns exactly once."""
+    document = _doc("piece_" + "1" * 32, "pièce citée")
+    lane = _prepare_lane(
+        tmp_path, monkeypatch, opened,
+        plugin_init=_plugin_init(
+            documents=[document] if has_manifest else None),
+        source_refs=_proofs([document]))
+    adapter = lane.adapter
+    store = adapter._run_idempotency_store
+    spawn_calls = []
+
+    async def _spawn_spy(*a, **k):
+        spawn_calls.append((a, k))
+        return SimpleNamespace(done=lambda: True)
+
+    try:
+        _freeze_oc_window(monkeypatch)
+        monkeypatch.setattr(b2b, "_spawn_run", _spawn_spy)
+        counts_before = adm._store_counts(store)
+        async with TestClient(TestServer(adm._app(adapter))) as client:
+            resp = await client.post(
+                f"/p/hub/api/sessions/{lane.session_id}/b2b-proposal",
+                json={"attempt_id": lane.attempt_id,
+                      "binding_digest": lane.binding},
+                headers=_prepare_headers(lane.attempt_id))
+            payload = await resp.json()
+        assert lane.purposes == ["bind"]
+        if has_manifest:
+            assert resp.status == 200, payload
+            assert payload["status"] == "admitted"
+            assert len(spawn_calls) == 1
+            assert store.b2b_binding(
+                session_id=lane.session_id, profile="hub") is not None
+            assert store.b2b_attempt(
+                profile="hub", attempt_id=lane.attempt_id) is not None
+        else:
+            assert resp.status == 503, payload
+            assert payload["error"] == "context_documents"
+            assert spawn_calls == []
+            assert adm._store_counts(store) == counts_before
+            assert adapter._session_db.get_session(
+                lane.session_id)["title"] is None
+    finally:
+        lane.source.stop()
+
+
+def _record_secret_scope_loads(monkeypatch):
+    """EXTERNAL SEAM — wrap the real profile secret loader, recording
+    ``(home, thread)`` per call: hydration placement is proven by WHERE the
+    loader ran, never by a mocked scope."""
+    import gateway.run as _run
+    calls = []
+    real_load = _run._load_profile_secret_scope
+
+    def load(home):
+        calls.append((Path(home).resolve(), threading.current_thread()))
+        return real_load(home)
+
+    monkeypatch.setattr(_run, "_load_profile_secret_scope", load)
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_b2b_prepare_route_never_hydrates_on_loop(
+        tmp_path, monkeypatch, opened):
+    """Multiplex regression (A→B→A): unauthenticated prepare POSTs to two
+    served profiles are denied with ZERO profile-secret hydration on the
+    loop — hydration belongs to the bounded bootstrap worker, never the
+    profile-prefix middleware's request scope."""
+    lane = _prepare_lane(tmp_path, monkeypatch, opened,
+                         plugin_init=_plugin_init())
+    adapter = lane.adapter
+    adapter.gateway_runner.config.multiplex_profiles = True
+    beta = tmp_path / "homes" / "profiles" / "beta"
+    beta.mkdir(parents=True)
+    (beta / "config.yaml").write_text(
+        "model:\n  context_length: 256000\n")
+    calls = _record_secret_scope_loads(monkeypatch)
+    try:
+        async with TestClient(TestServer(adm._app(adapter))) as client:
+            for profile in ("hub", "beta", "hub"):
+                resp = await client.post(
+                    f"/p/{profile}/api/sessions/"
+                    f"{lane.session_id}/b2b-prepare",
+                    json=_prepare_body(lane.attempt_id, lane.binding))
+                assert resp.status == 401, await resp.text()
+        assert calls == []
+        assert lane.purposes == []
+    finally:
+        lane.source.stop()
+
+
+@pytest.mark.asyncio
+async def test_b2b_prepare_valid_request_hydrates_on_worker(
+        tmp_path, monkeypatch, opened):
+    """A VALID multiplexed prepare hydrates the profile secret scope ONLY on
+    the bounded bootstrap worker — the middleware scope and the handler's
+    own awaits never run the loader on the loop thread."""
+    lane = _prepare_lane(tmp_path, monkeypatch, opened,
+                         plugin_init=_plugin_init())
+    adapter = lane.adapter
+    adapter.gateway_runner.config.multiplex_profiles = True
+    # The profile-scoped API_SERVER_KEY the multiplexed auth check reads —
+    # a real .env inside the lane's real profile home.
+    (lane.prof / ".env").write_text(f"API_SERVER_KEY={_API_KEY}\n")
+    calls = _record_secret_scope_loads(monkeypatch)
+    loop_thread = threading.current_thread()
+    try:
+        _freeze_oc_window(monkeypatch)
+        monkeypatch.setattr(b2b, "_spawn_run", _never("_spawn_run"))
+        async with TestClient(TestServer(adm._app(adapter))) as client:
+            resp = await client.post(
+                f"/p/hub/api/sessions/{lane.session_id}/b2b-prepare",
+                json=_prepare_body(lane.attempt_id, lane.binding),
+                headers=_prepare_headers(lane.attempt_id))
+            payload = await resp.json()
+            assert resp.status == 200, payload
+        assert lane.purposes == ["prepare"]
+        assert calls != []
+        assert all(home == lane.prof.resolve() and thread is not loop_thread
+                   for home, thread in calls)
+    finally:
+        lane.source.stop()

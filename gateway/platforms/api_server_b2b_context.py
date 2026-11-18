@@ -269,14 +269,16 @@ def _b2b_document(raw: Any, mission_id: Any) -> Dict[str, Any]:
         raise B2BTerminalRefusal("context_documents")
     if type(revision) is not int or revision != 1:
         raise B2BTerminalRefusal("context_documents")
-    if (not isinstance(text, str) or not text or "\x00" in text or
-            len(text.encode("utf-8")) > _MAX_DOCUMENT_TEXT_BYTES):
+    if not isinstance(text, str) or not text or "\x00" in text:
         raise B2BTerminalRefusal("context_documents")
     try:
         _reject_bad_unicode(text)
+        encoded = text.encode("utf-8")
     except (UnicodeError, ValueError):
         raise B2BTerminalRefusal("context_documents") from None
-    expected = "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if len(encoded) > _MAX_DOCUMENT_TEXT_BYTES:
+        raise B2BTerminalRefusal("context_documents")
+    expected = "sha256:" + hashlib.sha256(encoded).hexdigest()
     if raw["content_digest"] != expected or raw["native_digest"] != expected:
         raise B2BTerminalRefusal("context_documents")
     if raw["native_ref"] != f"dubsar:piece:{mission_id}:{piece_id}":
@@ -476,9 +478,11 @@ def _prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) ->
 
     # The structured piece attestation — the producer's own ordered document
     # manifest, re-proven host-side against BOTH proof lists (view references
-    # AND the signed mission_request.source_refs). Parsing rendered bytes for
-    # pieces would lose the producer's authoritative validation; trusting the
-    # field unproven would let it drift from the mission fingerprints.
+    # AND the signed mission_request.source_refs). Both b2b-prepare and
+    # b2b-proposal refuse before attestation or admission when a cited piece
+    # has no verified manifest. Parsing rendered bytes for pieces would lose
+    # the producer's authoritative validation; trusting the field unproven
+    # would let it drift from the mission fingerprints.
     documents = _b2b_documents(
         result.get("documents"), cap=cap, plain=plain, resolved=resolved)
 

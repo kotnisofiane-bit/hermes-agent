@@ -53,6 +53,8 @@ _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _SHA256_FIELD = re.compile(r"^(sha256:)?[0-9a-f]{64}$")
 _SESSION_ID_RE = re.compile(r"^b2b_[0-9a-f]{64}$")
 _ATTEMPT_ID_RE = re.compile(r"^b2bp_[0-9a-f]{64}$")
+_PREPARE_REQUEST_ID_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 _OBJECT_ID = re.compile(r"^[0-9a-f]{24}$")
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 _MISSION_ID = B2B_MISSION_ID  # AUTORITE-PRODUCTION §6.4, Contracts da9bc826
@@ -99,6 +101,7 @@ _ECMA_WHITESPACE = "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
 
 _ATTEMPT_FORMAT = "dubsar.b2b-proposal-attempt/1"
 _ATTEMPT_OPERATION = "proposal-v1"
+_PREPARED_OPERATION = "prepared"
 
 
 class B2BConfigError(ValueError):
@@ -427,15 +430,16 @@ def _decode_sig(text: Any) -> Optional[bytes]:
 
 
 def _signed_envelope(entry: Mapping[str, Any], keys: _KeyRing, operation: str,
-                     body: Mapping, *, audience: Optional[str] = None) -> Tuple[Dict[str, Any], bytes]:
-    """Mint a signed request envelope; returns (envelope, exact signed request bytes)."""
+                     body: Mapping, *, audience: Optional[str] = None,
+                     request_id: Optional[str] = None) -> Tuple[Dict[str, Any], bytes]:
+    """Mint a Hermes-signed envelope; returns (envelope, exact signed bytes)."""
     now = int(time.time())
     env = {
         "version": _VERSION,
         "issuer": entry["hermes_issuer"],
         "audience": audience or entry["portal_issuer"],
         "operation": operation,
-        "request_id": str(uuid.uuid4()),
+        "request_id": request_id if request_id is not None else str(uuid.uuid4()),
         "issued_at": now,
         "expires_at": now + _REQUEST_TTL_S,
         "body": dict(body)}
@@ -803,7 +807,7 @@ def _genesis_vs_native(session: Mapping[str, Any], session_id: str, profile: str
 # this table, so a new raise site or block() call extends BOTH in one change.
 _BLOCK_CONTEXT_STALE_REASONS = frozenset({
     "context_schema_invalid", "context_contract_unavailable",
-    "context_digest_invalid", "context_documents", "context_identity_source",
+    "context_digest_invalid", "context_identity_source",
     "context_mission_id",
     "context_identity_mismatch", "context_catalogue_mismatch",
     "context_authority_mismatch", "context_selection_mismatch",
@@ -1285,7 +1289,8 @@ def _b2b_prepare_once(*, cap: Any, sink: Any, project: Mapping[str, Any],
         finally:
             reset_execution(token)
     except B2BTerminalRefusal as exc:
-        return (str(exc) if str(exc) == "context_oc_source_stale"
+        return (str(exc) if str(exc) in {"context_oc_source_stale",
+                                         "context_documents"}
                 else "execution_unavailable")
     except Exception:
         return "execution_unavailable"
@@ -1513,18 +1518,21 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
 
 async def _prepare_b2b_only(adapter: Any, request: Any, *, profile: str, entry, keys,
                             session_id: str, binding_digest: str, attempt_id: str,
-                            resolved: Dict[str, Any], store: Any, db: Any):
+                            request_id: str, resolved: Dict[str, Any],
+                            store: Any, db: Any):
     """The prepare-only attestation (N3): verify the exact
     binding/session/attempt/source identities and run the SAME bounded
     bootstrap + plugin-owned context preparation as admission — then STOP:
     no b2b_admit, no title, no concurrency gate, no run, no provider, no
-    durable write of any kind. The answer is a ``b2b.preparation``
-    attestation correlated to THIS signed exchange: the context proof
-    digests, the source-basis contract, the rendered digest and the ordered
-    piece tuple — ``run_id: null``, ``model_scheduled: false``. A replayed
-    POST simply re-attests under a fresh signed exchange; an already durable
-    binding/attempt refuses 409 (the attestation of record is the historical
-    read, never a second minted answer)."""
+    durable write of any kind. The prepare-only attestation is signed by the
+    owning Hermes profile; it binds the caller request_id and the signed
+    source exchange. It does not create a Hermes record, authorize a run, or
+    assert that a later admission has not occurred. The answer is a
+    ``b2b.preparation`` attestation correlated to THIS signed exchange: the
+    context proof digests, the source-basis contract, the rendered digest
+    and the ordered piece tuple — ``run_id: null``,
+    ``model_scheduled: false``. A replayed POST simply re-attests under a
+    fresh signed exchange; an already durable binding/attempt refuses 409."""
     import asyncio as _a
     from aiohttp import web
     from datetime import datetime, timezone
@@ -1605,13 +1613,6 @@ async def _prepare_b2b_only(adapter: Any, request: Any, *, profile: str, entry, 
         resolved=resolved)
     if denied is not None:
         return denied
-    # Signed proof can expire while session/DB checks were awaited: re-verify
-    # the freshness window on BOTH envelopes immediately before answering —
-    # the same predicate the commit path applies to its own source reads.
-    now = int(time.time())
-    if not all(env["issued_at"] <= now < env["expires_at"] for env in
-               (resolved["_signed_request"], resolved["_signed_response"])):
-        return _deny(403, "source_denied")
     # Non-hydrating scope entry — introspection only, never plugin
     # secret-source code on the loop.
     try:
@@ -1624,16 +1625,29 @@ async def _prepare_b2b_only(adapter: Any, request: Any, *, profile: str, entry, 
     if has_non_plugin_hooks:
         return _deny(503, "non_plugin_hook_subscribers")
     preparation = sink._context_preparation
-    try:
-        assert_context_source_current(preparation)
-    except B2BTerminalRefusal as exc:
-        return _deny(503, str(exc))
     proof = context_proof(preparation.view)
     documents = [
         {"native_ref": document["native_ref"], "revision": document["revision"],
          "digest": document["native_digest"]}
         for document in preparation.documents]
-    return web.json_response({
+    # Last-mile race gate: a proposal admitted between the early durable
+    # check above and this boundary consumed the same tuple — refuse rather
+    # than mint a stale attestation beside an owned admission.
+    if (store.b2b_binding(session_id=session_id, profile=profile) is not None
+            or store.b2b_attempt(profile=profile, attempt_id=attempt_id) is not None):
+        return _deny(409, "already_admitted")
+    # Signed proof can expire while session/DB checks were awaited: re-verify
+    # the freshness window on BOTH envelopes immediately before signing —
+    # the same predicate the commit path applies to its own source reads.
+    now = int(time.time())
+    if not all(env["issued_at"] <= now < env["expires_at"] for env in
+               (resolved["_signed_request"], resolved["_signed_response"])):
+        return _deny(403, "source_denied")
+    try:
+        assert_context_source_current(preparation)
+    except B2BTerminalRefusal as exc:
+        return _deny(503, str(exc))
+    body = {
         "object": "b2b.preparation",
         "attempt_id": attempt_id, "binding_digest": binding_digest,
         "profile": profile, "session_id": session_id,
@@ -1652,7 +1666,10 @@ async def _prepare_b2b_only(adapter: Any, request: Any, *, profile: str, entry, 
         "rendered_digest": hashlib.sha256(preparation.rendered).hexdigest(),
         "source_request_id": resolved["source_request_id"],
         "source_request_digest": resolved["source_request_digest"],
-        "documents": documents})
+        "documents": documents}
+    envelope, _ = _signed_envelope(
+        entry, keys, _PREPARED_OPERATION, body, request_id=request_id)
+    return web.json_response(envelope)
 
 
 def _replayed_response(adapter: Any, run_id: Any, attempt_id: str, binding_digest: str,
@@ -1768,13 +1785,16 @@ async def _handle_b2b_prepare_post(adapter: Any, request: Any):
     parsed, err = await _read_bounded_json(request)
     if err is not None:
         return err
-    if set(parsed.keys()) != {"attempt_id", "binding_digest"}:
+    if set(parsed.keys()) != {"attempt_id", "binding_digest", "request_id"}:
         return _deny(400, "invalid_body")
     if parsed["binding_digest"] != binding_digest:
         return _deny(403, "binding_mismatch")
     attempt_id = parsed.get("attempt_id")
     if not _ATTEMPT_ID_RE.fullmatch(str(attempt_id or "")):
         return _deny(400, "invalid_attempt_id")
+    request_id = parsed["request_id"]
+    if not isinstance(request_id, str) or not _PREPARE_REQUEST_ID_RE.fullmatch(request_id):
+        return _deny(400, "invalid_request_id")
     if (request.headers.get("Idempotency-Key") or "").strip() != attempt_id:
         return _deny(400, "idempotency_key_mismatch")
     db = await adapter._ensure_session_db_async()
@@ -1793,7 +1813,7 @@ async def _handle_b2b_prepare_post(adapter: Any, request: Any):
     return await _prepare_b2b_only(
         adapter, request, profile=profile, entry=entry, keys=keys,
         session_id=session_id, binding_digest=binding_digest, attempt_id=attempt_id,
-        resolved=resolved, store=store, db=db)
+        request_id=request_id, resolved=resolved, store=store, db=db)
 
 
 async def _b2b_get(adapter: Any, request: Any, *, want_context: bool):
