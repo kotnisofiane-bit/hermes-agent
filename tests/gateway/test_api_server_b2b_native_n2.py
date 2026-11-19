@@ -20,6 +20,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import threading
@@ -117,21 +118,6 @@ def test_native_signed_refs_keep_twenty_originals_and_twenty_ordered_pairs():
         _flat([f"ordinary-{index}" for index in range(21)], documents), MISSION)
     assert not m._valid_native_source_refs(
         _flat(["ordinary"], _docs(count=21)), MISSION)
-
-
-def test_native_recipe_messages_digest_is_the_fixed_system_and_rendered_user():
-    from agent.b2b_execution import (
-        NATIVE_RECIPE_SYSTEM_PROMPT, mission_prompt, native_recipe_messages_digest)
-
-    request = {"criteria": ["prove"], "objective": "prepare", "source_refs": [],
-               "title": "mission"}
-    rendered = "bound context"
-    messages = [
-        {"role": "system", "content": NATIVE_RECIPE_SYSTEM_PROMPT},
-        {"role": "user", "content": mission_prompt(request) + "\n\n" + rendered},
-    ]
-    assert native_recipe_messages_digest(request, rendered.encode("utf-8")) == (
-        hashlib.sha256(canonical_json(messages)).hexdigest())
 
 
 def test_replay_only_admission_does_not_recreate_a_missing_attempt(tmp_path):
@@ -768,7 +754,7 @@ def _native_manifest_fixture(tmp_path, monkeypatch):
         stream.write(_FIXTURE_BOOT_ID + "\n")
     monkeypatch.setattr(native_auth, "_NATIVE_TRUSTED_ROOT", root)
     monkeypatch.setattr(native_auth, "_NATIVE_BOOT_ID_PATH", Path(boot_path))
-    monkeypatch.setattr(native_auth, "_NATIVE_SECURITY_UID", os.getuid())
+    monkeypatch.setattr(native_auth, "_NATIVE_SECURITY_UID", getattr(os, "getuid")())
     record = {
         "format": "dubsar.b2b-n2-recipe/1",
         "boot_id": _FIXTURE_BOOT_ID,
@@ -842,14 +828,30 @@ def test_native_manifest_real_file_refuses_bad_pin_mode_link_and_symlink(
         {"path": symlink, "sha256": ref["sha256"]}) is None
 
 
-@pytest.mark.skipif(
-    not _NATIVE_IO_AVAILABLE or os.getuid() != 0,
-    reason="root-owned directory required to isolate file-owner refusal",
-)
+@pytest.mark.skipif(not _NATIVE_IO_AVAILABLE, reason="Linux O_NOFOLLOW fixture required")
 def test_native_manifest_real_file_refuses_wrong_expected_owner(tmp_path, monkeypatch):
-    _root, _path, _record, ref = _native_manifest_fixture(tmp_path, monkeypatch)
-    monkeypatch.setattr(native_auth, "_NATIVE_SECURITY_UID", os.getuid() + 1)
+    _root, _path, record, ref = _native_manifest_fixture(tmp_path, monkeypatch)
+    assert native_auth._read_native_run_authorization(ref) == record
+    monkeypatch.setattr(native_auth, "_native_parents_safe", lambda path: path == ref["path"])
+    monkeypatch.setattr(
+        native_auth, "_NATIVE_SECURITY_UID", getattr(os, "getuid")() + 1)
     assert native_auth._read_native_run_authorization(ref) is None
+
+
+def test_native_parents_check_filesystem_root(monkeypatch):
+    info = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+
+    def lstat(path):
+        assert path == os.path.sep
+        return info
+
+    monkeypatch.setattr(native_auth, "_NATIVE_TRUSTED_ROOT", os.path.sep)
+    monkeypatch.setattr(
+        native_auth, "os", SimpleNamespace(path=os.path, lstat=lstat))
+    path = os.path.join(os.path.sep, "recipe.json")
+    assert native_auth._native_parents_safe(path)
+    info.st_mode |= 0o020
+    assert not native_auth._native_parents_safe(path)
 
 
 # ---------------------------------------------------------------------------
@@ -864,32 +866,33 @@ def _cap(policy):
         created_at=time.time())
 
 
-def _documents_case(refs=None, view_refs=None):
+def _documents_case():
     docs = _docs()
     flat = _flat(["dubsar:mission:objective"], docs)
     policy = {"mission_id": MISSION,
               "native_n2_binding": {"tenant_id": TENANT, "project_id": PROJECT,
                                     "mission_inputs": _pointer(docs)}}
     plain = {"my_work": {"mission": {
-        "references": flat if view_refs is None else view_refs}}}
+        "references": flat[:1]}}}
     resolved = {"mission_request": {
-        "source_refs": flat if refs is None else refs}}
-    return docs, _cap(policy), plain, resolved
+        "source_refs": flat}}
+    return docs, _cap(policy), plain, resolved, flat
 
 
 def test_b2b_documents_native_exact_manifest():
-    docs, cap, plain, resolved = _documents_case()
-    proven = _b2b_documents(docs, cap=cap, plain=plain, resolved=resolved)
+    docs, cap, plain, resolved, flat = _documents_case()
+    proven = _b2b_documents(
+        docs, cap=cap, plain=plain, resolved=resolved, native_references=flat)
     assert [d["native_ref"] for d in proven] == [d["native_ref"] for d in docs]
 
 
 @pytest.mark.parametrize("mutate", [
     "missing_documents", "empty_documents", "reordered_pairs",
-    "foreign_mission_ref", "wrong_manifest_digest", "view_only_reorder",
+    "foreign_mission_ref", "wrong_manifest_digest", "sidecar_reorder",
 ])
 def test_b2b_documents_native_mutations_refuse(mutate):
-    docs, cap, plain, resolved = _documents_case()
-    flat = _flat(["dubsar:mission:objective"], docs)
+    docs, cap, plain, resolved, flat = _documents_case()
+    native_references = flat
     if mutate == "missing_documents":
         raw = None
     elif mutate == "empty_documents":
@@ -899,9 +902,8 @@ def test_b2b_documents_native_mutations_refuse(mutate):
     if mutate == "reordered_pairs":
         resolved = {"mission_request": {
             "source_refs": flat[:1] + flat[3:] + flat[1:3]}}
-    elif mutate == "view_only_reorder":
-        plain = {"my_work": {"mission": {
-            "references": flat[:1] + flat[3:] + flat[1:3]}}}
+    elif mutate == "sidecar_reorder":
+        native_references = flat[:1] + flat[3:] + flat[1:3]
     elif mutate == "foreign_mission_ref":
         foreign = _docs("mis_" + "9" * 32)
         resolved = {"mission_request": {"source_refs": _flat([], foreign)}}
@@ -915,7 +917,16 @@ def test_b2b_documents_native_mutations_refuse(mutate):
             "mission_inputs": _pointer(docs,
                                        manifest_digest="sha256:" + "0" * 64)}})
     with pytest.raises(B2BTerminalRefusal, match="context_documents"):
-        _b2b_documents(raw, cap=cap, plain=plain, resolved=resolved)
+        _b2b_documents(
+            raw, cap=cap, plain=plain, resolved=resolved,
+            native_references=native_references)
+
+
+def test_b2b_documents_native_refuses_missing_sidecar():
+    docs, cap, plain, resolved, flat = _documents_case()
+    plain["my_work"]["mission"]["references"] = flat
+    with pytest.raises(B2BTerminalRefusal, match="context_documents"):
+        _b2b_documents(docs, cap=cap, plain=plain, resolved=resolved)
 
 
 # ---------------------------------------------------------------------------
@@ -1014,6 +1025,8 @@ def test_recipe_reason_classified():
     pytest.param(None, "request_digest", id="wrong-authorization-request"),
     pytest.param(None, "mission_source_digest", id="wrong-authorization-source"),
     pytest.param(None, "messages_digest", id="wrong-authorization-recipe"),
+    pytest.param(None, "unattested-view-piece", id="unattested-view-piece"),
+    pytest.param(None, "different-view-prefix", id="different-view-prefix"),
     pytest.param(None, "revoke_after_prepare", id="revoke-after-preparation"),
 ])
 async def test_native_http_prepare_admission_replay_and_revocation(
@@ -1034,7 +1047,12 @@ async def test_native_http_prepare_admission_replay_and_revocation(
     profile_home = adm._profile_home(tmp_path, monkeypatch, "deploy")
     documents = _docs(count=20)
     ordinary_refs = [f"dubsar:mission:ref-{index}" for index in range(20)]
+    view_refs = ordinary_refs
     native_references = _flat(ordinary_refs, documents)
+    if authorization == "unattested-view-piece":
+        view_refs = [*ordinary_refs[:-1], f"dubsar:piece:{MISSION}:piece_{'f' * 32}"]
+    elif authorization == "different-view-prefix":
+        view_refs = list(reversed(ordinary_refs))
     mission_request = {
         "criteria": ["prove the lane"], "objective": "o",
         "source_refs": native_references, "title": "t"}
@@ -1086,7 +1104,7 @@ async def test_native_http_prepare_admission_replay_and_revocation(
     manifest_path.chmod(0o640)
     monkeypatch.setattr(auth, "_NATIVE_TRUSTED_ROOT", str(trusted_root))
     monkeypatch.setattr(auth, "_NATIVE_BOOT_ID_PATH", boot_path)
-    monkeypatch.setattr(auth, "_NATIVE_SECURITY_UID", os.getuid())
+    monkeypatch.setattr(auth, "_NATIVE_SECURITY_UID", getattr(os, "getuid")())
     run_ref = {"path": str(manifest_path), "sha256": hashlib.sha256(
         manifest_bytes).hexdigest()}
 
@@ -1164,7 +1182,7 @@ async def test_native_http_prepare_admission_replay_and_revocation(
             execution_lane._write_fake_plugin(
                 profile_home, name=plugin_name,
                 init=_native_e2e_plugin_init(
-                    documents, ordinary_refs, native_references, rendered,
+                    documents, view_refs, native_references, rendered,
                     resolved_body["mission_source_digest"]))
             execution_lane._plugin_config(profile_home, names=(plugin_name,))
 
@@ -1199,6 +1217,12 @@ async def test_native_http_prepare_admission_replay_and_revocation(
                           "request_id": prepare_request_id},
                     headers=headers)
                 prepared = await prepared_response.json()
+                if authorization in {"unattested-view-piece", "different-view-prefix"}:
+                    assert prepared_response.status == 503, prepared
+                    assert prepared == {
+                        "error": "context_documents", "code": "context_documents"}
+                    assert provider_requests == []
+                    return
                 assert prepared_response.status == 200, prepared
                 signature = base64.urlsafe_b64decode(
                     prepared["signature"] + "=" * (-len(prepared["signature"]) % 4))

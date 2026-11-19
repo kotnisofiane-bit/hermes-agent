@@ -42,8 +42,6 @@ def _native_parents_safe(path: str) -> bool:
         return False
     current = os.path.dirname(path)
     while True:
-        if root == os.path.sep and current == root:
-            return True
         try:
             info = os.lstat(current)
         except OSError:
