@@ -55,7 +55,7 @@ def _nonhydrating_profile_scopes():
 # Routes whose request scope must never hydrate plugin secret sources on the
 # loop: every B2B governed-lane route (the launch bootstrap hydrates inside
 # its own bounded worker) and the health variants.
-_B2B_HTTP_ROUTE_RE = re.compile(r"^/api/sessions/[^/]+/b2b-proposal(?:/|$)")
+_B2B_HTTP_ROUTE_RE = re.compile(r"^/api/sessions/[^/]+/b2b-(?:proposal|prepare)(?:/|$)")
 _NONHYDRATING_ROUTE_PATHS = frozenset({"/health", "/health/detailed", "/v1/health"})
 
 

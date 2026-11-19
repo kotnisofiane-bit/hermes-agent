@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
+import re
 import threading
 import time
 from dataclasses import dataclass
@@ -233,6 +235,112 @@ def assert_context_source_current(preparation: Any) -> None:
         raise B2BTerminalRefusal("context_oc_source_stale")
 
 
+# ---------------------------------------------------------------------------
+# Structured piece attestation — the producer's ordered ``documents`` result
+# field, re-proven host-side against BOTH proof lists (the qualified view's
+# mission references AND the signed mission_request.source_refs).
+# ---------------------------------------------------------------------------
+
+_PIECE_ID = re.compile(r"\Apiece_[a-f0-9]{32}\Z")
+_PIECE_REF = re.compile(r"\Adubsar:piece:mis_[a-f0-9]{32}:piece_[a-f0-9]{32}\Z")
+_PIECE_PREFIX = "dubsar:piece:"
+_DOCUMENT_KEYS = frozenset(
+    {"id", "revision", "text", "content_digest", "native_ref", "native_digest"})
+_MAX_B2B_DOCUMENTS = 20
+_MAX_DOCUMENT_TEXT_BYTES = 8192
+
+
+def _document_digest_reprs(digest: str) -> frozenset:
+    """Both spelled forms a proof list may carry: bare hex and the
+    ``sha256:``-prefixed digest."""
+    bare = digest.split(":", 1)[1] if digest.startswith("sha256:") else digest
+    return frozenset((bare, "sha256:" + bare))
+
+
+def _b2b_document(raw: Any, mission_id: Any) -> Dict[str, Any]:
+    """One validated piece of the structured document attestation — the exact
+    six-key closed shape the owning producer's input port enforces, re-proven
+    host-side: piece id, revision 1, bounded UTF-8 text whose sha256 BOTH
+    digests carry, and a mission-bound native ref."""
+    if not isinstance(raw, Mapping) or set(raw) != _DOCUMENT_KEYS:
+        raise B2BTerminalRefusal("context_documents")
+    piece_id, revision, text = raw["id"], raw["revision"], raw["text"]
+    if not isinstance(piece_id, str) or _PIECE_ID.fullmatch(piece_id) is None:
+        raise B2BTerminalRefusal("context_documents")
+    if type(revision) is not int or revision != 1:
+        raise B2BTerminalRefusal("context_documents")
+    if not isinstance(text, str) or not text or "\x00" in text:
+        raise B2BTerminalRefusal("context_documents")
+    try:
+        _reject_bad_unicode(text)
+        encoded = text.encode("utf-8")
+    except (UnicodeError, ValueError):
+        raise B2BTerminalRefusal("context_documents") from None
+    if len(encoded) > _MAX_DOCUMENT_TEXT_BYTES:
+        raise B2BTerminalRefusal("context_documents")
+    expected = "sha256:" + hashlib.sha256(encoded).hexdigest()
+    if raw["content_digest"] != expected or raw["native_digest"] != expected:
+        raise B2BTerminalRefusal("context_documents")
+    if raw["native_ref"] != f"dubsar:piece:{mission_id}:{piece_id}":
+        raise B2BTerminalRefusal("context_documents")
+    return {"id": piece_id, "revision": revision, "text": text,
+            "content_digest": expected, "native_ref": raw["native_ref"],
+            "native_digest": expected}
+
+
+def _b2b_documents(raw_documents: Any, *, cap: BoundExecution,
+                   plain: Mapping[str, Any],
+                   resolved: Mapping[str, Any]) -> Tuple[Any, ...]:
+    """Host re-proof of the producer's structured piece attestation: missing
+    is legal ONLY when no piece reference exists in EITHER proof list; every
+    attested piece must be mission-bound, digest-exact and proven by an
+    adjacent (ref, digest) pair in BOTH the qualified view's mission
+    references and the signed ``mission_request.source_refs`` — every piece
+    ref in turn attested exactly once. Anything else refuses
+    ``context_documents``."""
+    mission_id = cap.policy_get("mission_id")
+    my_work = plain.get("my_work") if isinstance(plain, Mapping) else None
+    mission = my_work.get("mission") if isinstance(my_work, Mapping) else None
+    native_refs = mission.get("references") if isinstance(mission, Mapping) else None
+    request = resolved.get("mission_request")
+    request_refs = request.get("source_refs") if isinstance(request, Mapping) else None
+    proof_lists = (native_refs, request_refs)
+    piece_refs = [v for values in proof_lists
+                  if isinstance(values, (list, tuple)) for v in values
+                  if isinstance(v, str) and v.startswith(_PIECE_PREFIX)]
+    if raw_documents is None:
+        if piece_refs:
+            raise B2BTerminalRefusal("context_documents")
+        return ()
+    if (not isinstance(raw_documents, (list, tuple)) or
+            len(raw_documents) > _MAX_B2B_DOCUMENTS):
+        raise B2BTerminalRefusal("context_documents")
+    documents = [_b2b_document(item, mission_id) for item in raw_documents]
+    if (len({d["id"] for d in documents}) != len(documents) or
+            len({d["native_ref"] for d in documents}) != len(documents)):
+        raise B2BTerminalRefusal("context_documents")
+    attested_refs = [d["native_ref"] for d in documents]
+    for ref in piece_refs:
+        if (_PIECE_REF.fullmatch(ref) is None
+                or not ref.startswith(f"{_PIECE_PREFIX}{mission_id}:")
+                or attested_refs.count(ref) != 1):
+            raise B2BTerminalRefusal("context_documents")
+    if documents:
+        for values in proof_lists:
+            if (not isinstance(values, (list, tuple)) or
+                    any(type(v) is not str for v in values)):
+                raise B2BTerminalRefusal("context_documents")
+            for document in documents:
+                ref = document["native_ref"]
+                if values.count(ref) != 1:
+                    raise B2BTerminalRefusal("context_documents")
+                index = list(values).index(ref)
+                if (index + 1 >= len(values) or values[index + 1] not in
+                        _document_digest_reprs(document["native_digest"])):
+                    raise B2BTerminalRefusal("context_documents")
+    return tuple(_deep_freeze(d) for d in documents)
+
+
 @dataclass(frozen=True)
 class _PreparedContext:
     """The frozen proof bound to ONE capability's sink: the qualified view,
@@ -250,6 +358,8 @@ class _PreparedContext:
     profile: str
     home: str
     policy_home: Any
+    rendered: bytes = b""
+    documents: Tuple[Any, ...] = ()
 
     def _assert_frame(self, cap: Optional[BoundExecution]) -> None:
         if cap is not self.cap or cap.profile != self.profile:
@@ -366,6 +476,16 @@ def _prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) ->
             len(rendered_text) != plain["bounds"]["render_chars"]):
         raise B2BTerminalRefusal("context_render_bounds")
 
+    # The structured piece attestation — the producer's own ordered document
+    # manifest, re-proven host-side against BOTH proof lists (view references
+    # AND the signed mission_request.source_refs). Both b2b-prepare and
+    # b2b-proposal refuse before attestation or admission when a cited piece
+    # has no verified manifest. Parsing rendered bytes for pieces would lose
+    # the producer's authoritative validation; trusting the field unproven
+    # would let it drift from the mission fingerprints.
+    documents = _b2b_documents(
+        result.get("documents"), cap=cap, plain=plain, resolved=resolved)
+
     _observed_ms, source_deadline_ms = _assert_source_window(plain)
 
     prepared = _PreparedContext(
@@ -375,7 +495,9 @@ def _prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) ->
         project_utf8=json_utf8(cap.policy_get("project")),
         profile=cap.profile,
         home=str(get_hermes_home().resolve()),
-        policy_home=cap.policy_get("profile_home"))
+        policy_home=cap.policy_get("profile_home"),
+        rendered=rendered_bytes,
+        documents=documents)
     # The plugin's configuration must not have drifted during the read.
     prepared.assert_current(cap)
     return prepared
