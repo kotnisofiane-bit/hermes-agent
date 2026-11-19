@@ -19,10 +19,13 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
+import stat
 import time
 import types
 import uuid
+from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 from agent.b2b_execution import (
@@ -57,6 +60,28 @@ _PREPARE_REQUEST_ID_RE = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}")
 _OBJECT_ID = re.compile(r"^[0-9a-f]{24}$")
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+# Lot-1 native N2 lane: the catalogue may opt a project in with an exact
+# {tenant_id, run_authorization?} stanza; only a deploy-bound prj_32 lane may
+# carry it and its resolved body is the strictly extended shape.
+_NATIVE_PROJECT_ID = re.compile(r"^prj_[0-9a-f]{32}$")
+_NATIVE_TENANT_ID = re.compile(
+    r"^[^\x00-\x1f\s](?:[^\x00-\x1f]{0,62}[^\x00-\x1f\s])?$")
+_SHA256_PREFIXED = re.compile(r"^sha256:[0-9a-f]{64}$")
+_POINTER_KEYS = frozenset({"inputs_revision", "manifest_digest", "inputs_digest"})
+_DATASET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+_NATIVE_SECURITY_UID = 32013
+_NATIVE_MANIFEST_MAX = 65536
+_NATIVE_MANIFEST_FORMAT = "dubsar.b2b-n2-recipe/1"
+_NATIVE_MANIFEST_CLASS = "public_synthetic"
+_NATIVE_MANIFEST_KEYS = frozenset({
+    "format", "boot_id", "classification", "dataset_id", "binding",
+    "request_digest", "mission_source_digest", "messages_digest",
+})
+_NATIVE_BINDING_KEYS = (
+    "tenant_id", "project_id", "mission_id", "mission_revision", "profile",
+    "session_id", "attempt_id", "binding_digest", "requester_id",
+    "mission_inputs",
+)
 _MISSION_ID = B2B_MISSION_ID  # AUTORITE-PRODUCTION §6.4, Contracts da9bc826
 _UNPAIRED = re.compile(
     r"[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]")
@@ -75,6 +100,8 @@ _RESPONSE_BODY_KEYS = frozenset({
     "observation_genesis", "profile", "project_binding_id", "project_id",
     "request_digest", "requester_id", "reservation_ref", "session_id",
     "source_request_digest", "source_request_id", "source_state", "ticket_digest"})
+_RESPONSE_BODY_KEYS_NATIVE = _RESPONSE_BODY_KEYS | frozenset(
+    {"tenant_id", "mission_inputs"})
 _OBSERVATION_KEYS = frozenset({
     "id", "source", "title", "model", "parent_session_id", "has_system_prompt",
     "has_model_config", "ended_at", "end_reason", "message_count", "tool_call_count",
@@ -90,9 +117,9 @@ _PROFILE_ENTRY_KEYS = frozenset({
 _PROJECT_ENTRY_KEYS = frozenset({
     "project_id", "bot_id", "profile_id", "allowed_namespaces", "context_contract_root",
     "model", "provider", "base_url", "api_mode", "logical_mission", "project_context",
-    "request_timeout_seconds", "memory_mode"})
+    "request_timeout_seconds", "memory_mode", "native_n2"})
 _PROJECT_ENTRY_REQUIRED_KEYS = _PROJECT_ENTRY_KEYS - {
-    "request_timeout_seconds", "memory_mode"}
+    "request_timeout_seconds", "memory_mode", "native_n2"}
 _PROJECT_CONTEXT_KEYS = frozenset({"allocation_root", "project_id", "start"})
 _API_MODES = frozenset({"chat_completions"})
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -312,6 +339,43 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
             if not isinstance(v, str) or not v or _CONTROL_CHARS.search(v) or not _ABS_PATH_RE.match(v):
                 raise B2BConfigError(
                     f"b2b config: project {binding_id}: project_context.{k} must be absolute")
+    native = entry.get("native_n2")
+    native_n2 = None
+    if "native_n2" in entry:
+        # The native N2 lane is a strict opt-in: only an exact deploy-bound
+        # prj_32 project on the pinned custom:g2 loopback route, no memory and
+        # a required project_context may carry it.
+        if (not _NATIVE_PROJECT_ID.fullmatch(binding_id)
+                or not _NATIVE_PROJECT_ID.fullmatch(project_id)
+                or binding_id != project_id
+                or entry["bot_id"] != "deploy" or entry["profile_id"] != "deploy"
+                or memory_mode != "none" or entry["provider"] != "custom:b2b-g2"
+                or pc is None):
+            raise B2BConfigError(
+                f"b2b config: project {binding_id}: native_n2 requires exact deploy lane")
+        if (not isinstance(native, Mapping)
+                or not set(native.keys()).issubset({"tenant_id", "run_authorization"})
+                or "tenant_id" not in native):
+            raise B2BConfigError(
+                f"b2b config: project {binding_id}: native_n2 closed keys")
+        tenant_id = native["tenant_id"]
+        if not isinstance(tenant_id, str) or not _NATIVE_TENANT_ID.fullmatch(tenant_id):
+            raise B2BConfigError(
+                f"b2b config: project {binding_id}: native_n2.tenant_id")
+        native_n2 = {"tenant_id": tenant_id}
+        if "run_authorization" in native:
+            ref = native["run_authorization"]
+            if not isinstance(ref, Mapping) or set(ref.keys()) != {"path", "sha256"}:
+                raise B2BConfigError(
+                    f"b2b config: project {binding_id}: run_authorization closed keys")
+            path, sha256 = ref.get("path"), ref.get("sha256")
+            if (not isinstance(path, str) or not path or "\x00" in path
+                    or os.path.abspath(path) != path
+                    or not isinstance(sha256, str)
+                    or _HEX64.fullmatch(sha256) is None):
+                raise B2BConfigError(
+                    f"b2b config: project {binding_id}: run_authorization ref")
+            native_n2["run_authorization"] = {"path": path, "sha256": sha256}
     normalized = {
         "project_id": project_id,
         "bot_id": entry["bot_id"], "profile_id": entry["profile_id"],
@@ -329,6 +393,8 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
         normalized["request_timeout_seconds"] = request_timeout_seconds
     if "memory_mode" in entry:
         normalized["memory_mode"] = memory_mode
+    if native_n2 is not None:
+        normalized["native_n2"] = native_n2
     return normalized
 
 
@@ -367,6 +433,21 @@ class B2BConfig:
                     raise B2BConfigError(
                         f"b2b config: profile {name}: invalid project binding id")
                 parsed_projects[binding_id] = _validate_project_entry(p, binding_id)
+            native_ids = [
+                project["project_id"] for project in parsed_projects.values()
+                if project.get("native_n2") is not None]
+            if native_ids:
+                if name != "deploy":
+                    raise B2BConfigError(
+                        f"b2b config: profile {name}: "
+                        "native_n2 requires the deploy profile")
+                # A native project id may be bound exactly once in this
+                # catalogue: no second entry — native or legacy — may alias it.
+                if any(sum(1 for project in parsed_projects.values()
+                           if project["project_id"] == pid) != 1
+                       for pid in native_ids):
+                    raise B2BConfigError(
+                        f"b2b config: profile {name}: native_n2 project aliased")
             parsed[name] = {
                 "source_url": _validate_source_url(entry.get("source_url")),
                 "portal_issuer": _req_str(
@@ -484,9 +565,16 @@ def _verify_envelope(parsed: Any, *, entry: Mapping[str, Any], keys: _KeyRing,
 
 
 def _verify_resolved_body(body: Any, *, request: Dict[str, Any], profile: str,
-                          session_id: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    """Closed 20-field resolved response; every P1 verifyResolvedSource check mirrored."""
-    if not _exact_keys(body, _RESPONSE_BODY_KEYS) or not _scalar_ok(body):
+                          session_id: str,
+                          native_n2: Optional[Mapping[str, Any]] = None
+                          ) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Closed resolved response; every P1 verifyResolvedSource check mirrored.
+    ``native_n2`` is the configured stanza of the catalogue entry the signed
+    ``project_binding_id`` selects — never the body's own claim. When it is
+    set the body must carry exactly the extended 22-field shape."""
+    expected = (_RESPONSE_BODY_KEYS_NATIVE if native_n2 is not None
+                else _RESPONSE_BODY_KEYS)
+    if not _exact_keys(body, expected) or not _scalar_ok(body):
         return None, "body_shape"
     req_body = request["body"]
     if (body.get("source_request_id") != request.get("request_id")
@@ -531,7 +619,9 @@ def _verify_resolved_body(body: Any, *, request: Dict[str, Any], profile: str,
             return None, f"body_{k}"
     if not _valid_observation(body.get("observation_genesis"), profile, session_id):
         return None, "body_observation"
-    if not _valid_mission_request(body.get("mission_request")):
+    # Both variants share the 20-entry cap; the native response also
+    # validates the ordered piece suffix in _verify_native_body.
+    if native_n2 is None and not _valid_mission_request(body.get("mission_request")):
         return None, "body_mission_request"
     basis = {
         "format": "dubsar.b2b-agent-session-binding/1", "requester_id": body["requester_id"],
@@ -539,7 +629,178 @@ def _verify_resolved_body(body: Any, *, request: Dict[str, Any], profile: str,
         "mission_revision": body["mission_revision"]}
     if hashlib.sha256(canonical_json(basis)).hexdigest() != binding:
         return None, "body_binding_tuple"
+    if native_n2 is not None and not _verify_native_body(body, native_n2):
+        return None, "body_native"
     return dict(body), "ok"
+
+
+def _valid_native_source_refs(values: Any, mission_id: str) -> bool:
+    """Native flat refs use the source contract's combined 20-entry cap."""
+    if not isinstance(values, list) or not 1 <= len(values) <= _SOURCE_REFS_MAX:
+        return False
+    if not all(_bounded_field(v, _SOURCE_REF_MAX) for v in values):
+        return False
+    piece = re.compile(
+        rf"^dubsar:piece:{re.escape(mission_id)}:piece_[0-9a-f]{{32}}$")
+    docs = [i for i, v in enumerate(values) if v.startswith("dubsar:piece:")]
+    count = len(docs)
+    if not 1 <= count <= 20 or len(values) - 2 * count > _SOURCE_REFS_MAX:
+        return False
+    if docs != list(range(len(values) - 2 * count, len(values), 2)):
+        return False
+    seen = set()
+    for i in docs:
+        value = values[i]
+        if (piece.fullmatch(value) is None
+                or _SHA256_PREFIXED.fullmatch(values[i + 1]) is None):
+            return False
+        piece_id = value.rsplit(":", 1)[1]
+        if piece_id in seen:
+            return False
+        seen.add(piece_id)
+    return True
+
+
+def _verify_native_body(body: Mapping[str, Any], native_n2: Mapping[str, Any]) -> bool:
+    """The extended native body admits only the exact tenant/project/pointer
+    binding the opted catalogue entry declares."""
+    if (body.get("tenant_id") != native_n2.get("tenant_id")
+            or body.get("profile") != "deploy"
+            or not isinstance(body.get("project_id"), str)
+            or _NATIVE_PROJECT_ID.fullmatch(body["project_id"]) is None
+            or body.get("project_binding_id") != body["project_id"]):
+        return False
+    pointer = body.get("mission_inputs")
+    if (not isinstance(pointer, Mapping) or set(pointer) != _POINTER_KEYS
+            or type(pointer.get("inputs_revision")) is not int
+            or not 1 <= pointer["inputs_revision"] <= 2**53 - 1
+            or type(pointer.get("manifest_digest")) is not str
+            or _SHA256_PREFIXED.fullmatch(pointer["manifest_digest"]) is None
+            or type(pointer.get("inputs_digest")) is not str
+            or _SHA256_PREFIXED.fullmatch(pointer["inputs_digest"]) is None):
+        return False
+    mission_request = body.get("mission_request")
+    if (not _exact_keys(mission_request,
+                        {"criteria", "objective", "source_refs", "title"})
+            or not _bounded_field(mission_request["title"], _TITLE_MAX)
+            or not _bounded_field(mission_request["objective"], _OBJECTIVE_MAX)
+            or not isinstance(mission_request["criteria"], list)
+            or not 1 <= len(mission_request["criteria"]) <= _CRITERIA_MAX
+            or not all(_bounded_field(c, _CRITERION_MAX)
+                       for c in mission_request["criteria"])):
+        return False
+    return _valid_native_source_refs(
+        mission_request.get("source_refs"), body.get("mission_id", ""))
+
+
+def _native_binding(resolved: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    """Canonical ten-key native run binding — present only after the extended
+    body shape verified; a legacy resolve never carries it."""
+    if resolved.get("_native_verified") is not True:
+        return None
+    return {key: resolved[key] for key in _NATIVE_BINDING_KEYS}
+
+
+def _boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text("ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def _native_parents_safe(path: str) -> bool:
+    """Every ancestor directory: a real dir, owned by root or the security uid,
+    never group/world writable."""
+    current = path
+    while True:
+        parent = os.path.dirname(current)
+        if parent == current:
+            return True
+        try:
+            info = os.lstat(parent)
+        except OSError:
+            return False
+        if (not stat.S_ISDIR(info.st_mode)
+                or info.st_uid not in (0, _NATIVE_SECURITY_UID)
+                or stat.S_IMODE(info.st_mode) & 0o022):
+            return False
+        current = parent
+
+
+def _read_native_run_authorization(ref: Any) -> Optional[Dict[str, Any]]:
+    """Protected manifest read — same discipline as the Portal installation
+    record: canonical path, safe parents, O_NOFOLLOW, security-owned 0640
+    nlink=1 regular file, byte-pinned sha256, current-boot JSON record.
+    Returns the closed eight-key manifest or ``None`` (fail closed)."""
+    if not isinstance(ref, Mapping) or set(ref) != {"path", "sha256"}:
+        return None
+    path, pinned = ref.get("path"), ref.get("sha256")
+    if (not isinstance(path, str) or not path or "\x00" in path
+            or os.path.abspath(path) != path
+            or not isinstance(pinned, str) or _HEX64.fullmatch(pinned) is None
+            or not _native_parents_safe(path)):
+        return None
+    boot_id = _boot_id()
+    if not boot_id:
+        return None
+    try:
+        with os.fdopen(
+                os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode)
+                    or stat.S_IMODE(info.st_mode) != 0o640
+                    or info.st_uid != _NATIVE_SECURITY_UID or info.st_nlink != 1
+                    or info.st_size > _NATIVE_MANIFEST_MAX):
+                return None
+            data = stream.read(_NATIVE_MANIFEST_MAX + 1)
+    except OSError:
+        return None
+    if (len(data) > _NATIVE_MANIFEST_MAX
+            or hashlib.sha256(data).hexdigest() != pinned):
+        return None
+    try:
+        record = _strict_json_loads(data)
+    except (ValueError, RecursionError):
+        return None
+    binding = record.get("binding") if isinstance(record, Mapping) else None
+    pointer = binding.get("mission_inputs") if isinstance(binding, Mapping) else None
+    if (not isinstance(record, Mapping) or set(record) != _NATIVE_MANIFEST_KEYS
+            or record.get("format") != _NATIVE_MANIFEST_FORMAT
+            or record.get("boot_id") != boot_id
+            or record.get("classification") != _NATIVE_MANIFEST_CLASS
+            or not isinstance(record.get("dataset_id"), str)
+            or _DATASET_ID.fullmatch(record["dataset_id"]) is None
+            or not isinstance(binding, Mapping)
+            or set(binding) != set(_NATIVE_BINDING_KEYS)
+            or type(binding.get("mission_revision")) is not int
+            or not 1 <= binding["mission_revision"] <= 2**53 - 1
+            or any(type(binding.get(key)) is not str for key in (
+                "tenant_id", "project_id", "mission_id", "profile", "session_id",
+                "attempt_id", "binding_digest", "requester_id"))
+            or _NATIVE_TENANT_ID.fullmatch(binding["tenant_id"]) is None
+            or _NATIVE_PROJECT_ID.fullmatch(binding["project_id"]) is None
+            or _MISSION_ID.fullmatch(binding["mission_id"]) is None
+            or binding["profile"] != "deploy"
+            or _SESSION_ID_RE.fullmatch(binding["session_id"]) is None
+            or _ATTEMPT_ID_RE.fullmatch(binding["attempt_id"]) is None
+            or _HEX64.fullmatch(binding["binding_digest"]) is None
+            or _OBJECT_ID.fullmatch(binding["requester_id"]) is None
+            or not isinstance(pointer, Mapping)
+            or set(pointer) != _POINTER_KEYS
+            or type(pointer.get("inputs_revision")) is not int
+            or not 1 <= pointer["inputs_revision"] <= 2**53 - 1
+            or type(pointer.get("manifest_digest")) is not str
+            or _SHA256_PREFIXED.fullmatch(pointer["manifest_digest"]) is None
+            or type(pointer.get("inputs_digest")) is not str
+            or _SHA256_PREFIXED.fullmatch(pointer["inputs_digest"]) is None
+            or type(record.get("request_digest")) is not str
+            or _SHA256_FIELD.fullmatch(record["request_digest"]) is None
+            or type(record.get("mission_source_digest")) is not str
+            or _SHA256_FIELD.fullmatch(record["mission_source_digest"]) is None
+            or type(record.get("messages_digest")) is not str
+            or _HEX64.fullmatch(record["messages_digest"]) is None):
+        return None
+    return dict(record)
 
 
 # ---------------------------------------------------------------------------
@@ -584,10 +845,31 @@ async def _resolve_source_async(entry: Mapping[str, Any], keys: _KeyRing, purpos
         issuer=entry["portal_issuer"], audience=entry["hermes_issuer"])
     if verified is None:
         return None, reason
+    # Exact legacy-vs-extended selection comes from the configured project the
+    # signed body binds — never the body's own claim. A body that names a
+    # configured native project_id but binds a non-native catalogue alias is a
+    # downgrade and refuses before any shape check.
+    signed_body = verified.get("body")
+    catalogue_key = (signed_body.get("project_binding_id")
+                     if isinstance(signed_body, Mapping) else None)
+    project = (entry["projects"].get(catalogue_key)
+               if isinstance(catalogue_key, str) else None)
+    native_n2 = (project.get("native_n2")
+                 if isinstance(project, Mapping) else None)
+    native_ids = {p["project_id"] for p in entry["projects"].values()
+                  if isinstance(p, Mapping) and p.get("native_n2") is not None}
+    claimed = signed_body.get("project_id") if isinstance(signed_body, Mapping) else None
+    if (isinstance(claimed, str) and claimed in native_ids
+            and native_n2 is None):
+        return None, "body_native_downgrade"
     out, reason = _verify_resolved_body(
-        verified.get("body"), request=env, profile=profile, session_id=session_id)
+        verified.get("body"), request=env, profile=profile, session_id=session_id,
+        native_n2=native_n2)
     if out is None:
         return None, reason
+    if native_n2 is not None:
+        out["_native_verified"] = True
+        out["_native_binding"] = _native_binding(out)
     if not (env["issued_at"] <= int(time.time()) < env["expires_at"]):
         return None, "request_window_closed"
     out["_signed_request"] = env
@@ -731,6 +1013,10 @@ def _policy_digest(profile: str, entry: Mapping[str, Any], project: Mapping[str,
         "schema_pins": R2_SCHEMA_PINS, "execution_policy": "h1/proposal-v1",
         "profile_home": resolved.get("profile_home"),
     }
+    if "native_n2" in project:
+        basis["native_n2"] = project["native_n2"]
+        basis["native_n2_binding"] = resolved.get("native_n2_binding")
+        basis["native_n2_messages_digest"] = resolved.get("native_n2_messages_digest")
     # Optional operator key: absent from the digest basis unless explicitly
     # configured, so a pre-versioning admission replays byte-for-byte while a
     # configured value still revokes a running cap when changed mid-run.
@@ -846,6 +1132,7 @@ _BLOCK_POLICY_CHANGED_REASONS = frozenset({
     "b2b_sdk_override", "b2b_sdk_headers", "b2b_client_policy",
     "b2b_retries_not_disabled", "b2b_request_client_not_isolated",
     "b2b_timeout_policy", "terminal_guard_required", "kwargs_not_permitted",
+    "b2b_recipe_messages_mismatch",
 })
 _BLOCK_SOURCE_DENIED_REASONS = frozenset({
     "source_before_provider_denied", "source_before_seal_denied",
@@ -952,9 +1239,45 @@ class _AttemptSink:
             "project_binding_id", "mission_id", "mission_revision", "profile", "session_id",
             "reservation_ref", "request_digest", "ticket_digest", "authority_basis_digest",
             "authority_digest", "observation_genesis", "mission_request")
-        return (resolved.get("source_state") == "active" and self.assert_current_policy() and
+        if not (resolved.get("source_state") == "active" and self.assert_current_policy() and
                 all(json_utf8(resolved.get(key)) == json_utf8(self.policy.get(key))
-                    for key in fields))
+                    for key in fields)):
+            return False
+        native = _native_binding(resolved)
+        expected_native = self.policy.get("native_n2_binding")
+        if (native is None) != (expected_native is None):
+            return False
+        if expected_native is not None:
+            if canonical_json(native) != canonical_json(expected_native):
+                return False
+            # A native RUN policy additionally re-proves its manifest: the
+            # protected record must still pin the same binding and digests at
+            # every source recheck (resolve_before_provider and before_seal).
+            if (self.policy.get("native_n2_messages_digest") is not None
+                    and not self._native_run_current(resolved)):
+                return False
+        return True
+
+    def _native_run_current(self, resolved: Mapping[str, Any]) -> bool:
+        """Protected manifest re-read: the record must still pin exactly this
+        run's binding, this exchange's request/source digests and the approved
+        messages digest."""
+        project = self.policy.get("project")
+        native = project.get("native_n2") if isinstance(project, Mapping) else None
+        ref = native.get("run_authorization") if isinstance(native, Mapping) else None
+        manifest = _read_native_run_authorization(ref)
+        if manifest is None:
+            return False
+        try:
+            return (canonical_json(manifest["binding"]) ==
+                    canonical_json(self.policy.get("native_n2_binding"))
+                    and manifest["request_digest"] == resolved.get("request_digest")
+                    and manifest["mission_source_digest"] ==
+                    resolved.get("mission_source_digest")
+                    and manifest["messages_digest"] ==
+                    self.policy.get("native_n2_messages_digest"))
+        except (TypeError, ValueError):
+            return False
 
     def _source_matches_context(self, resolved: Mapping[str, Any]) -> bool:
         receipt = self.context_receipt
@@ -1388,6 +1711,21 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
+    native_binding = resolved.get("_native_binding")
+    native_messages_digest = None
+    if project.get("native_n2") is not None:
+        # Native run: the opted catalogue entry must carry run authorization
+        # and the protected manifest must pin THIS exact binding plus this
+        # exchange's digests. An absent stanza means prepare-only — refuse
+        # before context preparation, admission or any receipt consumption.
+        manifest = _read_native_run_authorization(
+            project["native_n2"].get("run_authorization"))
+        if (native_binding is None or manifest is None
+                or canonical_json(manifest["binding"]) != canonical_json(native_binding)
+                or manifest["request_digest"] != resolved["request_digest"]
+                or manifest["mission_source_digest"] != resolved["mission_source_digest"]):
+            return _deny(503, "execution_unavailable")
+        native_messages_digest = manifest["messages_digest"]
     # P2 admission gate: NEW work proves its mission context BEFORE the single
     # durable attempt is consumed — the sink/cap are built in memory first,
     # then the bounded bootstrap enters the owning profile scope (secret
@@ -1418,7 +1756,10 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         "authority_basis_digest": resolved["authority_basis_digest"],
         "authority_digest": resolved["authority_digest"],
         "observation_genesis": resolved["observation_genesis"],
-        "mission_request": resolved["mission_request"], "project": project}
+        "mission_request": resolved["mission_request"], "project": project,
+        **({"native_n2_binding": native_binding,
+            "native_n2_messages_digest": native_messages_digest}
+           if native_binding is not None else {})}
     fingerprint = _policy_digest(profile, entry, project, policy)
     scope = _run_scope(profile, resolved["requester_id"], binding_digest)
     initial_status = {"status": "queued", "session_id": session_id, "created_at": time.time()}
@@ -1595,7 +1936,9 @@ async def _prepare_b2b_only(adapter: Any, request: Any, *, profile: str, entry, 
         "authority_basis_digest": resolved["authority_basis_digest"],
         "authority_digest": resolved["authority_digest"],
         "observation_genesis": resolved["observation_genesis"],
-        "mission_request": resolved["mission_request"], "project": project}
+        "mission_request": resolved["mission_request"], "project": project,
+        **({"native_n2_binding": resolved.get("_native_binding")}
+           if resolved.get("_native_binding") is not None else {})}
     # The sink + cap exist ONLY in memory — the run_id minted here is the
     # capability's identity, NEVER admitted, scheduled or returned: the
     # attestation's run_id is null. A failed preparation drops both with
