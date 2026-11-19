@@ -309,22 +309,23 @@ def _b2b_documents(raw_documents: Any, *, cap: BoundExecution,
                    plain: Mapping[str, Any],
                    resolved: Mapping[str, Any],
                    native_references: Any = None) -> Tuple[Any, ...]:
-    """Host re-proof of the producer's structured piece attestation: missing
-    is legal ONLY when no piece reference exists in EITHER proof list; every
-    attested piece must be mission-bound, digest-exact and proven by an
-    adjacent (ref, digest) pair in BOTH the qualified view's mission
-    references and the signed ``mission_request.source_refs`` — every piece
-    ref in turn attested exactly once. Anything else refuses
-    ``context_documents``."""
+    """Re-prove the producer's structured piece attestation against its sources.
+
+    Historical: prove each piece exactly once in the qualified mission view and
+    the signed request, with its adjacent digest. No pieces permits no manifest.
+    Native N2: the qualified view must equal the ordinary prefix of the My Work
+    proof list. Its suffix and the signed request's suffix must both match the
+    nonempty manifest with canonical digests, in order. The canonical manifest
+    must match the bound pointer. A missing proof or mismatch is context_documents.
+    """
     mission_id = cap.policy_get("mission_id")
     native = cap.policy_get("native_n2_binding") is not None
     my_work = plain.get("my_work") if isinstance(plain, Mapping) else None
     mission = my_work.get("mission") if isinstance(my_work, Mapping) else None
-    native_refs = (native_references if native and native_references is not None else
-                   mission.get("references") if isinstance(mission, Mapping) else None)
+    view_refs = mission.get("references") if isinstance(mission, Mapping) else None
     request = resolved.get("mission_request")
     request_refs = request.get("source_refs") if isinstance(request, Mapping) else None
-    proof_lists = (native_refs, request_refs)
+    proof_lists = (native_references if native else view_refs, request_refs)
     piece_refs = [v for values in proof_lists
                   if isinstance(values, (list, tuple)) for v in values
                   if isinstance(v, str) and v.startswith(_PIECE_PREFIX)]
@@ -373,6 +374,9 @@ def _b2b_documents(raw_documents: Any, *, cap: BoundExecution,
                     or not 0 <= len(values) - 2 * len(documents) <= 20
                     or list(values[len(values) - 2 * len(documents):]) != flat):
                 raise B2BTerminalRefusal("context_documents")
+        if (not isinstance(view_refs, (list, tuple))
+                or list(view_refs) != list(native_references[:-len(flat)])):
+            raise B2BTerminalRefusal("context_documents")
         binding = cap.policy_get("native_n2_binding")
         pointer = binding.get("mission_inputs") \
             if isinstance(binding, Mapping) else None
@@ -525,13 +529,8 @@ def _prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) ->
             len(rendered_text) != plain["bounds"]["render_chars"]):
         raise B2BTerminalRefusal("context_render_bounds")
 
-    # The structured piece attestation — the producer's own ordered document
-    # manifest, re-proven host-side against BOTH proof lists (view references
-    # AND the signed mission_request.source_refs). Both b2b-prepare and
-    # b2b-proposal refuse before attestation or admission when a cited piece
-    # has no verified manifest. Parsing rendered bytes for pieces would lose
-    # the producer's authoritative validation; trusting the field unproven
-    # would let it drift from the mission fingerprints.
+    # Re-prove the producer's documents against the signed request and qualified
+    # view. Native N2 additionally binds the My Work sidecar to that view.
     documents = _b2b_documents(
         result.get("documents"), cap=cap, plain=plain, resolved=resolved,
         native_references=result.get("native_references"))
