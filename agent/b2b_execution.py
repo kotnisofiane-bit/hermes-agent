@@ -470,6 +470,7 @@ BLOCK_REASONS = frozenset({
     "b2b_capability_missing", "b2b_client_policy",
     "b2b_destination_mismatch", "b2b_model_mismatch", "b2b_policy_changed",
     "b2b_policy_override", "b2b_profile_mismatch",
+    "b2b_recipe_messages_mismatch",
     "b2b_request_client_not_isolated", "b2b_retries_not_disabled",
     "b2b_runtime_mismatch", "b2b_runtime_policy", "b2b_sdk_headers",
     "b2b_sdk_override", "b2b_timeout_policy", "kwargs_not_permitted",
@@ -1208,6 +1209,22 @@ def assert_terminal_runtime(agent: Any, kwargs: Mapping[str, Any], cap: BoundExe
         raise B2BTerminalRefusal("b2b_sdk_headers")
     if cap.sink.assert_current_policy() is not True:
         raise B2BTerminalRefusal("b2b_policy_changed")
+    if cap.policy_get("native_n2_binding") is not None:
+        # The native run may dispatch only the exact recipe the protected
+        # manifest approved: a non-empty {role, content} system/user list
+        # whose canonical digest equals the pinned messages_digest. The pin
+        # covers the raw Hermes turns, not G2's folded transcript.
+        messages = kwargs.get("messages")
+        if (type(messages) is not list or not messages
+                or any(type(message) is not dict or
+                       set(message) != {"role", "content"} or
+                       message["role"] !=
+                       ("user" if index == len(messages) - 1 else "system") or
+                       type(message["content"]) is not str
+                       for index, message in enumerate(messages))
+                or hashlib.sha256(canonical_json(messages)).hexdigest()
+                != cap.policy_get("native_n2_messages_digest")):
+            raise B2BTerminalRefusal("b2b_recipe_messages_mismatch")
 
 
 def provider_request_digest(kwargs: Mapping[str, Any]) -> str:

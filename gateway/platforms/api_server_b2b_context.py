@@ -33,7 +33,8 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from agent.b2b_execution import (
     B2BTerminalRefusal, BoundExecution, CONTEXT_MAX_BYTES, _deep_freeze,
     _native_oc_read_metadata, _reject_bad_unicode, _utc_milliseconds,
-    assert_source_equivalent, json_utf8, qualify_context_view, source_basis,
+    assert_source_equivalent, canonical_json, json_utf8, qualify_context_view,
+    source_basis,
 )
 from gateway.platforms.api_server_b2b import _SOURCE_DEADLINE_S
 
@@ -308,8 +309,9 @@ def _b2b_documents(raw_documents: Any, *, cap: BoundExecution,
     piece_refs = [v for values in proof_lists
                   if isinstance(values, (list, tuple)) for v in values
                   if isinstance(v, str) and v.startswith(_PIECE_PREFIX)]
+    native = cap.policy_get("native_n2_binding") is not None
     if raw_documents is None:
-        if piece_refs:
+        if piece_refs or native:
             raise B2BTerminalRefusal("context_documents")
         return ()
     if (not isinstance(raw_documents, (list, tuple)) or
@@ -338,6 +340,28 @@ def _b2b_documents(raw_documents: Any, *, cap: BoundExecution,
                 if (index + 1 >= len(values) or values[index + 1] not in
                         _document_digest_reprs(document["native_digest"])):
                     raise B2BTerminalRefusal("context_documents")
+    if native:
+        # Adjacency alone is not enough for the native lane: BOTH proof lists
+        # must enumerate the exact ordered (native_ref, native_digest) pairs
+        # as their suffix, the manifest must be non-empty, and its canonical
+        # six-key digest must equal the pointer the admitted binding carries.
+        if not documents:
+            raise B2BTerminalRefusal("context_documents")
+        flat = [part for document in documents
+                for part in (document["native_ref"], document["native_digest"])]
+        for values in proof_lists:
+            if (not isinstance(values, (list, tuple))
+                    or len(values) < 2 * len(documents)
+                    or list(values[len(values) - 2 * len(documents):]) != flat):
+                raise B2BTerminalRefusal("context_documents")
+        binding = cap.policy_get("native_n2_binding")
+        pointer = binding.get("mission_inputs") \
+            if isinstance(binding, Mapping) else None
+        manifest_digest = "sha256:" + hashlib.sha256(
+            canonical_json(documents)).hexdigest()
+        if (not isinstance(pointer, Mapping)
+                or pointer.get("manifest_digest") != manifest_digest):
+            raise B2BTerminalRefusal("context_documents")
     return tuple(_deep_freeze(d) for d in documents)
 
 
