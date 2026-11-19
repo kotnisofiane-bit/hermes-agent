@@ -38,6 +38,7 @@ from agent.b2b_execution import (
     canonical_json, install_bounded_agent_policy, reset_execution,
 )
 from gateway.platforms import api_server_b2b as m
+from gateway.platforms import api_server_b2b_native_authorization as native_auth
 from gateway.platforms.api_server_b2b_context import _b2b_documents
 from hermes_constants import get_hermes_home
 
@@ -580,25 +581,25 @@ def test_native_manifest_absent_and_unsafe_refuse():
     ref = {"path": os.path.join(tempfile.gettempdir(),
                                 f"n2-missing-{os.getpid()}.json"),
            "sha256": "a" * 64}
-    assert m._read_native_run_authorization(ref) is None
+    assert native_auth._read_native_run_authorization(ref) is None
     # A file we can create fails every proof: /tmp is world-writable and our
     # UID is never 32013 — the refusal is the fail-closed side only.
     directory = tempfile.mkdtemp(prefix="n2-manifest-")
     path = os.path.join(directory, "recipe.json")
     payload = json.dumps({
-        "format": "dubsar.b2b-n2-recipe/1", "boot_id": m._boot_id(),
+        "format": "dubsar.b2b-n2-recipe/1", "boot_id": native_auth._boot_id(),
         "classification": "public_synthetic", "dataset_id": "ds-1",
         "binding": {}, "request_digest": "a" * 64,
         "mission_source_digest": "b" * 64, "messages_digest": "c" * 64})
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(payload)
-    assert m._read_native_run_authorization(
+    assert native_auth._read_native_run_authorization(
         {"path": path,
          "sha256": hashlib.sha256(payload.encode()).hexdigest()}) is None
     for ref in (None, {}, {"path": "relative/x", "sha256": "a" * 64},
                 {"path": path, "sha256": "b" * 64},
                 {"path": path}):
-        assert m._read_native_run_authorization(ref) is None, ref
+        assert native_auth._read_native_run_authorization(ref) is None, ref
 
 
 # ---------------------------------------------------------------------------

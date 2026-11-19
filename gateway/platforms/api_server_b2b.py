@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import re
-import stat
 import time
 import types
 import uuid
@@ -34,6 +33,7 @@ from agent.b2b_execution import (
     _public_text, canonical_json, is_b2b_attempt_id, is_b2b_session_id, json_utf8,
     assert_source_equivalent, context_proof, qualify_context_view, verify_context_proof,
     mission_prompt, recheck_context, validate_proposal, extract_allowed_refs)
+from gateway.platforms import api_server_b2b_native_authorization as _native_auth
 
 logger = logging.getLogger("gateway.platforms.api_server")
 
@@ -68,15 +68,6 @@ _NATIVE_TENANT_ID = re.compile(
     r"^[^\x00-\x1f\s](?:[^\x00-\x1f]{0,62}[^\x00-\x1f\s])?$")
 _SHA256_PREFIXED = re.compile(r"^sha256:[0-9a-f]{64}$")
 _POINTER_KEYS = frozenset({"inputs_revision", "manifest_digest", "inputs_digest"})
-_DATASET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
-_NATIVE_SECURITY_UID = 32013
-_NATIVE_MANIFEST_MAX = 65536
-_NATIVE_MANIFEST_FORMAT = "dubsar.b2b-n2-recipe/1"
-_NATIVE_MANIFEST_CLASS = "public_synthetic"
-_NATIVE_MANIFEST_KEYS = frozenset({
-    "format", "boot_id", "classification", "dataset_id", "binding",
-    "request_digest", "mission_source_digest", "messages_digest",
-})
 _NATIVE_BINDING_KEYS = (
     "tenant_id", "project_id", "mission_id", "mission_revision", "profile",
     "session_id", "attempt_id", "binding_digest", "requester_id",
@@ -701,108 +692,6 @@ def _native_binding(resolved: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
     return {key: resolved[key] for key in _NATIVE_BINDING_KEYS}
 
 
-def _boot_id() -> str:
-    try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text("ascii").strip()
-    except (OSError, UnicodeDecodeError):
-        return ""
-
-
-def _native_parents_safe(path: str) -> bool:
-    """Every ancestor directory: a real dir, owned by root or the security uid,
-    never group/world writable."""
-    current = path
-    while True:
-        parent = os.path.dirname(current)
-        if parent == current:
-            return True
-        try:
-            info = os.lstat(parent)
-        except OSError:
-            return False
-        if (not stat.S_ISDIR(info.st_mode)
-                or info.st_uid not in (0, _NATIVE_SECURITY_UID)
-                or stat.S_IMODE(info.st_mode) & 0o022):
-            return False
-        current = parent
-
-
-def _read_native_run_authorization(ref: Any) -> Optional[Dict[str, Any]]:
-    """Protected manifest read — same discipline as the Portal installation
-    record: canonical path, safe parents, O_NOFOLLOW, security-owned 0640
-    nlink=1 regular file, byte-pinned sha256, current-boot JSON record.
-    Returns the closed eight-key manifest or ``None`` (fail closed)."""
-    if not isinstance(ref, Mapping) or set(ref) != {"path", "sha256"}:
-        return None
-    path, pinned = ref.get("path"), ref.get("sha256")
-    if (not isinstance(path, str) or not path or "\x00" in path
-            or os.path.abspath(path) != path
-            or not isinstance(pinned, str) or _HEX64.fullmatch(pinned) is None
-            or not _native_parents_safe(path)):
-        return None
-    boot_id = _boot_id()
-    if not boot_id:
-        return None
-    try:
-        with os.fdopen(
-                os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(info.st_mode)
-                    or stat.S_IMODE(info.st_mode) != 0o640
-                    or info.st_uid != _NATIVE_SECURITY_UID or info.st_nlink != 1
-                    or info.st_size > _NATIVE_MANIFEST_MAX):
-                return None
-            data = stream.read(_NATIVE_MANIFEST_MAX + 1)
-    except OSError:
-        return None
-    if (len(data) > _NATIVE_MANIFEST_MAX
-            or hashlib.sha256(data).hexdigest() != pinned):
-        return None
-    try:
-        record = _strict_json_loads(data)
-    except (ValueError, RecursionError):
-        return None
-    binding = record.get("binding") if isinstance(record, Mapping) else None
-    pointer = binding.get("mission_inputs") if isinstance(binding, Mapping) else None
-    if (not isinstance(record, Mapping) or set(record) != _NATIVE_MANIFEST_KEYS
-            or record.get("format") != _NATIVE_MANIFEST_FORMAT
-            or record.get("boot_id") != boot_id
-            or record.get("classification") != _NATIVE_MANIFEST_CLASS
-            or not isinstance(record.get("dataset_id"), str)
-            or _DATASET_ID.fullmatch(record["dataset_id"]) is None
-            or not isinstance(binding, Mapping)
-            or set(binding) != set(_NATIVE_BINDING_KEYS)
-            or type(binding.get("mission_revision")) is not int
-            or not 1 <= binding["mission_revision"] <= 2**53 - 1
-            or any(type(binding.get(key)) is not str for key in (
-                "tenant_id", "project_id", "mission_id", "profile", "session_id",
-                "attempt_id", "binding_digest", "requester_id"))
-            or _NATIVE_TENANT_ID.fullmatch(binding["tenant_id"]) is None
-            or _NATIVE_PROJECT_ID.fullmatch(binding["project_id"]) is None
-            or _MISSION_ID.fullmatch(binding["mission_id"]) is None
-            or binding["profile"] != "deploy"
-            or _SESSION_ID_RE.fullmatch(binding["session_id"]) is None
-            or _ATTEMPT_ID_RE.fullmatch(binding["attempt_id"]) is None
-            or _HEX64.fullmatch(binding["binding_digest"]) is None
-            or _OBJECT_ID.fullmatch(binding["requester_id"]) is None
-            or not isinstance(pointer, Mapping)
-            or set(pointer) != _POINTER_KEYS
-            or type(pointer.get("inputs_revision")) is not int
-            or not 1 <= pointer["inputs_revision"] <= 2**53 - 1
-            or type(pointer.get("manifest_digest")) is not str
-            or _SHA256_PREFIXED.fullmatch(pointer["manifest_digest"]) is None
-            or type(pointer.get("inputs_digest")) is not str
-            or _SHA256_PREFIXED.fullmatch(pointer["inputs_digest"]) is None
-            or type(record.get("request_digest")) is not str
-            or _SHA256_FIELD.fullmatch(record["request_digest"]) is None
-            or type(record.get("mission_source_digest")) is not str
-            or _SHA256_FIELD.fullmatch(record["mission_source_digest"]) is None
-            or type(record.get("messages_digest")) is not str
-            or _HEX64.fullmatch(record["messages_digest"]) is None):
-        return None
-    return dict(record)
-
-
 # ---------------------------------------------------------------------------
 # Source client — aiohttp, hard 1 s total, streamed bounded read, no redirects
 # ---------------------------------------------------------------------------
@@ -1265,7 +1154,7 @@ class _AttemptSink:
         project = self.policy.get("project")
         native = project.get("native_n2") if isinstance(project, Mapping) else None
         ref = native.get("run_authorization") if isinstance(native, Mapping) else None
-        manifest = _read_native_run_authorization(ref)
+        manifest = _native_auth._read_native_run_authorization(ref)
         if manifest is None:
             return False
         try:
@@ -1718,7 +1607,7 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         # and the protected manifest must pin THIS exact binding plus this
         # exchange's digests. An absent stanza means prepare-only — refuse
         # before context preparation, admission or any receipt consumption.
-        manifest = _read_native_run_authorization(
+        manifest = _native_auth._read_native_run_authorization(
             project["native_n2"].get("run_authorization"))
         if (native_binding is None or manifest is None
                 or canonical_json(manifest["binding"]) != canonical_json(native_binding)
