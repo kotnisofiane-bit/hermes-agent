@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
+import json
 import re
 import threading
 import time
@@ -33,7 +34,8 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 from agent.b2b_execution import (
     B2BTerminalRefusal, BoundExecution, CONTEXT_MAX_BYTES, _deep_freeze,
     _native_oc_read_metadata, _reject_bad_unicode, _utc_milliseconds,
-    assert_source_equivalent, json_utf8, qualify_context_view, source_basis,
+    _plain_json, assert_source_equivalent, canonical_json, json_utf8, qualify_context_view,
+    source_basis,
 )
 from gateway.platforms.api_server_b2b import _SOURCE_DEADLINE_S
 
@@ -288,28 +290,47 @@ def _b2b_document(raw: Any, mission_id: Any) -> Dict[str, Any]:
             "native_digest": expected}
 
 
+def _assert_native_document_lines(rendered_text: str, documents: Any) -> None:
+    expected = [
+        "b2b_document=" + json.dumps(
+            _plain_json(document), ensure_ascii=True, sort_keys=True,
+            separators=(",", ":"), allow_nan=False)
+        for document in documents
+    ]
+    actual = [
+        line for line in rendered_text.split("\n")
+        if line.startswith("b2b_document=")
+    ]
+    if actual != expected:
+        raise B2BTerminalRefusal("context_documents")
+
+
 def _b2b_documents(raw_documents: Any, *, cap: BoundExecution,
                    plain: Mapping[str, Any],
-                   resolved: Mapping[str, Any]) -> Tuple[Any, ...]:
-    """Host re-proof of the producer's structured piece attestation: missing
-    is legal ONLY when no piece reference exists in EITHER proof list; every
-    attested piece must be mission-bound, digest-exact and proven by an
-    adjacent (ref, digest) pair in BOTH the qualified view's mission
-    references and the signed ``mission_request.source_refs`` — every piece
-    ref in turn attested exactly once. Anything else refuses
-    ``context_documents``."""
+                   resolved: Mapping[str, Any],
+                   native_references: Any = None) -> Tuple[Any, ...]:
+    """Re-prove the producer's structured piece attestation against its sources.
+
+    Historical: prove each piece exactly once in the qualified mission view and
+    the signed request, with its adjacent digest. No pieces permits no manifest.
+    Native N2: the qualified view must equal the ordinary prefix of the My Work
+    proof list. Its suffix and the signed request's suffix must both match the
+    nonempty manifest with canonical digests, in order. The canonical manifest
+    must match the bound pointer. A missing proof or mismatch is context_documents.
+    """
     mission_id = cap.policy_get("mission_id")
+    native = cap.policy_get("native_n2_binding") is not None
     my_work = plain.get("my_work") if isinstance(plain, Mapping) else None
     mission = my_work.get("mission") if isinstance(my_work, Mapping) else None
-    native_refs = mission.get("references") if isinstance(mission, Mapping) else None
+    view_refs = mission.get("references") if isinstance(mission, Mapping) else None
     request = resolved.get("mission_request")
     request_refs = request.get("source_refs") if isinstance(request, Mapping) else None
-    proof_lists = (native_refs, request_refs)
+    proof_lists = (native_references if native else view_refs, request_refs)
     piece_refs = [v for values in proof_lists
                   if isinstance(values, (list, tuple)) for v in values
                   if isinstance(v, str) and v.startswith(_PIECE_PREFIX)]
     if raw_documents is None:
-        if piece_refs:
+        if piece_refs or native:
             raise B2BTerminalRefusal("context_documents")
         return ()
     if (not isinstance(raw_documents, (list, tuple)) or
@@ -338,6 +359,32 @@ def _b2b_documents(raw_documents: Any, *, cap: BoundExecution,
                 if (index + 1 >= len(values) or values[index + 1] not in
                         _document_digest_reprs(document["native_digest"])):
                     raise B2BTerminalRefusal("context_documents")
+    if native:
+        # Adjacency alone is not enough for the native lane: BOTH proof lists
+        # must enumerate the exact ordered (native_ref, native_digest) pairs
+        # as their suffix, the manifest must be non-empty, and its canonical
+        # six-key digest must equal the pointer the admitted binding carries.
+        if not documents:
+            raise B2BTerminalRefusal("context_documents")
+        flat = [part for document in documents
+                for part in (document["native_ref"], document["native_digest"])]
+        for values in proof_lists:
+            if (not isinstance(values, (list, tuple))
+                    or len(values) < 2 * len(documents)
+                    or not 0 <= len(values) - 2 * len(documents) <= 20
+                    or list(values[len(values) - 2 * len(documents):]) != flat):
+                raise B2BTerminalRefusal("context_documents")
+        if (not isinstance(view_refs, (list, tuple))
+                or list(view_refs) != list(native_references[:-len(flat)])):
+            raise B2BTerminalRefusal("context_documents")
+        binding = cap.policy_get("native_n2_binding")
+        pointer = binding.get("mission_inputs") \
+            if isinstance(binding, Mapping) else None
+        manifest_digest = "sha256:" + hashlib.sha256(
+            canonical_json(documents)).hexdigest()
+        if (not isinstance(pointer, Mapping)
+                or pointer.get("manifest_digest") != manifest_digest):
+            raise B2BTerminalRefusal("context_documents")
     return tuple(_deep_freeze(d) for d in documents)
 
 
@@ -426,6 +473,12 @@ class _PreparedContext:
         _assert_source_window(receipt.view)
         if json_utf8(source_basis(receipt.view)) != json_utf8(receipt.source_basis):
             raise B2BTerminalRefusal("context_stale")
+        if cap.policy_get("native_n2_binding") is not None:
+            try:
+                rendered_text = receipt.rendered.decode("utf-8")
+            except (AttributeError, UnicodeError):
+                raise B2BTerminalRefusal("context_documents") from None
+            _assert_native_document_lines(rendered_text, self.documents)
 
 
 def _prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) -> _PreparedContext:
@@ -476,15 +529,13 @@ def _prepare_b2b_context(cap: BoundExecution, *, resolved: Mapping[str, Any]) ->
             len(rendered_text) != plain["bounds"]["render_chars"]):
         raise B2BTerminalRefusal("context_render_bounds")
 
-    # The structured piece attestation — the producer's own ordered document
-    # manifest, re-proven host-side against BOTH proof lists (view references
-    # AND the signed mission_request.source_refs). Both b2b-prepare and
-    # b2b-proposal refuse before attestation or admission when a cited piece
-    # has no verified manifest. Parsing rendered bytes for pieces would lose
-    # the producer's authoritative validation; trusting the field unproven
-    # would let it drift from the mission fingerprints.
+    # Re-prove the producer's documents against the signed request and qualified
+    # view. Native N2 additionally binds the My Work sidecar to that view.
     documents = _b2b_documents(
-        result.get("documents"), cap=cap, plain=plain, resolved=resolved)
+        result.get("documents"), cap=cap, plain=plain, resolved=resolved,
+        native_references=result.get("native_references"))
+    if cap.policy_get("native_n2_binding") is not None:
+        _assert_native_document_lines(rendered_text, documents)
 
     _observed_ms, source_deadline_ms = _assert_source_window(plain)
 
