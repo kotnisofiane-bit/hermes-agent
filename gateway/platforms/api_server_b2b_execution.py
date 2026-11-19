@@ -367,6 +367,8 @@ async def construct_run_agent(adapter: Any, run: Any, construct_agent: Callable[
     if cap is None:
         return construct_agent()
     from agent.b2b_execution import bind_execution, reset_execution
+    from gateway.platforms.api_server import _api_request_profile
+    profile_token = _api_request_profile.set(getattr(run, "request_profile", None))
     cap_token = bind_execution(cap)  # agent construction reads it through current_execution
     try:
         # B2B: cold AIAgent.__init__ (httpx import, client build) must not
@@ -383,6 +385,7 @@ async def construct_run_agent(adapter: Any, run: Any, construct_agent: Callable[
             lambda: ctor_context.run(construct_agent), timeout=_REQUEST_TTL_S)
     finally:
         reset_execution(cap_token)
+        _api_request_profile.reset(profile_token)
 
 
 async def execute_run_agent(adapter: Any, run: Any, callback: Callable[[], Any],
@@ -494,8 +497,8 @@ async def generic_run_visible(adapter: Any, run_id: str) -> bool:
 async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[str, Any]):
     """Only worker-attested durable output can become a fully sealed proposal."""
     from agent.b2b_execution import (
-        B2BTerminalRefusal, bind_execution, reset_execution, recheck_context, validate_proposal,
-        extract_allowed_refs)
+        B2BTerminalRefusal, bind_execution, reset_execution, recheck_context,
+        validate_proposal)
 
     sink = cap.sink
 
@@ -535,7 +538,7 @@ async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[s
             if artifact is None:
                 return blocked("result_unattested")
             public = json.loads(artifact["payload"])
-            parsed, _ = validate_proposal(public["text"], extract_allowed_refs(receipt.view))
+            parsed, _ = validate_proposal(public["text"], cap.proposal_refs(receipt.view))
             if (parsed is None or parsed != public.get("proposal") or
                     result.get("final_response", "").strip() != public["text"].strip()):
                 return blocked("result_invalid")

@@ -791,6 +791,12 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     """Assemble the full prompt; cached on ``agent._cached_system_prompt`` and
     only rebuilt after compression.  Tiers are ordered stable -> context ->
     volatile so implicit longest-prefix caches keep the unchanged scaffold."""
+    execution = vars(agent).get("_b2b_execution")
+    if execution is not None and execution.policy_get("native_n2_binding") is not None:
+        from agent.b2b_execution import NATIVE_RECIPE_SYSTEM_PROMPT
+
+        agent._cached_system_prompt_static = NATIVE_RECIPE_SYSTEM_PROMPT
+        return NATIVE_RECIPE_SYSTEM_PROMPT
     parts = build_system_prompt_parts(agent, system_message=system_message)
     agent._cached_system_prompt_static = parts["stable"]
     # Surface context-file truncation warnings in chat, not only in logs.

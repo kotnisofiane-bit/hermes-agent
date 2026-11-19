@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 _NATIVE_SECURITY_UID = 32013
+_NATIVE_TRUSTED_ROOT = "/"
+_NATIVE_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 _NATIVE_MANIFEST_MAX = 65536
 _NATIVE_MANIFEST_FORMAT = "dubsar.b2b-n2-recipe/1"
 _NATIVE_MANIFEST_CLASS = "public_synthetic"
@@ -22,7 +24,7 @@ _DATASET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 
 def _boot_id() -> str:
     try:
-        return Path("/proc/sys/kernel/random/boot_id").read_text("ascii").strip()
+        return _NATIVE_BOOT_ID_PATH.read_text("ascii").strip()
     except (OSError, UnicodeDecodeError):
         return ""
 
@@ -30,18 +32,30 @@ def _boot_id() -> str:
 def _native_parents_safe(path: str) -> bool:
     """Every ancestor directory: a real dir, owned by root or the security uid,
     never group/world writable."""
-    current = path
+    root = _NATIVE_TRUSTED_ROOT
+    try:
+        if os.path.commonpath((path, root)) != root:
+            return False
+    except ValueError:
+        return False
+    if path == root:
+        return False
+    current = os.path.dirname(path)
     while True:
-        parent = os.path.dirname(current)
-        if parent == current:
+        if root == os.path.sep and current == root:
             return True
         try:
-            info = os.lstat(parent)
+            info = os.lstat(current)
         except OSError:
             return False
         if (not stat.S_ISDIR(info.st_mode)
                 or info.st_uid not in (0, _NATIVE_SECURITY_UID)
                 or stat.S_IMODE(info.st_mode) & 0o022):
+            return False
+        if current == root:
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
             return False
         current = parent
 
