@@ -24,7 +24,7 @@ _DATASET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 
 def _boot_id() -> str:
     try:
-        return _NATIVE_BOOT_ID_PATH.read_text("ascii").strip()
+        return _NATIVE_BOOT_ID_PATH.read_text(encoding="ascii").strip()
     except (OSError, UnicodeDecodeError):
         return ""
 
