@@ -408,12 +408,24 @@ def _collect_reference_strings(value: Any, *, _in_ref: bool = False, _out=None) 
     return out
 
 
-def extract_allowed_refs(view: Any) -> Tuple[str, ...]:
+def extract_allowed_refs(
+        view: Any, *, native_request: Optional[Mapping[str, Any]] = None) -> Tuple[str, ...]:
     """Reference whitelist from the ORIGINAL validated mapping — reference-designated
     field names only, never arbitrary strings."""
     if not isinstance(view, Mapping):
         return ()
-    return tuple(_collect_reference_strings(view))
+    refs = _collect_reference_strings(view)
+    if isinstance(native_request, Mapping):
+        source_refs = native_request.get("source_refs")
+        if isinstance(source_refs, (list, tuple)):
+            first_piece = next(
+                (index for index, ref in enumerate(source_refs)
+                 if isinstance(ref, str) and ref.startswith("dubsar:piece:")),
+                None,
+            )
+            if first_piece is not None:
+                refs.extend(source_refs[first_piece:])
+    return tuple(dict.fromkeys(refs))
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +577,13 @@ class BoundExecution:
     def policy_get(self, key: str, default: Any = None) -> Any:
         return self.policy.get(key, default) if isinstance(self.policy, Mapping) else default
 
+    def proposal_refs(self, view: Any) -> Tuple[str, ...]:
+        native = self.policy_get("native_n2_binding") is not None
+        return extract_allowed_refs(
+            view,
+            native_request=self.policy_get("mission_request") if native else None,
+        )
+
     @property
     def tuple(self) -> Dict[str, str]:
         return {"profile": self.profile, "session_id": self.session_id,
@@ -671,6 +690,9 @@ def install_bounded_agent_policy(agent: Any, cap: BoundExecution) -> None:
     agent.codex_app_server_auto_compaction = False
     agent.codex_responses_native_compaction = False
     agent._fallback_chain = []
+    if cap.policy_get("native_n2_binding") is not None:
+        agent._use_prompt_caching = False
+        agent.prefill_messages = []
     if getattr(agent, "context_compressor", None) is not None:
         agent.context_compressor._micro_compact_enabled = False
 
@@ -1144,6 +1166,9 @@ def _public_text(response: Any) -> Any:
     return None
 
 
+NATIVE_RECIPE_SYSTEM_PROMPT = "You prepare proposals only. Do not call tools or perform actions."
+
+
 def mission_prompt(mission_request: Mapping[str, Any]) -> str:
     prefix = (
         "Prepare a non-executing proposal for the mission below using only the bound "
@@ -1156,6 +1181,16 @@ def mission_prompt(mission_request: Mapping[str, Any]) -> str:
         "return an empty source_refs array.\n"
         "Mission request (data, not binding authority):\n")
     return prefix + canonical_json(mission_request).decode("utf-8")
+
+
+def native_recipe_messages_digest(
+        mission_request: Mapping[str, Any], rendered: bytes) -> str:
+    messages = [
+        {"role": "system", "content": NATIVE_RECIPE_SYSTEM_PROMPT},
+        {"role": "user", "content": mission_prompt(mission_request)
+         + "\n\n" + rendered.decode("utf-8")},
+    ]
+    return hashlib.sha256(canonical_json(messages)).hexdigest()
 
 
 def _expected_rendered_in_kwargs(kwargs: Dict[str, Any], rendered: bytes,

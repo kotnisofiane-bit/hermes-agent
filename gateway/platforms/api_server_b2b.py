@@ -32,7 +32,8 @@ from agent.b2b_execution import (
     _plain_json,
     _public_text, canonical_json, is_b2b_attempt_id, is_b2b_session_id, json_utf8,
     assert_source_equivalent, context_proof, qualify_context_view, verify_context_proof,
-    mission_prompt, recheck_context, validate_proposal, extract_allowed_refs)
+    mission_prompt, native_recipe_messages_digest, recheck_context, validate_proposal,
+    extract_allowed_refs)
 from gateway.platforms import api_server_b2b_native_authorization as _native_auth
 
 logger = logging.getLogger("gateway.platforms.api_server")
@@ -100,6 +101,7 @@ _OBSERVATION_KEYS = frozenset({
 _TITLE_MAX, _OBJECTIVE_MAX = 160, 1000
 _CRITERION_MAX, _CRITERIA_MAX = 300, 20
 _SOURCE_REF_MAX, _SOURCE_REFS_MAX = 300, 20
+_MAX_NATIVE_PIECES = 20
 
 _B2B_CONFIG_ROOT_KEYS = frozenset({"enabled", "profiles"})
 _PROFILE_ENTRY_KEYS = frozenset({
@@ -334,8 +336,8 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
     native_n2 = None
     if "native_n2" in entry:
         # The native N2 lane is a strict opt-in: only an exact deploy-bound
-        # prj_32 project on the pinned custom:g2 loopback route, no memory and
-        # a required project_context may carry it.
+        # prj_32 project with provider custom:b2b-g2 and a validated loopback
+        # URL, no memory and a required project_context may carry it.
         if (not _NATIVE_PROJECT_ID.fullmatch(binding_id)
                 or not _NATIVE_PROJECT_ID.fullmatch(project_id)
                 or binding_id != project_id
@@ -626,8 +628,9 @@ def _verify_resolved_body(body: Any, *, request: Dict[str, Any], profile: str,
 
 
 def _valid_native_source_refs(values: Any, mission_id: str) -> bool:
-    """Native flat refs use the source contract's combined 20-entry cap."""
-    if not isinstance(values, list) or not 1 <= len(values) <= _SOURCE_REFS_MAX:
+    """Native refs preserve the ordinary 20-ref prefix and bounded piece suffix."""
+    if (not isinstance(values, list)
+            or not 1 <= len(values) <= _SOURCE_REFS_MAX + 2 * _MAX_NATIVE_PIECES):
         return False
     if not all(_bounded_field(v, _SOURCE_REF_MAX) for v in values):
         return False
@@ -635,7 +638,8 @@ def _valid_native_source_refs(values: Any, mission_id: str) -> bool:
         rf"^dubsar:piece:{re.escape(mission_id)}:piece_[0-9a-f]{{32}}$")
     docs = [i for i, v in enumerate(values) if v.startswith("dubsar:piece:")]
     count = len(docs)
-    if not 1 <= count <= 20 or len(values) - 2 * count > _SOURCE_REFS_MAX:
+    ordinary_count = len(values) - 2 * count
+    if not 1 <= count <= _MAX_NATIVE_PIECES or not 0 <= ordinary_count <= _SOURCE_REFS_MAX:
         return False
     if docs != list(range(len(values) - 2 * count, len(values), 2)):
         return False
@@ -1193,6 +1197,13 @@ class _AttemptSink:
         self._before_provider = resolved
         return True
 
+    def _proposal_refs(self, view: Any) -> Tuple[str, ...]:
+        native = self.policy.get("native_n2_binding") is not None
+        return extract_allowed_refs(
+            view,
+            native_request=self.policy.get("mission_request") if native else None,
+        )
+
     def context_recheck_deadline(self) -> float:
         """Monotonic deadline for the next bounded C1 recheck: an explicit
         source/C1 budget, never the worker/provider timeout. With a completed
@@ -1274,7 +1285,7 @@ class _AttemptSink:
     def commit_result(self, *, text: Any, parsed: Any, reason: str) -> None:
         receipt = self.context_receipt
         valid, checked = validate_proposal(
-            text, extract_allowed_refs(receipt.view) if receipt else ())
+            text, self._proposal_refs(receipt.view) if receipt else ())
         marker = self._store.b2b_artifact(attempt_id=self.attempt_id, kind="provider_dispatch")
         if receipt is None or marker is None or valid is None or valid != parsed or checked != reason:
             self.block("result_invalid")
@@ -1297,7 +1308,8 @@ class _AttemptSink:
             return False
         stored = json.loads(row["payload"])
         parsed, _ = validate_proposal(
-            text, extract_allowed_refs(self.context_receipt.view) if self.context_receipt else ())
+            text, self._proposal_refs(self.context_receipt.view)
+            if self.context_receipt else ())
         return (stored.get("attempt_id") == self.attempt_id and stored.get("run_id") == self.run_id
                 and stored.get("text") == text and parsed is not None
                 and stored.get("proposal") == parsed)
@@ -1366,7 +1378,7 @@ class _AttemptSink:
                    (source_before_seal["_signed_request"], source_before_seal["_signed_response"])):
             raise B2BTerminalRefusal("source_window_closed")
         public = json.loads(result["payload"])
-        parsed, _ = validate_proposal(public["text"], extract_allowed_refs(receipt.view))
+        parsed, _ = validate_proposal(public["text"], self._proposal_refs(receipt.view))
         if parsed is None or parsed != public.get("proposal"):
             raise B2BTerminalRefusal("result_invalid")
         # CLOSED dubsar.b2b-proposal/1 — exactly the 15 contract fields, nothing more.
@@ -1600,21 +1612,33 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
+    existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
     native_binding = resolved.get("_native_binding")
     native_messages_digest = None
     if project.get("native_n2") is not None:
-        # Native run: the opted catalogue entry must carry run authorization
-        # and the protected manifest must pin THIS exact binding plus this
-        # exchange's digests. An absent stanza means prepare-only — refuse
-        # before context preparation, admission or any receipt consumption.
-        manifest = _native_auth._read_native_run_authorization(
-            project["native_n2"].get("run_authorization"))
-        if (native_binding is None or manifest is None
-                or canonical_json(manifest["binding"]) != canonical_json(native_binding)
-                or manifest["request_digest"] != resolved["request_digest"]
-                or manifest["mission_source_digest"] != resolved["mission_source_digest"]):
-            return _deny(503, "execution_unavailable")
-        native_messages_digest = manifest["messages_digest"]
+        if existing_attempt is not None:
+            existing = existing or store.b2b_binding(session_id=session_id, profile=profile)
+            try:
+                native_messages_digest = json.loads(existing["policy_json"])[
+                    "native_n2_messages_digest"]
+            except (TypeError, KeyError, ValueError):
+                return _deny(409, "conflict")
+            if (not isinstance(native_messages_digest, str)
+                    or _HEX64.fullmatch(native_messages_digest) is None):
+                return _deny(409, "conflict")
+        else:
+            # Native run: the opted catalogue entry must carry run authorization
+            # and the protected manifest must pin THIS exact binding plus this
+            # exchange's digests. An absent stanza means prepare-only — refuse
+            # before context preparation, admission or any receipt consumption.
+            manifest = _native_auth._read_native_run_authorization(
+                project["native_n2"].get("run_authorization"))
+            if (native_binding is None or manifest is None
+                    or canonical_json(manifest["binding"]) != canonical_json(native_binding)
+                    or manifest["request_digest"] != resolved["request_digest"]
+                    or manifest["mission_source_digest"] != resolved["mission_source_digest"]):
+                return _deny(503, "execution_unavailable")
+            native_messages_digest = manifest["messages_digest"]
     # P2 admission gate: NEW work proves its mission context BEFORE the single
     # durable attempt is consumed — the sink/cap are built in memory first,
     # then the bounded bootstrap enters the owning profile scope (secret
@@ -1630,7 +1654,6 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     # served by the idempotent replay below (b2b_admit -> _replayed_response),
     # so a lost-ACK retry never hears "execution_unavailable" for a committed
     # lane and never pays a context read.
-    existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
     policy = {
         "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
         "attempt_id": attempt_id, "profile_home": str(home),
@@ -1673,6 +1696,11 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             resolved=resolved)
         if denied is not None:
             return denied
+        if (native_binding is not None
+                and native_recipe_messages_digest(
+                    resolved["mission_request"], sink._context_preparation.rendered
+                ) != native_messages_digest):
+            return _deny(503, "execution_unavailable")
     if existing_attempt is None:
         # Inherited generic API admission, kept at
         # its original place — not a B2B capacity gate.
@@ -1711,6 +1739,10 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             assert_context_source_current(sink._context_preparation)
         except B2BTerminalRefusal as exc:
             return _deny(503, str(exc))
+        if (native_binding is not None
+                and not sink._native_run_current(resolved)):
+            # Revocation during bounded preparation must not consume admission.
+            return _deny(503, "execution_unavailable")
     outcome = store.b2b_admit(
         profile=profile, session_id=session_id, binding_digest=binding_digest,
         attempt_id=attempt_id, fingerprint=fingerprint,
@@ -1719,7 +1751,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         run_scope=scope, run_key=attempt_id, run_id=run_id,
         run_fingerprint=fingerprint, run_status=initial_status,
         owner_pid=getattr(adapter, "_run_owner_pid", 0),
-        owner_started=getattr(adapter, "_run_owner_started", 0))
+        owner_started=getattr(adapter, "_run_owner_started", 0),
+        replay_only=existing_attempt is not None)
     if outcome.get("status") == "conflict":
         return _deny(409, "conflict")
     stored_run_id = outcome.get("run_id") or (
@@ -1899,6 +1932,9 @@ async def _prepare_b2b_only(adapter: Any, request: Any, *, profile: str, entry, 
         "source_request_id": resolved["source_request_id"],
         "source_request_digest": resolved["source_request_digest"],
         "documents": documents}
+    if resolved.get("_native_binding") is not None:
+        body["messages_digest"] = native_recipe_messages_digest(
+            resolved["mission_request"], preparation.rendered)
     envelope, _ = _signed_envelope(
         entry, keys, _PREPARED_OPERATION, body, request_id=request_id)
     return web.json_response(envelope)
@@ -2124,7 +2160,13 @@ async def _b2b_get(adapter: Any, request: Any, *, want_context: bool):
     public = json.loads(artifacts["provider_result"]["payload"]) if "provider_result" in artifacts else None
     if public is not None:
         from agent.b2b_execution import validate_proposal, extract_allowed_refs
-        allowed = extract_allowed_refs(context_view) if context_view else ()
+        native_request = (
+            source.get("mission_request")
+            if source.get("mission_inputs") is not None and source.get("tenant_id") is not None
+            else None
+        )
+        allowed = extract_allowed_refs(context_view, native_request=native_request) \
+            if context_view else ()
         parsed, _ = validate_proposal(public.get("text"), allowed)
         dispatch = json.loads(dispatch_artifact["payload"]) if dispatch_artifact else None
         if (parsed is None or parsed != public.get("proposal") or dispatch is None or
