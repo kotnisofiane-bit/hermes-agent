@@ -1,11 +1,13 @@
 """Tests for the committed-infographic check in
 ``.github/workflows/infographic-check.yml``.
 
-The workflow is now a blocking ``needs`` entry of ``all-checks-pass``, so
-its advertised ``docs/assets/`` and ``website/`` exclusions must actually be
-applied before the infographic path filter. These tests extract the real
-``run`` block, build a throwaway git index with the tracked files under
-test, and execute that block under bash — nothing is reimplemented.
+The workflow is a blocking ``needs`` entry of ``all-checks-pass``. It
+matches tracked raster images by an ``infograph*`` path segment at any
+depth — product imagery under ``docs/assets/`` or ``website/`` passes only
+when its own path has no such segment, never because a whole root is
+excluded. These tests extract the real ``run`` block, build a throwaway git
+index with the tracked files under test, and execute that block under bash —
+nothing is reimplemented.
 """
 
 from __future__ import annotations
@@ -61,18 +63,8 @@ def _execute(tmp_path: Path, repo: Path) -> tuple[subprocess.CompletedProcess, s
     return proc, output
 
 
-@pytest.mark.parametrize(
-    "allowed",
-    [
-        "docs/assets/infographics/banner.png",
-        "docs/assets/infograficos/banner.webp",
-        "docs/assets/deep/infographics/banner.jpg",
-        "website/infographics/banner.png",
-        "website/static/infographics/banner.gif",
-        "docs/assets/logo.png",
-    ],
-)
-def test_docs_and_website_infographics_are_excluded(tmp_path, allowed):
+@pytest.mark.parametrize("allowed", ["docs/assets/logo.png"])
+def test_product_image_without_infographic_segment_is_allowed(tmp_path, allowed):
     repo = _tracked_repo(tmp_path, [allowed])
     proc, output = _execute(tmp_path, repo)
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -87,11 +79,16 @@ def test_docs_and_website_infographics_are_excluded(tmp_path, allowed):
         "docs/infographics/banner.png",
         "docs/infograficos/banner.webp",
         "assets/infographics/banner.png",
+        "docs/assets/infographics/banner.png",
+        "docs/assets/infograficos/banner.webp",
+        "docs/assets/deep/infographics/banner.jpg",
+        "website/infographics/banner.png",
+        "website/static/infographics/banner.gif",
         "docs/assets-other/infographics/banner.png",
         "website-preview/infographics/banner.png",
     ],
 )
-def test_infographics_outside_the_exclusions_are_rejected(tmp_path, offender):
+def test_infographic_under_any_root_is_rejected(tmp_path, offender):
     repo = _tracked_repo(tmp_path, [offender])
     proc, output = _execute(tmp_path, repo)
     assert proc.returncode != 0
