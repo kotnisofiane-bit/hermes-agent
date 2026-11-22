@@ -2,8 +2,7 @@ name: CI
 
 # Orchestrator workflow. Runs ``detect-changes`` once, then conditionally
 # calls the sub-workflows that a PR can actually affect. A final
-# ``all-checks-pass`` gate job aggregates results so branch protection only
-# needs to require a single check.
+# ``all-checks-pass`` gate job aggregates the results of the jobs that ran.
 #
 # Sub-workflows are triggered via ``workflow_call`` and keep their own job
 # definitions, matrices, and concurrency settings. They no longer have
@@ -229,8 +228,6 @@ jobs:
   # re-evaluates each lane gate into ``LANE_<job>`` with the same
   # expressions — and ``cancelled`` always fails.
   #
-  # Branch protection should require ONLY this check.
-  #
   # Outputs ``needs-json``, a compact ``{job_name: result}`` summary of
   # the evaluated needs map.
   # ─────────────────────────────────────────────────────────────────────
@@ -309,20 +306,23 @@ jobs:
           # lane evaluated false for this event — those conditions are
           # re-evaluated by the workflow into ``LANE_<job>`` env vars
           # (see the step ``env:`` above), using the same expressions
-          # and the same engine. A job with no ``if:`` has no LANE_ var
-          # and is treated as always-open: for it, and for any job whose
-          # lane was open, ``skipped`` can only mean an upstream
-          # failure or cancellation — never a green outcome.
+          # and the same engine. Only the literal string ``false`` may
+          # close a lane; an absent or malformed value is treated as
+          # always-open. For such a job, and for any job whose lane was
+          # open, ``skipped`` can only mean an upstream failure or
+          # cancellation — never a green outcome.
           # ``cancelled`` is never acceptable anywhere.
           lane = {
-              k[len('LANE_'):].lower().replace('_', '-'): v == 'true'
+              k[len('LANE_'):].lower().replace('_', '-'): v
               for k, v in os.environ.items()
               if k.startswith('LANE_')
           }
           bad = []
           for name, info in sorted(needs.items()):
               result = info['result']
-              ok = result == 'success' or (result == 'skipped' and not lane.get(name, True))
+              ok = result == 'success' or (
+                  result == 'skipped' and lane.get(name) == 'false'
+              )
               icon = '✅' if ok else '❌'
               print(f'{icon} {name}: {result}')
               if not ok:

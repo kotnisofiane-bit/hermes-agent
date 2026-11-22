@@ -2,8 +2,10 @@
 
 The gate's decision logic lives inline in the workflow's ``run: |`` block:
 keeping it under ``.github/`` means every change is classified
-``ci_review`` by the change detector and the ``review-labels`` job then
-requires a maintainer-applied ``ci-reviewed`` label on the PR. These tests
+``ci_review`` by the change detector and the ``review-labels`` job asks for
+a maintainer-applied ``ci-reviewed`` label on the PR. That label is still
+produced by the PR-controlled workflow, so it is not independent proof of
+review — the workflow does not claim otherwise. These tests
 replay that exact step — the YAML is parsed, the step's ``run`` block is
 executed by bash with a synthetic ``NEEDS`` payload shaped like
 ``${{ toJSON(needs) }}`` plus the ``LANE_*`` env values GitHub's
@@ -166,6 +168,15 @@ def _run_gate(
 # ---------------------------------------------------------------------------
 
 
+def test_workflow_does_not_claim_branch_protection_sufficiency():
+    """The workflow file and its classifier are themselves PR-controlled, so
+    a status produced by this workflow cannot prove an independent review.
+    The YAML must not recommend requiring only this check."""
+    text = _CI_YAML.read_text(encoding="utf-8").lower()
+    assert "branch protection should require only this check" not in text
+    assert "branch protection only needs to require a single check" not in text
+
+
 def test_gate_needs_cover_every_upstream_job():
     """Every job in the file is either in the gate's ``needs``, the gate
     itself, or a job that (transitively) needs the gate (e.g. ci-timings)
@@ -184,11 +195,23 @@ def test_lane_env_mirrors_job_conditions(evaluate_step):
     ``always() &&`` is scheduling-only and is expected to be dropped.
     No ungated job may carry a LANE_ var."""
     jobs = _jobs()
-    lanes = {
-        key: _expr_text(value)
+    raw_lanes = {
+        key: value
         for key, value in evaluate_step["env"].items()
         if key.startswith(_LANE_PREFIX)
     }
+    for key, raw in raw_lanes.items():
+        is_expression = (
+            isinstance(raw, str)
+            and raw.strip().startswith("${{")
+            and raw.strip().endswith("}}")
+        )
+        assert is_expression, (
+            f"{key} must be an Actions expression (``${{{{ ... }}}}``), "
+            f"got {raw!r} — a literal is not evaluated by Actions and the "
+            "gate would read it as a closed lane"
+        )
+    lanes = {key: _expr_text(value) for key, value in raw_lanes.items()}
     assert {_lane_job(key) for key in lanes} == set(_gated_jobs()), (
         "LANE_* env vars must exist exactly for the needs entries that "
         "carry an ``if:`` gate"
@@ -245,8 +268,9 @@ def test_cancelled_is_red(evaluate_run, evaluate_step, tmp_path):
 
 
 def test_skip_on_closed_lanes_is_green(evaluate_run, evaluate_step, tmp_path):
-    """Every lane-gated job skipped because its ``if:`` was false for the
-    event — e.g. a docs-only PR — must not block the gate."""
+    """Synthetic payload: every lane-gated job is skipped and every lane
+    evaluates false. This is not a real event (``history-check`` is open on
+    every PR); it isolates the gate's declared-skip branch."""
     proc, _ = _run_gate(
         evaluate_run,
         _needs({name: "skipped" for name in _gated_jobs()}),
@@ -267,7 +291,7 @@ def test_history_check_skipped_on_pr_is_red(evaluate_run, evaluate_step, tmp_pat
     )
     assert proc.returncode != 0
     assert "::error::" in proc.stdout
-    assert "history-check" in proc.stdout
+    assert "history-check=skipped (lane open)" in proc.stdout
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +309,8 @@ def test_bad_result_always_red(evaluate_run, evaluate_step, tmp_path, job, resul
         lanes=_lanes(evaluate_step),
     )
     assert proc.returncode != 0, f"{job}={result} must fail the gate"
+    assert "::error::" in proc.stdout
+    assert f"{job}={result}" in proc.stdout
 
 
 @pytest.mark.parametrize("job", _gated_jobs())
@@ -311,6 +337,30 @@ def test_skip_on_open_lane_is_red(evaluate_run, evaluate_step, tmp_path, job):
         lanes=_lanes(evaluate_step, {job}),
     )
     assert proc.returncode != 0, f"{job} skipped on an open lane must fail"
+    assert "::error::" in proc.stdout
+    assert f"{job}=skipped (lane open)" in proc.stdout, proc.stdout
+
+
+@pytest.mark.parametrize("lane_value", ["", "0", "False", "closed"])
+def test_skip_requires_explicit_false_lane(
+    evaluate_run, evaluate_step, tmp_path, lane_value
+):
+    """The gate consumes GitHub's evaluated env string. Only the literal
+    ``false`` may close a lane; empty, truthy-ish, or arbitrary values must
+    not turn a skip green."""
+    lanes = _lanes(evaluate_step)
+    lanes["LANE_TESTS"] = lane_value
+    proc, _ = _run_gate(
+        evaluate_run,
+        _needs({"tests": "skipped"}),
+        tmp_path,
+        lanes=lanes,
+    )
+    assert proc.returncode != 0, (
+        f"LANE_TESTS={lane_value!r} must not authorise a skipped tests job"
+    )
+    assert "::error::" in proc.stdout
+    assert "tests=skipped (lane open)" in proc.stdout
 
 
 def test_needs_json_output_still_emitted(evaluate_run, evaluate_step, tmp_path):
