@@ -38,15 +38,21 @@ jobs:
       - id: infographic-check
         name: Reject committed PR-infographic images
         run: |
-          # Match on the IMAGE, not on a directory name.  Keying this to
-          # `infographic/` is what let `infograficos/` through in #70552 —
-          # any localized or typo'd directory would sidestep it again.
-          # Instead: find tracked raster images whose path contains an
-          # infographic-ish segment, in any spelling, at any depth.
+          # Match on a DIRECTORY segment, never on the image's own
+          # filename.  Anchoring the old rule to `infographic/` is what
+          # let `infograficos/` through in #70552 — any localized or
+          # typo'd directory would sidestep it again.  Instead: find
+          # tracked raster images whose path has a directory segment
+          # starting with `infograph`/`infograf`, in any spelling, at any
+          # depth.  A file merely *named* `infographic.png` outside such
+          # a directory is NOT caught — known limitation, tracked as a
+          # follow-up.
           #
-          # Product imagery under `docs/assets` and `website/` passes on
-          # its own: those paths carry no `infograph*` segment. An image
-          # whose path does carry one is rejected wherever it is committed.
+          # Product imagery under `docs/assets/` and `website/` passes on
+          # its own: its directory segments carry no `infograph*`
+          # prefix.  An image is rejected only when one of its DIRECTORY
+          # segments starts with `infograph`/`infograf` — at any depth,
+          # under any root, including `docs/assets/` and `website/`.
           OFFENDERS=$(git ls-files -z \
             | tr '\0' '\n' \
             | grep -iE '(^|/)(infograph|infograf)[^/]*/' \

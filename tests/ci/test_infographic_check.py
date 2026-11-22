@@ -2,11 +2,14 @@
 ``.github/workflows/infographic-check.yml``.
 
 The workflow is a blocking ``needs`` entry of ``all-checks-pass``. It
-matches tracked raster images by an ``infograph*`` path segment at any
-depth — product imagery under ``docs/assets/`` or ``website/`` passes only
-when its own path has no such segment, never because a whole root is
-excluded. These tests extract the real ``run`` block, build a throwaway git
-index with the tracked files under test, and execute that block under bash —
+rejects tracked raster images that have a DIRECTORY segment starting
+with ``infograph`` or ``infograf`` at any depth — under any root,
+including ``docs/assets/`` and ``website/``. Product imagery under those
+roots passes only because its directory segments carry no such prefix,
+never because a whole root is excluded. Known limitation: a file merely
+named ``infograph*`` outside such a directory is not filtered (follow-up).
+These tests extract the real ``run`` block, build a throwaway git index
+with the tracked files under test, and execute that block under bash —
 nothing is reimplemented.
 """
 
