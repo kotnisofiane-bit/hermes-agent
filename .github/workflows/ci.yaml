@@ -223,8 +223,10 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when some deps were skipped. Green requires every
+  # required job to report ``success``; ``skipped`` is accepted only for
+  # the lane-gated callers listed in SKIPPABLE below, and ``cancelled``
+  # always fails (it used to pass the ``failure``-only check).
   #
   # Branch protection should require ONLY this check.
   #
@@ -280,15 +282,33 @@ jobs:
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          # Lane-gated callers (``if:`` on the job definition above) for
+          # which ``skipped`` is the declared, legitimate outcome when the
+          # lane does not apply — including e2e-desktop, pinned ``if:
+          # false`` until its flake is fixed. Every other needed job is
+          # required: it must report ``success``. ``cancelled`` is never
+          # acceptable anywhere — it used to slip past the ``failure``-only
+          # check and turn the gate green while required suites were
+          # killed (timeouts, concurrency cancels, runner eviction).
+          SKIPPABLE = {
+              'contributor-check', 'docker-lint', 'docs-site',
+              'e2e-desktop', 'e2e-desktop-core', 'history-check',
+              'installer-tests', 'js-tests', 'lint', 'lockfile-diff',
+              'review-labels', 'rust-tests', 'supply-chain', 'tests',
+              'tests-os', 'uv-lockfile',
+          }
+          bad = []
           for name, info in sorted(needs.items()):
               result = info['result']
-              icon = '✅' if result in ('success', 'skipped') else '❌'
+              ok = result == 'success' or (result == 'skipped' and name in SKIPPABLE)
+              icon = '✅' if ok else '❌'
               print(f'{icon} {name}: {result}')
-          if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+              if not ok:
+                  bad.append(f'{name}={result}')
+          if bad:
+              print(f'::error::{len(bad)} required check(s) not green: {\", \".join(bad)}')
               sys.exit(1)
-          print('All checks passed (or were skipped)')
+          print('All checks passed (skips only where declared)')
           "
 
   # ─────────────────────────────────────────────────────────────────────
