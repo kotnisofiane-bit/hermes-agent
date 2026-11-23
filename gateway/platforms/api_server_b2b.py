@@ -1797,12 +1797,14 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         return _deny(503, "launch_failed")
     if project.get("native_n4") is not None:
         # Additive side artifact: the recipe run above is already admitted and
-        # launched. The N4 admission never gates it; a refusal is explicit in
-        # the log and leaves no file.
+        # launched. The N4 admission never gates it; it is published
+        # atomically or refused without leaving a file, and every refusal is
+        # explicit in the log. The file I/O runs off the event loop.
         from gateway.platforms.api_server_b2b_native_admission import (
             NativeAdmissionRefusal, emit_native_admission)
         try:
-            emit_native_admission(
+            await asyncio.to_thread(
+                emit_native_admission,
                 home=home, stanza=project["native_n4"],
                 native_binding=native_binding, resolved=resolved,
                 preparation=sink._context_preparation,
