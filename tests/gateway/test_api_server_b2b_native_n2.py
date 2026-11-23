@@ -1030,7 +1030,7 @@ def test_recipe_reason_classified():
     pytest.param(None, "revoke_after_prepare", id="revoke-after-preparation"),
 ])
 async def test_native_http_prepare_admission_replay_and_revocation(
-        tmp_path, monkeypatch, revoke_at, authorization):
+        tmp_path, monkeypatch, revoke_at, authorization, native_n4=None):
     import base64
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
@@ -1171,7 +1171,8 @@ async def test_native_http_prepare_admission_replay_and_revocation(
                 base_url=provider_url,
                 context_contract_root=prepare_tests.extract_contract_root(tmp_path),
                 project_context={"project_id": PROJECT,
-                                 "allocation_root": str(alloc), "start": str(start)})
+                                 "allocation_root": str(alloc), "start": str(start)},
+                **({"native_n4": {"dataset_id": native_n4}} if native_n4 else {}))
             b2b_raw = _raw_config(
                 source_port=source.port, projects={PROJECT: project})
             extra = {"key": adm._API_KEY, "b2b": b2b_raw}
