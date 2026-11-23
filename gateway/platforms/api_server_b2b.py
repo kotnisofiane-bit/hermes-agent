@@ -65,7 +65,6 @@ _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 # {tenant_id, run_authorization?} stanza; only a deploy-bound prj_32 lane may
 # carry it and its resolved body is the strictly extended shape.
 _NATIVE_PROJECT_ID = re.compile(r"^prj_[0-9a-f]{32}$")
-_N4_DATASET_ID = re.compile(r"^[A-Za-z0-9._:-]{2,128}$")
 _NATIVE_TENANT_ID = re.compile(
     r"^[^\x00-\x1f\s](?:[^\x00-\x1f]{0,62}[^\x00-\x1f\s])?$")
 _SHA256_PREFIXED = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -103,7 +102,6 @@ _TITLE_MAX, _OBJECTIVE_MAX = 160, 1000
 _CRITERION_MAX, _CRITERIA_MAX = 300, 20
 _SOURCE_REF_MAX, _SOURCE_REFS_MAX = 300, 20
 _MAX_NATIVE_PIECES = 20
-_NATIVE_N4_KEYS = frozenset({"dataset_id"})
 
 _B2B_CONFIG_ROOT_KEYS = frozenset({"enabled", "profiles"})
 _PROFILE_ENTRY_KEYS = frozenset({
@@ -373,23 +371,9 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
             native_n2["run_authorization"] = {"path": path, "sha256": sha256}
     native_n4 = None
     if "native_n4" in entry:
-        # N4 is an additive admission artifact, never a lane switch: it may
-        # only ride an already-opted native N2 project, and stays absent by
-        # default so the recipe lane is byte-for-byte unchanged.
-        if native_n2 is None:
-            raise B2BConfigError(
-                f"b2b config: project {binding_id}: native_n4 requires native_n2")
-        config_n4 = entry.get("native_n4")
-        if (not isinstance(config_n4, Mapping)
-                or set(config_n4.keys()) != _NATIVE_N4_KEYS):
-            raise B2BConfigError(
-                f"b2b config: project {binding_id}: native_n4 closed keys")
-        dataset_id = config_n4["dataset_id"]
-        if (not isinstance(dataset_id, str)
-                or _N4_DATASET_ID.fullmatch(dataset_id) is None):
-            raise B2BConfigError(
-                f"b2b config: project {binding_id}: native_n4.dataset_id")
-        native_n4 = {"dataset_id": dataset_id}
+        from gateway.platforms.api_server_b2b_native_admission import (
+            validate_native_stanza)
+        native_n4 = validate_native_stanza(entry, binding_id, native_n2)
     normalized = {
         "project_id": project_id,
         "bot_id": entry["bot_id"], "profile_id": entry["profile_id"],
@@ -1796,26 +1780,16 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         sink.block("launch_failed")
         return _deny(503, "launch_failed")
     if project.get("native_n4") is not None:
-        # Additive side artifact: the recipe run above is already admitted and
-        # launched. The N4 admission never gates it; it is published
-        # atomically or refused without leaving a file, and every refusal is
-        # explicit in the log. The file I/O runs off the event loop.
         from gateway.platforms.api_server_b2b_native_admission import (
-            NativeAdmissionRefusal, emit_native_admission)
-        try:
-            await asyncio.to_thread(
-                emit_native_admission,
-                home=home, stanza=project["native_n4"],
-                native_binding=native_binding, resolved=resolved,
-                preparation=sink._context_preparation,
-                messages_digest=native_messages_digest,
-                session_id=session_id, attempt_id=attempt_id,
-                binding_digest=binding_digest, profile=profile,
-                configured_tenant=project["native_n2"]["tenant_id"])
-        except NativeAdmissionRefusal as exc:
-            logger.warning("b2b native N4 admission refused: %s", exc.code)
-        except OSError as exc:
-            logger.warning("b2b native N4 admission unavailable: %s", exc)
+            emit_for_admitted_run)
+        await emit_for_admitted_run(
+            home=home, stanza=project["native_n4"],
+            native_binding=native_binding, resolved=resolved,
+            preparation=sink._context_preparation,
+            messages_digest=native_messages_digest,
+            session_id=session_id, attempt_id=attempt_id,
+            binding_digest=binding_digest, profile=profile,
+            configured_tenant=project["native_n2"]["tenant_id"])
     from aiohttp import web
     return web.json_response({
         "object": "b2b.proposal_attempt", "attempt_id": attempt_id,

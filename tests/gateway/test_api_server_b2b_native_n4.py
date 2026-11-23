@@ -13,6 +13,7 @@ The consumer half is copied from Scribe-backend #131 @
 from __future__ import annotations
 
 import errno
+import inspect
 import json
 import logging
 import os
@@ -205,6 +206,21 @@ def test_config_native_n4_parses_closed_stanza():
     config = n2.m.B2BConfig(n2._raw_config(projects={n2.PROJECT: project}))
     entry = config.profiles["deploy"]["projects"][n2.PROJECT]
     assert entry["native_n4"] == {"dataset_id": "unit-native-n4"}
+
+
+def test_n4_validation_and_emission_are_owned_by_the_native_sibling():
+    from gateway.platforms import api_server_b2b as facade
+
+    source = inspect.getsource(facade)
+    assert len(source.splitlines()) < 2299
+    assert "_N4_DATASET_ID" not in source
+    assert "_NATIVE_N4_KEYS" not in source
+    assert "native_n4 requires native_n2" not in source
+    assert "b2b native N4 admission refused" not in source
+    assert "validate_native_stanza" in source
+    assert "emit_for_admitted_run" in source
+    assert callable(n4.validate_native_stanza)
+    assert callable(n4.emit_for_admitted_run)
 
 
 def test_emission_is_mission_bound_and_consumer_accepts(tmp_path):

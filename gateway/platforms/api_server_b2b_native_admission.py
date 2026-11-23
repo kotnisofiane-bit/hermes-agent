@@ -19,7 +19,9 @@ atomically without overwriting an existing admission.
 
 from __future__ import annotations
 
+import asyncio
 import errno
+import logging
 import os
 import re
 import stat
@@ -27,7 +29,9 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 from agent.b2b_execution import canonical_json
-from gateway.platforms.api_server_b2b import _SHA256_FIELD
+from gateway.platforms.api_server_b2b import B2BConfigError, _SHA256_FIELD
+
+logger = logging.getLogger("gateway.platforms.api_server")
 
 ADMISSION_SCHEMA = "dubsar.g2-n4-native-admission/1"
 APPROVAL_SCHEMA = "dubsar.g2-n4-approval/1"
@@ -49,6 +53,30 @@ _NATIVE_BINDING_KEYS = frozenset({
     "mission_inputs"})
 _POINTER_KEYS = frozenset({"inputs_revision", "manifest_digest", "inputs_digest"})
 _STANZA_KEYS = frozenset({"dataset_id"})
+
+
+def validate_native_stanza(entry: Mapping[str, Any], binding_id: str,
+                           native_n2: Optional[Mapping[str, Any]]
+                           ) -> Optional[Dict[str, Any]]:
+    """Validate the optional native N4 stanza of an opted-in N2 project."""
+    if "native_n4" not in entry:
+        return None
+    # N4 is an additive admission artifact, never a lane switch: it may
+    # only ride an already-opted native N2 project, and stays absent by
+    # default so the recipe lane is byte-for-byte unchanged.
+    if native_n2 is None:
+        raise B2BConfigError(
+            f"b2b config: project {binding_id}: native_n4 requires native_n2")
+    config_n4 = entry.get("native_n4")
+    if (not isinstance(config_n4, Mapping)
+            or set(config_n4.keys()) != _STANZA_KEYS):
+        raise B2BConfigError(
+            f"b2b config: project {binding_id}: native_n4 closed keys")
+    dataset_id = config_n4["dataset_id"]
+    if not isinstance(dataset_id, str) or _ID.fullmatch(dataset_id) is None:
+        raise B2BConfigError(
+            f"b2b config: project {binding_id}: native_n4.dataset_id")
+    return {"dataset_id": dataset_id}
 
 
 class NativeAdmissionRefusal(Exception):
@@ -287,3 +315,28 @@ def emit_native_admission(*, home: Path, stanza: Mapping[str, Any],
     directory = _directory(home)
     _write(directory, attempt_id, canonical_json(admission))
     return directory / (attempt_id + ".json")
+
+
+async def emit_for_admitted_run(*, home: Path, stanza: Mapping[str, Any],
+                                native_binding: Optional[Mapping[str, Any]],
+                                resolved: Mapping[str, Any], preparation: Any,
+                                messages_digest: Any, session_id: str,
+                                attempt_id: str, binding_digest: str,
+                                profile: str,
+                                configured_tenant: str) -> None:
+    """Emit the N4 admission off the event loop for an already-launched run."""
+    # Additive side artifact: the recipe run is already admitted and launched.
+    # The N4 admission never gates it; it is published atomically or refused
+    # without leaving a file, and every refusal is explicit in the log.
+    try:
+        await asyncio.to_thread(
+            emit_native_admission,
+            home=home, stanza=stanza, native_binding=native_binding,
+            resolved=resolved, preparation=preparation,
+            messages_digest=messages_digest, session_id=session_id,
+            attempt_id=attempt_id, binding_digest=binding_digest,
+            profile=profile, configured_tenant=configured_tenant)
+    except NativeAdmissionRefusal as exc:
+        logger.warning("b2b native N4 admission refused: %s", exc.code)
+    except OSError as exc:
+        logger.warning("b2b native N4 admission unavailable: %s", exc)
