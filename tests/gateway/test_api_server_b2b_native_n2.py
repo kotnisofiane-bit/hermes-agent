@@ -785,7 +785,7 @@ def _native_manifest_fixture(tmp_path, monkeypatch):
     return root, path, record, ref
 
 
-@pytest.mark.skipif(not _NATIVE_IO_AVAILABLE, reason="Linux O_NOFOLLOW fixture required")
+@pytest.mark.linux_only
 def test_native_manifest_real_file_accepts_and_rejects_repinned_schema_drift(
         tmp_path, monkeypatch):
     _root, path, record, ref = _native_manifest_fixture(tmp_path, monkeypatch)
@@ -806,7 +806,7 @@ def test_native_manifest_real_file_accepts_and_rejects_repinned_schema_drift(
         assert native_auth._read_native_run_authorization(repinned) is None
 
 
-@pytest.mark.skipif(not _NATIVE_IO_AVAILABLE, reason="Linux O_NOFOLLOW fixture required")
+@pytest.mark.linux_only
 def test_native_manifest_real_file_refuses_bad_pin_mode_link_and_symlink(
         tmp_path, monkeypatch):
     root, path, record, ref = _native_manifest_fixture(tmp_path, monkeypatch)
@@ -828,7 +828,7 @@ def test_native_manifest_real_file_refuses_bad_pin_mode_link_and_symlink(
         {"path": symlink, "sha256": ref["sha256"]}) is None
 
 
-@pytest.mark.skipif(not _NATIVE_IO_AVAILABLE, reason="Linux O_NOFOLLOW fixture required")
+@pytest.mark.linux_only
 def test_native_manifest_real_file_refuses_wrong_expected_owner(tmp_path, monkeypatch):
     _root, _path, record, ref = _native_manifest_fixture(tmp_path, monkeypatch)
     assert native_auth._read_native_run_authorization(ref) == record
@@ -1013,8 +1013,7 @@ def test_recipe_reason_classified():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    not _NATIVE_IO_AVAILABLE, reason="Linux O_NOFOLLOW fixture required")
+@pytest.mark.linux_only
 @pytest.mark.parametrize(("revoke_at", "authorization"), [
     pytest.param(None, "valid", id="valid"),
     pytest.param("before_provider", "valid", id="before-provider-revocation"),

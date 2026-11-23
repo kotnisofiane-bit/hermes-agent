@@ -262,8 +262,7 @@ def test_admission_cannot_be_replayed_for_another_request(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    not n2._NATIVE_IO_AVAILABLE, reason="Linux O_NOFOLLOW fixture required")
+@pytest.mark.linux_only
 async def test_native_http_without_stanza_writes_no_admission(tmp_path, monkeypatch):
     from hermes_constants import get_hermes_home
 
@@ -274,8 +273,7 @@ async def test_native_http_without_stanza_writes_no_admission(tmp_path, monkeypa
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(
-    not n2._NATIVE_IO_AVAILABLE, reason="Linux O_NOFOLLOW fixture required")
+@pytest.mark.linux_only
 async def test_native_http_n4_admission_is_emitted_once(tmp_path, monkeypatch):
     from hermes_constants import get_hermes_home
 
