@@ -2,8 +2,7 @@ name: CI
 
 # Orchestrator workflow. Runs ``detect-changes`` once, then conditionally
 # calls the sub-workflows that a PR can actually affect. A final
-# ``all-checks-pass`` gate job aggregates results so branch protection only
-# needs to require a single check.
+# ``all-checks-pass`` gate job aggregates the results of the jobs that ran.
 #
 # Sub-workflows are triggered via ``workflow_call`` and keep their own job
 # definitions, matrices, and concurrency settings. They no longer have
@@ -223,13 +222,14 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────────
   # Gate: runs after everything. ``if: always()`` ensures it reports a
-  # status even when some deps were skipped. Only actual ``failure``
-  # results cause it to fail; ``skipped`` is treated as success.
+  # status even when some deps were skipped. Green requires every job
+  # that ran to report ``success``; ``skipped`` is green only when that
+  # job's own ``if:`` evaluated false for this event — the step's env
+  # re-evaluates each lane gate into ``LANE_<job>`` with the same
+  # expressions — and ``cancelled`` always fails.
   #
-  # Branch protection should require ONLY this check.
-  #
-  # Outputs ``needs-json`` — a compact ``{job_name: result}`` dict — so
-  # the live comment poller can list failed jobs in the PR comment.
+  # Outputs ``needs-json``, a compact ``{job_name: result}`` summary of
+  # the evaluated needs map.
   # ─────────────────────────────────────────────────────────────────────
   all-checks-pass:
     name: All required checks pass
@@ -247,6 +247,7 @@ jobs:
       - history-check
       - contributor-check
       - uv-lockfile
+      - infographic-check
       - case-collision-check
       - lockfile-diff
       - docker-lint
@@ -271,24 +272,68 @@ jobs:
         id: evaluate
         env:
           NEEDS: ${{ toJSON(needs) }}
+          # Every lane-gated caller's own ``if:`` is re-evaluated here —
+          # same expression, same engine — into ``LANE_<job>``, so the
+          # check below can tell a declared skip (lane closed for this
+          # event) from a skip on an open lane, which is never green.
+          # ``always() &&`` prefixes are scheduling-only and dropped.
+          LANE_TESTS: ${{ needs.detect.outputs.python == 'true' }}
+          LANE_TESTS_OS: ${{ needs.detect.outputs.python == 'true' }}
+          LANE_LINT: ${{ needs.detect.outputs.python == 'true' }}
+          LANE_JS_TESTS: ${{ needs.detect.outputs.frontend == 'true' }}
+          LANE_INSTALLER_TESTS: ${{ needs.detect.outputs.installer == 'true' }}
+          LANE_RUST_TESTS: ${{ needs.detect.outputs.rust == 'true' }}
+          LANE_E2E_DESKTOP: ${{ false }}
+          LANE_E2E_DESKTOP_CORE: ${{ needs.detect.outputs.python_prod == 'true' || needs.detect.outputs.frontend == 'true' }}
+          LANE_DOCS_SITE: ${{ needs.detect.outputs.site == 'true' }}
+          LANE_HISTORY_CHECK: ${{ needs.detect.outputs.event_name == 'pull_request' }}
+          LANE_CONTRIBUTOR_CHECK: ${{ needs.detect.outputs.python == 'true' }}
+          LANE_UV_LOCKFILE: ${{ needs.detect.outputs.uv_lock == 'true' }}
+          LANE_LOCKFILE_DIFF: ${{ needs.detect.outputs.event_name == 'pull_request' && needs.detect.outputs.npm_lock == 'true' }}
+          LANE_DOCKER_LINT: ${{ needs.detect.outputs.docker_meta == 'true' }}
+          LANE_SUPPLY_CHAIN: ${{ needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps == 'true') }}
+          LANE_REVIEW_LABELS: ${{ needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true' || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true') }}
         run: |
           echo "$NEEDS" | python3 -c "
-          import json, sys
+          import json, os, sys
           needs = json.load(sys.stdin)
-          # Emit compact {job_name: result} for the comment assembler.
+          # Emit the compact {job_name: result} map as the job's needs-json output.
           compact = {name: info['result'] for name, info in needs.items()}
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          # ``skipped`` is legitimate only when the job's own ``if:``
+          # lane evaluated false for this event — those conditions are
+          # re-evaluated by the workflow into ``LANE_<job>`` env vars
+          # (see the step ``env:`` above), using the same expressions
+          # and the same engine. Only the literal string ``false`` may
+          # close a lane; an absent or malformed value is treated as
+          # always-open. For such a job, and for any job whose lane was
+          # open, ``skipped`` can only mean an upstream failure or
+          # cancellation — never a green outcome.
+          # ``cancelled`` is never acceptable anywhere.
+          lane = {
+              k[len('LANE_'):].lower().replace('_', '-'): v
+              for k, v in os.environ.items()
+              if k.startswith('LANE_')
+          }
+          bad = []
           for name, info in sorted(needs.items()):
               result = info['result']
-              icon = '✅' if result in ('success', 'skipped') else '❌'
+              ok = result == 'success' or (
+                  result == 'skipped' and lane.get(name) == 'false'
+              )
+              icon = '✅' if ok else '❌'
               print(f'{icon} {name}: {result}')
-          if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+              if not ok:
+                  detail = f'{name}={result}'
+                  if result == 'skipped':
+                      detail += ' (lane open)'
+                  bad.append(detail)
+          if bad:
+              print(f'::error::{len(bad)} required check(s) not green: {\", \".join(bad)}')
               sys.exit(1)
-          print('All checks passed (or were skipped)')
+          print('All checks passed (skips only on closed lanes)')
           "
 
   # ─────────────────────────────────────────────────────────────────────
