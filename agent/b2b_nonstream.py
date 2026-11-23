@@ -14,7 +14,7 @@ import httpx
 from agent import chat_completion_helpers as h
 from agent.b2b_execution import (
     B2BTerminalRefusal, _public_text, before_sdk_dispatch,
-    extract_allowed_refs, validate_proposal)
+    validate_proposal)
 from agent.chat_completion_nonstream import _NonStreamRequest
 
 
@@ -155,7 +155,7 @@ class _B2BNonStreamRequest(_NonStreamRequest):
             cap = self._b2b_execution
             receipt = getattr(cap.sink, "context_receipt", None) or cap.context_receipt
             text = _public_text(response)
-            allowed = extract_allowed_refs(receipt.view) if receipt is not None else ()
+            allowed = cap.proposal_refs(receipt.view) if receipt is not None else ()
             parsed, reason = validate_proposal(text, allowed)
             if parsed is None:
                 cap.sink.block("result_invalid")
