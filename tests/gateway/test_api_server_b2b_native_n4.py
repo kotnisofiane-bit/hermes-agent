@@ -12,7 +12,9 @@ The consumer half is copied from Scribe-backend #131 @
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import re
 import stat
 from pathlib import Path
@@ -234,6 +236,25 @@ def test_source_digests_accept_both_representations(tmp_path, prefix):
     assert admission["mission_source_digest"] == sourced["mission_source_digest"]
     _consume(admission, request_digest=sourced["request_digest"],
              attempt_id=n2.ATTEMPT)
+
+
+def test_failed_write_leaves_no_admission_and_no_temporary(tmp_path, monkeypatch):
+    real_write = os.write
+    calls = []
+
+    def failing_write(fd, data):
+        if not calls:
+            calls.append(1)
+            return real_write(fd, bytes(data)[:3])
+        raise OSError(errno.ENOSPC, "no space left on device")
+
+    monkeypatch.setattr(n4.os, "write", failing_write)
+    with pytest.raises(n4.NativeAdmissionRefusal,
+                       match="^n4_admission_unavailable$"):
+        _emit(tmp_path)
+    directory = tmp_path / "b2b" / "n4-admissions"
+    assert not _path(tmp_path).exists()
+    assert list(directory.iterdir()) == []
 
 
 def test_unbound_mission_writes_nothing(tmp_path):

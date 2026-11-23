@@ -13,8 +13,8 @@ admitted, with ``authorized: false``. Only the Core/operator may seal
 template; Hermes never writes either value because the signed source does
 not provide one. Hermes never writes ``model_route`` or ``ports``.
 Emission happens after the existing recipe-lane run was admitted, so a
-refusal here never changes that run. One file per attempt, written once
-(``O_EXCL``), never overwritten.
+refusal here never changes that run. One file per attempt, published once
+atomically without overwriting an existing admission.
 """
 
 from __future__ import annotations
@@ -218,8 +218,16 @@ def _directory(home: Path) -> Path:
     return directory
 
 
+def _unlink_quiet(name: str, dir_fd: int) -> None:
+    try:
+        os.unlink(name, dir_fd=dir_fd)
+    except OSError:
+        pass
+
+
 def _write(directory: Path, attempt_id: str, payload: bytes) -> None:
     name = attempt_id + ".json"
+    temporary = f".{attempt_id}.{os.getpid()}.{os.urandom(8).hex()}.tmp"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -228,9 +236,7 @@ def _write(directory: Path, attempt_id: str, payload: bytes) -> None:
         _refuse("n4_admission_unavailable")
     try:
         try:
-            fd = os.open(name, flags, 0o640, dir_fd=dir_fd)
-        except FileExistsError:
-            _refuse("n4_admission_consumed")
+            fd = os.open(temporary, flags, 0o640, dir_fd=dir_fd)
         except OSError:
             _refuse("n4_admission_unavailable")
         try:
@@ -242,12 +248,24 @@ def _write(directory: Path, attempt_id: str, payload: bytes) -> None:
                 view = view[written:]
             os.fsync(fd)
         except OSError:
+            _unlink_quiet(temporary, dir_fd)
             _refuse("n4_admission_unavailable")
         finally:
             os.close(fd)
         try:
+            os.link(temporary, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd,
+                    follow_symlinks=False)
+        except FileExistsError:
+            _unlink_quiet(temporary, dir_fd)
+            _refuse("n4_admission_consumed")
+        except OSError:
+            _unlink_quiet(temporary, dir_fd)
+            _refuse("n4_admission_unavailable")
+        _unlink_quiet(temporary, dir_fd)
+        try:
             os.fsync(dir_fd)
         except OSError:
+            _unlink_quiet(name, dir_fd)
             _refuse("n4_admission_unavailable")
     finally:
         os.close(dir_fd)
