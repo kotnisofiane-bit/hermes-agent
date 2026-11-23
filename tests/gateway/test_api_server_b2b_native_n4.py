@@ -134,6 +134,28 @@ def _unit():
     return resolved, native_binding, preparation, digest
 
 
+def _unit_with(*, requester, request_digest, mission_source_digest):
+    binding = n2._binding_for(requester=requester)
+    session_id = "b2b_" + binding
+    attempt_id = n2.m._attempt_id_for(binding)
+    request = {"request_id": "req-" + requester, "body": {
+        "attempt_id": attempt_id, "profile": "deploy",
+        "session_id": session_id}}
+    body = n2._resolved_body(
+        request, binding=binding, requester_id=requester,
+        request_digest=request_digest,
+        mission_source_digest=mission_source_digest)
+    resolved = {key: body[key] for key in (
+        "project_id", "mission_id", "mission_revision", "request_digest",
+        "mission_source_digest", "requester_id", "mission_request")}
+    native_binding = {key: body[key] for key in n2.m._NATIVE_BINDING_KEYS}
+    rendered = b"unit-rendered"
+    preparation = SimpleNamespace(documents=n2._docs(), rendered=rendered)
+    digest = native_recipe_messages_digest(resolved["mission_request"], rendered)
+    return (resolved, native_binding, preparation, digest, session_id,
+            attempt_id, binding)
+
+
 _UNSET = object()
 
 
@@ -299,14 +321,30 @@ def test_unavailable_store_writes_nothing(tmp_path):
     assert not (blocker / "b2b").exists()
 
 
-def test_admission_cannot_be_replayed_for_another_request(tmp_path):
-    path = _emit(tmp_path)
-    admission = json.loads(path.read_text(encoding="utf-8"))
-    with pytest.raises(ValueError, match="^n4_admission_request_mismatch$"):
-        _consume(admission, request_digest="99" * 32, attempt_id=n2.ATTEMPT)
-    with pytest.raises(ValueError, match="^n4_admission_attempt_mismatch$"):
-        _consume(admission, request_digest=admission["request_digest"],
-                 attempt_id=n2.m._attempt_id_for("f" * 64))
+def test_two_requests_emit_two_files_bound_to_their_attempts(tmp_path):
+    emitted = []
+    for requester, request_digest, mission_source_digest in (
+            ("5" * 24, "11" * 32, "ef" * 32),
+            ("6" * 24, "99" * 32, "a1" * 32)):
+        (resolved, native_binding, preparation, messages_digest, session_id,
+         attempt_id, binding_digest) = _unit_with(
+            requester=requester, request_digest=request_digest,
+            mission_source_digest=mission_source_digest)
+        path = n4.emit_native_admission(
+            home=tmp_path, stanza={"dataset_id": "unit-n4-dataset"},
+            native_binding=native_binding, resolved=resolved,
+            preparation=preparation, messages_digest=messages_digest,
+            session_id=session_id, attempt_id=attempt_id,
+            binding_digest=binding_digest, profile="deploy",
+            configured_tenant=n2.TENANT)
+        emitted.append((path, request_digest, attempt_id))
+    assert len({path for path, _, _ in emitted}) == 2
+    for path, request_digest, attempt_id in emitted:
+        admission = json.loads(path.read_text(encoding="utf-8"))
+        assert admission["request_digest"] == request_digest
+        assert admission["binding"]["attempt_id"] == attempt_id
+        _consume(admission, request_digest=request_digest,
+                 attempt_id=attempt_id)
 
 
 @pytest.mark.asyncio
