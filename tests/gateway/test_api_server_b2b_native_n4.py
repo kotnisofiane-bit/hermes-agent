@@ -1,12 +1,13 @@
 """N4 native admission producer — contract RED/GREEN.
 
 The consumer half is copied from Scribe-backend #131 @
-9248374fb95f3965f88e19e726b2f56fcacf3d4b:
+6493bc78e48fbfed468ea2e01f890ca1dd2ca798 (relevé au départ) :
 
 - ``backend/control_plane_g1/b2b_n4_config.py:79-110`` — ``_validate_binding``
 - ``backend/control_plane_g1/b2b_n4_config.py:184-192`` — dataset approval
-- ``deploy/control-plane-g2/approval.g2.n4.template.json`` — operator seals
-  ``authorized: true``; Hermes emits ``false`` and never the route/ports.
+- ``deploy/control-plane-g2/approval.g2.n4.template.json`` — the operator
+  seals ``authorized: true`` and supplies ``classification``; Hermes emits
+  neither and never the route/ports.
 """
 
 from __future__ import annotations
@@ -104,6 +105,10 @@ def _consume(admission, *, request_digest, attempt_id):
     _validate_binding(admission["binding"])
     sealed = json.loads(json.dumps(admission["dataset"]))
     assert sealed["authorized"] is False
+    assert "classification" not in sealed
+    # The operator's approval template supplies the classification; Hermes
+    # never asserts a value the signed source did not provide.
+    sealed["classification"] = _B2B_DATA_CLASS
     sealed["authorized"] = True
     _validate_dataset(sealed)
     if admission["request_digest"] != request_digest:
@@ -193,11 +198,19 @@ def test_emission_is_mission_bound_and_consumer_accepts(tmp_path):
         for document in n2._docs()]
     assert admission["dataset"] == {
         "dataset_id": "unit-n4-dataset",
-        "classification": "public_synthetic",
         "authorized": False,
         "messages_digest": _unit()[3]}
     _consume(admission, request_digest=admission["request_digest"],
              attempt_id=n2.ATTEMPT)
+
+
+def test_emission_does_not_assert_classification(tmp_path):
+    path = _emit(tmp_path)
+    admission = json.loads(path.read_text(encoding="utf-8"))
+    assert "classification" not in admission["dataset"]
+    sealed = dict(admission["dataset"], classification=_B2B_DATA_CLASS,
+                  authorized=True)
+    _validate_dataset(sealed)
 
 
 def test_emission_is_one_shot(tmp_path):

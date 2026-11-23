@@ -9,7 +9,9 @@ Scribe-backend #131 is the consumer and verifies exactly one shape:
 
 Hermes is only the producer: it emits the mission-bound binding it just
 admitted, with ``authorized: false``. Only the Core/operator may seal
-``authorized: true``; Hermes never writes ``model_route`` or ``ports``.
+``authorized: true`` and supply ``classification`` from its approval
+template; Hermes never writes either value because the signed source does
+not provide one. Hermes never writes ``model_route`` or ``ports``.
 Emission happens after the existing recipe-lane run was admitted, so a
 refusal here never changes that run. One file per attempt, written once
 (``O_EXCL``), never overwritten.
@@ -28,7 +30,6 @@ from agent.b2b_execution import canonical_json
 
 ADMISSION_SCHEMA = "dubsar.g2-n4-native-admission/1"
 APPROVAL_SCHEMA = "dubsar.g2-n4-approval/1"
-CLASSIFICATION = "public_synthetic"
 
 _ID = re.compile(r"^[A-Za-z0-9._:-]{2,128}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -158,8 +159,8 @@ def _dataset(stanza: Mapping[str, Any], messages_digest: Any) -> Dict[str, Any]:
         _refuse("n4_dataset_invalid")
     if not _matches(messages_digest, _HEX64):
         _refuse("n4_documents_invalid")
-    return {"dataset_id": dataset_id, "classification": CLASSIFICATION,
-            "authorized": False, "messages_digest": messages_digest}
+    return {"dataset_id": dataset_id, "authorized": False,
+            "messages_digest": messages_digest}
 
 
 def _admission(*, stanza: Mapping[str, Any], native_binding: Any,
