@@ -187,6 +187,11 @@ def _admission(*, stanza: Mapping[str, Any], native_binding: Any,
             "mission_source_digest": mission_source_digest}
 
 
+def _owned_by_euid(info: os.stat_result) -> bool:
+    geteuid = getattr(os, "geteuid", None)
+    return geteuid is not None and info.st_uid == geteuid()
+
+
 def _directory(home: Path) -> Path:
     home = Path(home)
     for parent in (home, home / "b2b"):
@@ -197,7 +202,7 @@ def _directory(home: Path) -> Path:
         except OSError:
             _refuse("n4_admission_unavailable")
         if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
-                or info.st_uid != os.geteuid() or info.st_mode & 0o022):
+                or not _owned_by_euid(info) or info.st_mode & 0o022):
             _refuse("n4_admission_unavailable")
     directory = home / "b2b" / "n4-admissions"
     try:
@@ -206,7 +211,7 @@ def _directory(home: Path) -> Path:
     except OSError:
         _refuse("n4_admission_unavailable")
     if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
-            or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+            or not _owned_by_euid(info) or info.st_mode & 0o077):
         _refuse("n4_admission_unavailable")
     return directory
 
