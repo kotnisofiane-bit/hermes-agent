@@ -222,6 +222,20 @@ def test_emission_is_one_shot(tmp_path):
     assert [entry.name for entry in path.parent.iterdir()] == [path.name]
 
 
+@pytest.mark.parametrize("prefix", ["", "sha256:"])
+def test_source_digests_accept_both_representations(tmp_path, prefix):
+    resolved, *_ = _unit()
+    sourced = dict(
+        resolved, request_digest=prefix + "11" * 32,
+        mission_source_digest=prefix + "ef" * 32)
+    path = _emit(tmp_path, resolved=sourced)
+    admission = json.loads(path.read_text(encoding="utf-8"))
+    assert admission["request_digest"] == sourced["request_digest"]
+    assert admission["mission_source_digest"] == sourced["mission_source_digest"]
+    _consume(admission, request_digest=sourced["request_digest"],
+             attempt_id=n2.ATTEMPT)
+
+
 def test_unbound_mission_writes_nothing(tmp_path):
     with pytest.raises(n4.NativeAdmissionRefusal, match="^n4_mission_unbound$"):
         _emit(tmp_path, native_binding=None)

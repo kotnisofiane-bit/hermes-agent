@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 from agent.b2b_execution import canonical_json
+from gateway.platforms.api_server_b2b import _SHA256_FIELD
 
 ADMISSION_SCHEMA = "dubsar.g2-n4-native-admission/1"
 APPROVAL_SCHEMA = "dubsar.g2-n4-approval/1"
@@ -179,8 +180,8 @@ def _admission(*, stanza: Mapping[str, Any], native_binding: Any,
     dataset = _dataset(stanza, messages_digest)
     request_digest = resolved.get("request_digest")
     mission_source_digest = resolved.get("mission_source_digest")
-    if (not _matches(request_digest, _HEX64)
-            or not _matches(mission_source_digest, _HEX64)):
+    if (not _matches(request_digest, _SHA256_FIELD)
+            or not _matches(mission_source_digest, _SHA256_FIELD)):
         _refuse("n4_binding_invalid")
     return {"schema": ADMISSION_SCHEMA, "approval_schema": APPROVAL_SCHEMA,
             "binding": binding, "dataset": dataset,
