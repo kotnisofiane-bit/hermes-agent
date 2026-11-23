@@ -14,7 +14,7 @@ import httpx
 from agent import chat_completion_helpers as h
 from agent.b2b_execution import (
     B2BTerminalRefusal, _public_text, before_sdk_dispatch,
-    validate_proposal)
+    normalized_messages_digest, provider_attestation, validate_proposal)
 from agent.chat_completion_nonstream import _NonStreamRequest
 
 
@@ -160,7 +160,19 @@ class _B2BNonStreamRequest(_NonStreamRequest):
             if parsed is None:
                 cap.sink.block("result_invalid")
                 raise B2BTerminalRefusal(f"result_invalid:{reason}")
-            cap.sink.commit_result(text=text, parsed=parsed, reason=reason)
+            provenance, receipt_ref = provider_attestation(response)
+            messages_digest = None
+            if provenance is not None or receipt_ref is not None:
+                try:
+                    messages_digest = normalized_messages_digest(
+                        self.api_kwargs.get("messages"))
+                except ValueError:
+                    cap.sink.block("result_unattested")
+                    raise B2BTerminalRefusal("result_unattested") from None
+            cap.sink.commit_result(
+                text=text, parsed=parsed, reason=reason,
+                provenance=provenance, receipt_ref=receipt_ref,
+                messages_digest=messages_digest)
             self.result["response"] = response
         except Exception as e:
             # Our own force-close caused this error: swallow it, the main
