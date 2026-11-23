@@ -375,6 +375,7 @@ async def test_native_http_n4_admission_is_emitted_once(tmp_path, monkeypatch):
              attempt_id=n2.ATTEMPT)
     assert [entry.name for entry in path.parent.iterdir()] == [path.name]
 
+
 @pytest.mark.asyncio
 @pytest.mark.linux_only
 async def test_native_http_unavailable_store_admits_and_logs(
