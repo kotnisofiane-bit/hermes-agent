@@ -1029,7 +1029,8 @@ def test_recipe_reason_classified():
     pytest.param(None, "revoke_after_prepare", id="revoke-after-preparation"),
 ])
 async def test_native_http_prepare_admission_replay_and_revocation(
-        tmp_path, monkeypatch, revoke_at, authorization, native_n4=None):
+        tmp_path, monkeypatch, revoke_at, authorization, native_n4=None,
+        native_n4_unavailable=False, observed=None):
     import base64
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
@@ -1044,6 +1045,8 @@ async def test_native_http_prepare_admission_replay_and_revocation(
     from agent.b2b_execution import NATIVE_RECIPE_SYSTEM_PROMPT, mission_prompt
 
     profile_home = adm._profile_home(tmp_path, monkeypatch, "deploy")
+    if native_n4_unavailable:
+        (profile_home / "b2b").write_text("not a directory", encoding="ascii")
     documents = _docs(count=20)
     ordinary_refs = [f"dubsar:mission:ref-{index}" for index in range(20)]
     view_refs = ordinary_refs
@@ -1292,6 +1295,8 @@ async def test_native_http_prepare_admission_replay_and_revocation(
                     json={"attempt_id": ATTEMPT, "binding_digest": BINDING},
                     headers=headers)
                 admission = await proposal_response.json()
+                if observed is not None:
+                    observed.update(admission)
                 assert proposal_response.status == 200, admission
                 run_id = admission["run_id"]
                 settled = False

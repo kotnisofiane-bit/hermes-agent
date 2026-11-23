@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import errno
 import json
+import logging
 import os
 import re
 import stat
@@ -373,3 +374,24 @@ async def test_native_http_n4_admission_is_emitted_once(tmp_path, monkeypatch):
     _consume(admission, request_digest=admission["request_digest"],
              attempt_id=n2.ATTEMPT)
     assert [entry.name for entry in path.parent.iterdir()] == [path.name]
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_native_http_unavailable_store_admits_and_logs(
+        tmp_path, monkeypatch, caplog):
+    from hermes_constants import get_hermes_home
+
+    observed = {}
+    with caplog.at_level(logging.WARNING,
+                         logger="gateway.platforms.api_server"):
+        await n2.test_native_http_prepare_admission_replay_and_revocation(
+            tmp_path, monkeypatch, None, "valid",
+            native_n4="unit-native-n4", native_n4_unavailable=True,
+            observed=observed)
+    home = Path(get_hermes_home())
+    assert observed["status"] == "admitted"
+    assert isinstance(observed["run_id"], str)
+    assert observed["run_id"].startswith("run_")
+    assert not (home / "b2b" / "n4-admissions").exists()
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("n4_admission_unavailable" in message for message in messages)
