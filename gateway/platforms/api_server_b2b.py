@@ -33,6 +33,7 @@ from agent.b2b_execution import (
     _public_text, canonical_json, is_b2b_attempt_id, is_b2b_session_id, json_utf8,
     assert_source_equivalent, context_proof, qualify_context_view, verify_context_proof,
     mission_prompt, native_recipe_messages_digest,
+    native_recipe_normalized_content_digest,
     native_recipe_normalized_messages_digest, recheck_context, validate_proposal,
     validate_provider_attestation,
     extract_allowed_refs)
@@ -1302,14 +1303,18 @@ class _AttemptSink:
             self.block("result_invalid")
             raise B2BTerminalRefusal("result_invalid")
         attestation = None
-        if provenance is not None or receipt_ref is not None or messages_digest is not None:
+        native_n4 = self.policy["project"].get("native_n4")
+        if (native_n4 is not None or provenance is not None
+                or receipt_ref is not None or messages_digest is not None):
             expected = native_recipe_normalized_messages_digest(
                 self.policy["mission_request"], receipt.rendered)
             if messages_digest != expected:
                 self.block("result_unattested")
                 raise B2BTerminalRefusal("result_unattested")
             attestation = validate_provider_attestation(
-                provenance, receipt_ref, expected_messages_digest=expected)
+                provenance, receipt_ref, expected_messages_digest=expected,
+                expected_content_digest=native_recipe_normalized_content_digest(
+                    self.policy["mission_request"], receipt.rendered))
             if attestation is None:
                 self.block("result_unattested")
                 raise B2BTerminalRefusal("result_unattested")

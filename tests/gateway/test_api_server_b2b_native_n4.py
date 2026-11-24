@@ -26,7 +26,8 @@ import pytest
 
 from agent.b2b_execution import (
     NATIVE_RECIPE_SYSTEM_PROMPT, canonical_json, mission_prompt,
-    native_recipe_messages_digest, native_recipe_normalized_messages_digest)
+    native_recipe_messages_digest, native_recipe_normalized_content_digest,
+    native_recipe_normalized_messages_digest, normalized_messages_digest)
 from gateway.platforms import api_server_b2b_native_admission as n4
 from tests.gateway import test_api_server_b2b_native_n2 as n2
 
@@ -209,6 +210,23 @@ def test_n4_digest_folds_like_the_g2_consumer():
         resolved["mission_request"], preparation.rendered)
 
 
+def test_n4_digest_frozen_vector_matches_scribe():
+    """The frozen Scribe-produced vector is versioned on both sides and needs
+    no environment: it pins the fold, the messages digest and the receipt
+    content digest hermes-agent must reproduce."""
+    vector = json.loads((
+        Path(__file__).parents[1] / "fixtures" / "b2b"
+        / "n4-digest-vector.json").read_text(encoding="utf-8"))
+    assert vector["schema"] == "dubsar.n4-digest-vector/1"
+    rendered = vector["rendered"].encode("utf-8")
+    raw = _raw_recipe_messages(vector["mission_request"], rendered)
+    assert raw == vector["messages"]
+    assert native_recipe_normalized_messages_digest(
+        vector["mission_request"], rendered) == vector["messages_digest"]
+    assert native_recipe_normalized_content_digest(
+        vector["mission_request"], rendered) == vector["content_digest"]
+
+
 def test_n4_digest_matches_real_g2_consumer(monkeypatch):
     """Proof through the REAL Scribe-backend consumer (no copied predicate):
     set DUBSAR_SCRIBE_BACKEND to a Scribe checkout to run this."""
@@ -235,19 +253,17 @@ def test_n4_digest_matches_real_g2_consumer(monkeypatch):
 async def test_native_http_n4_admission_uses_normalized_digest(
         tmp_path, monkeypatch):
     """The HTTP prepare path must sign the normalized digest into the N4
-    admission. The sentinel proves the wiring without re-deriving it."""
-    from gateway.platforms import api_server_b2b as b2b
+    admission, and the result commit must accept exactly that transcript."""
     from hermes_constants import get_hermes_home
 
-    sentinel = "ab" * 32
-    monkeypatch.setattr(
-        b2b, "native_recipe_normalized_messages_digest",
-        lambda *args, **kwargs: sentinel)
+    observed = {}
     await n2.test_native_http_prepare_admission_replay_and_revocation(
-        tmp_path, monkeypatch, None, "valid", native_n4="unit-native-n4")
+        tmp_path, monkeypatch, None, "valid", native_n4="unit-native-n4",
+        observed=observed)
     path = Path(get_hermes_home()) / "b2b" / "n4-admissions" / (n2.ATTEMPT + ".json")
     admission = json.loads(path.read_text(encoding="utf-8"))
-    assert admission["dataset"]["messages_digest"] == sentinel
+    assert admission["dataset"]["messages_digest"] == normalized_messages_digest(
+        observed["provider_messages"])
 
 
 def _path(tmp_path):

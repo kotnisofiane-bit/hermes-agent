@@ -1245,6 +1245,27 @@ def native_recipe_normalized_messages_digest(
         native_recipe_messages(mission_request, rendered))
 
 
+def normalized_content_digest(messages: Any) -> str:
+    """G2 receipt content digest over the normalized recipe transcript.
+
+    Scribe-backend hashes ``policy_text_from_messages`` (role content, plus
+    tool names/calls for tool turns) with newline separators. The recipe shape
+    normalizes to one content-only user turn, so joining the normalized
+    contents is byte-for-byte the same policy text.
+    """
+    normalized = normalize_recipe_messages(messages)
+    return hashlib.sha256(
+        "\n".join(message["content"] for message in normalized).encode("utf-8")
+    ).hexdigest()
+
+
+def native_recipe_normalized_content_digest(
+        mission_request: Mapping[str, Any], rendered: bytes) -> str:
+    """N4 receipt content digest for the exact authorized transcript."""
+    return normalized_content_digest(
+        native_recipe_messages(mission_request, rendered))
+
+
 _DIGEST_HEX = re.compile(r"[0-9a-f]{64}")
 
 
@@ -1290,13 +1311,15 @@ _RECEIPT_KEYS = frozenset({
 
 
 def validate_provider_attestation(
-        provenance: Any, receipt_ref: Any, *, expected_messages_digest: Any) -> Any:
+        provenance: Any, receipt_ref: Any, *,
+        expected_messages_digest: Any, expected_content_digest: Any) -> Any:
     """Verify the N4 provenance document and receipt reference together.
 
     Returns the pair unchanged (as plain dicts) only when both documents
-    describe the same provider call, the same route pins and this attempt's
-    exact normalized messages digest. Any partial, foreign or malformed pair is
-    ``None`` — the caller classifies it as ``result_unattested``.
+    describe the same provider call, the same route pins, this attempt's exact
+    normalized messages digest and the content digest of that same normalized
+    transcript. Any partial, foreign or malformed pair is ``None`` — the
+    caller classifies it as ``result_unattested``.
     """
     if type(provenance) is not dict or type(receipt_ref) is not dict:
         return None
@@ -1322,7 +1345,8 @@ def validate_provider_attestation(
             or receipt_ref["provider_id"] != provenance["provider_id"]
             or receipt_ref["model"] != provenance["model"]
             or receipt_ref["request_sha256"] != provenance["request_sha256"]
-            or receipt_ref["messages_digest"] != expected_messages_digest):
+            or receipt_ref["messages_digest"] != expected_messages_digest
+            or receipt_ref["content_digest"] != expected_content_digest):
         return None
     return dict(provenance), dict(receipt_ref)
 

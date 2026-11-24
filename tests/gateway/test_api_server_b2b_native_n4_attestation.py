@@ -14,8 +14,9 @@ from types import SimpleNamespace
 import pytest
 
 from agent.b2b_execution import (
-    B2BTerminalRefusal, native_recipe_normalized_messages_digest,
-    provider_attestation, validate_proposal)
+    B2BTerminalRefusal, native_recipe_normalized_content_digest,
+    native_recipe_normalized_messages_digest, provider_attestation,
+    validate_proposal)
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from tests.gateway import b2b_unit_fixtures
 from tests.gateway.test_api_server_b2b_terminal import _commit_dispatch
@@ -26,16 +27,20 @@ MODEL = "nvidia/nemotron-3-nano-30b-a3b"
 CALL_ID = "n4-call-1"
 REQUEST_SHA = "11" * 32
 APPROVAL_SHA = "22" * 32
-CONTENT_DIGEST = "33" * 32
 EGRESS_DIGEST = "44" * 32
 
 
-def _lane(tmp_path):
-    return b2b_unit_fixtures.build_b2b_dispatch_lane(tmp_path)
+def _lane(tmp_path, **over):
+    return b2b_unit_fixtures.build_b2b_dispatch_lane(tmp_path, **over)
 
 
 def _digest(lane):
     return native_recipe_normalized_messages_digest(
+        lane.policy["mission_request"], lane.receipt.rendered)
+
+
+def _content_digest(lane):
+    return native_recipe_normalized_content_digest(
         lane.policy["mission_request"], lane.receipt.rendered)
 
 
@@ -52,7 +57,7 @@ def _provenance(**over):
 def _receipt(lane, **over):
     value = {
         "call_id": CALL_ID, "decision": "ALLOW", "reason_codes": [],
-        "content_digest": CONTENT_DIGEST, "messages_digest": _digest(lane),
+        "content_digest": _content_digest(lane), "messages_digest": _digest(lane),
         "authorized_egress_messages_digest": EGRESS_DIGEST,
         "provider_id": PROVIDER_ID, "endpoint": ENDPOINT, "model": MODEL,
         "request_sha256": REQUEST_SHA}
@@ -145,6 +150,100 @@ def test_commit_result_refuses_partial_attestation(tmp_path, which):
         lane.store.close()
 
 
+def test_native_n4_missing_attestation_is_refused(tmp_path):
+    """An N4 lane may not persist a provider result with no attestation at
+    all: the native project means the N4 docs are required, not optional."""
+    lane = _lane(tmp_path, native_n4="unit-native-n4")
+    try:
+        _commit_dispatch(lane)
+        with pytest.raises(B2BTerminalRefusal) as exc:
+            _commit(lane)
+        assert str(exc.value) == "result_unattested"
+        assert lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="provider_result") is None
+        assert lane.store.b2b_attempt(
+            profile=lane.profile, attempt_id=lane.attempt_id)[
+                "status"] == "indeterminate"
+    finally:
+        lane.store.close()
+
+
+def test_commit_result_refuses_content_digest_not_bound_to_transcript(tmp_path):
+    """The receipt content digest must cover this attempt's normalized
+    transcript, exactly like Scribe's ``content_digest_from_messages``."""
+    lane = _lane(tmp_path)
+    try:
+        _commit_dispatch(lane)
+        receipt = _receipt(lane, content_digest="55" * 32)
+        with pytest.raises(B2BTerminalRefusal) as exc:
+            _commit(lane, provenance=_provenance(), receipt_ref=receipt,
+                    messages_digest=_digest(lane))
+        assert str(exc.value) == "result_unattested"
+        assert lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="provider_result") is None
+    finally:
+        lane.store.close()
+
+
+def test_commit_result_refuses_worker_messages_digest_mismatch(tmp_path):
+    """The worker computes the normalized digest; a mismatch with the receipt
+    is refused before either document is persisted."""
+    lane = _lane(tmp_path)
+    try:
+        _commit_dispatch(lane)
+        with pytest.raises(B2BTerminalRefusal) as exc:
+            _commit(lane, provenance=_provenance(), receipt_ref=_receipt(lane),
+                    messages_digest="55" * 32)
+        assert str(exc.value) == "result_unattested"
+        assert lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="provider_result") is None
+    finally:
+        lane.store.close()
+
+
+def test_worker_refuses_unattested_when_transcript_cannot_normalize():
+    """The worker's ValueError branch maps a non-normalizable transcript to
+    ``result_unattested`` — never to a completed response."""
+    from types import SimpleNamespace
+
+    from agent.b2b_nonstream import _B2BNonStreamRequest
+
+    blocked = []
+    sink = SimpleNamespace(
+        block=blocked.append, context_receipt=None)
+    cap = SimpleNamespace(
+        sink=sink, context_receipt=SimpleNamespace(view={}),
+        proposal_refs=lambda view: ())
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(
+            finish_reason="stop",
+            message=SimpleNamespace(role="assistant", content=_text()))],
+        dubsar_provenance=_provenance(),
+        dubsar_receipt_ref={"call_id": CALL_ID})
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: response)))
+    req = _B2BNonStreamRequest.__new__(_B2BNonStreamRequest)
+    req.agent = SimpleNamespace()
+    req.api_kwargs = {"messages": [], "timeout": 1.0}
+    req.result = {"response": None, "error": None}
+    req.clients = SimpleNamespace(close_once=lambda reason: None)
+    req.cancelled = False
+    req.codex_token = None
+    req.codex_retired = False
+    req.codex_watchdog_state = None
+    req.call_start = 0.0
+    req.wd = SimpleNamespace(stale_timeout=0.0)
+    req._b2b_execution = cap
+    req._b2b_receipt = object()
+    req._b2b_request_digest = "d" * 64
+    req._make_client = lambda reason: client
+    req._call()
+    assert blocked == ["result_unattested"]
+    assert isinstance(req.result["error"], B2BTerminalRefusal)
+    assert str(req.result["error"]) == "result_unattested"
+    assert req.result["response"] is None
+
+
 @pytest.mark.parametrize("field,value", [
     ("call_id", "n4-call-foreign"),
     ("provider_id", "other-provider"),
@@ -187,5 +286,7 @@ def test_commit_result_refuses_invalid_provenance(tmp_path, field, value):
             _commit(lane, provenance=provenance, receipt_ref=_receipt(lane),
                     messages_digest=_digest(lane))
         assert str(exc.value) == "result_unattested"
+        assert lane.store.b2b_artifact(
+            attempt_id=lane.attempt_id, kind="provider_result") is None
     finally:
         lane.store.close()
