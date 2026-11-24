@@ -81,6 +81,7 @@ class Installation:
         from backend.control_plane_g1.gateway_server import GatewayServer
         from backend.control_plane_g1.nvidia_nim import NvidiaNimTransport
         from backend.control_plane_g1.provider_transport import BoundedUrllibExecutor
+        from scribe.core_execution_inventory import initialize_inventory
         from scribe.model_authorization import ENDPOINT, ROUTE
 
         integrity = b"synthetic-integrity-key-integration-only"
@@ -100,6 +101,9 @@ class Installation:
             "attempt_id": lane.ATTEMPT, "profile": "deploy", "session_id": lane.SESSION}}, docs=self.documents)
         review.update(mission_inputs=source["mission_inputs"], request_digest=source["request_digest"],
                       mission_source_digest=source["mission_source_digest"])
+        inventory = self.temp / "executions"
+        inventory.mkdir(mode=0o750)
+        initialize_inventory(str(inventory))
         review_path, prep, seed = (self.temp / n for n in ("review.json", "prepared.json", "seed"))
         prep.write_text(json.dumps(prepared))
         review_path.write_text(json.dumps(review))
@@ -108,7 +112,7 @@ class Installation:
         review_path.chmod(0o600)
         cmd = [os.environ.get("DUBSAR_CORE_PYTHON", sys.executable), "-m", "scribe.model_authorization",
                "--store", str(self.store), "--prepared", str(prep), "--review", str(review_path),
-               "--signing-key", str(seed)]
+               "--signing-key", str(seed), "--execution-inventory", str(inventory)]
         kwargs = dict(cwd=self.core_root, capture_output=True, text=True, timeout=3)
         # Re-signing for the same attempt must not replace the first decision.
         result = subprocess.run(cmd, check=True, **kwargs)
