@@ -55,7 +55,8 @@ def build_b2b_dispatch_lane(tmp_path, *,
                             mission_source_refs=(),
                             project_id="b2b-bench",
                             view_factory=build_context_view,
-                            request_timeout_seconds=None):
+                            request_timeout_seconds=None,
+                            native_n4=None):
     """One admitted B2B attempt with a published context receipt -- ready for the
     dispatch fence. NO CAS and NO result commit: ``status == "context_ready"``.
 
@@ -110,6 +111,8 @@ def build_b2b_dispatch_lane(tmp_path, *,
         "mission_request": {"title": "m", "objective": "o",
                              "criteria": [], "source_refs": list(mission_source_refs)},
         "project": entry["projects"][project_id]}
+    if native_n4 is not None:
+        policy["project"]["native_n4"] = {"dataset_id": native_n4}
     view = view_factory(policy, {"mission_source_digest": "c" * 64})
     db_path = os.path.join(str(tmp_path), "runs.db")
     store = RunIdempotencyStore(db_path)

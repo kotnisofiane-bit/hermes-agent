@@ -35,7 +35,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from agent.b2b_execution import (
     B2BTerminalRefusal, BoundExecution, assert_terminal_runtime, bind_execution,
-    canonical_json, install_bounded_agent_policy, reset_execution,
+    canonical_json, install_bounded_agent_policy, normalized_content_digest,
+    normalized_messages_digest, reset_execution,
 )
 from gateway.platforms import api_server_b2b as m
 from gateway.platforms import api_server_b2b_native_authorization as native_auth
@@ -1140,14 +1141,36 @@ async def test_native_http_prepare_admission_replay_and_revocation(
         raw = await request.read()
         if not request.headers.get("Authorization"):
             return web.Response(status=401)
-        provider_requests.append(json.loads(raw))
-        return web.json_response({
+        payload = json.loads(raw)
+        provider_requests.append(payload)
+        if observed is not None:
+            observed["provider_messages"] = payload.get("messages")
+        response = {
             "id": "cmpl-native-e2e", "object": "chat.completion",
             "choices": [{"index": 0, "message": {
                 "role": "assistant", "content": json.dumps(proposal_result)},
                 "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-        })
+        }
+        if native_n4:
+            call_id = "n4-native-http-call"
+            request_sha = "11" * 32
+            response["dubsar_provenance"] = {
+                "schema": "dubsar.g2-n4-provenance/1", "kind": "provider",
+                "provider_id": "unit-provider", "model": "unit-model",
+                "request_sha256": request_sha, "approval_sha256": "22" * 32,
+                "call_id": call_id}
+            response["dubsar_receipt_ref"] = {
+                "call_id": call_id, "decision": "ALLOW", "reason_codes": [],
+                "content_digest": normalized_content_digest(
+                    payload.get("messages")),
+                "messages_digest": normalized_messages_digest(
+                    payload.get("messages")),
+                "authorized_egress_messages_digest": "44" * 32,
+                "provider_id": "unit-provider",
+                "endpoint": "https://provider.invalid/v1/chat/completions",
+                "model": "unit-model", "request_sha256": request_sha}
+        return web.json_response(response)
 
     provider_app = web.Application()
     provider_app.router.add_post("/v1/chat/completions", provider_chat)

@@ -32,7 +32,10 @@ from agent.b2b_execution import (
     _plain_json,
     _public_text, canonical_json, is_b2b_attempt_id, is_b2b_session_id, json_utf8,
     assert_source_equivalent, context_proof, qualify_context_view, verify_context_proof,
-    mission_prompt, native_recipe_messages_digest, recheck_context, validate_proposal,
+    mission_prompt, native_recipe_messages_digest,
+    native_recipe_normalized_content_digest,
+    native_recipe_normalized_messages_digest, recheck_context, validate_proposal,
+    validate_provider_attestation,
     extract_allowed_refs)
 from gateway.platforms import api_server_b2b_native_authorization as _native_auth
 
@@ -1289,7 +1292,9 @@ class _AttemptSink:
             profile=self.profile, attempt_id=self.attempt_id,
             source_record=source_record, dispatch_record=dispatch_record)
 
-    def commit_result(self, *, text: Any, parsed: Any, reason: str) -> None:
+    def commit_result(self, *, text: Any, parsed: Any, reason: str,
+                      provenance: Any = None, receipt_ref: Any = None,
+                      messages_digest: Any = None) -> None:
         receipt = self.context_receipt
         valid, checked = validate_proposal(
             text, self._proposal_refs(receipt.view) if receipt else ())
@@ -1297,12 +1302,30 @@ class _AttemptSink:
         if receipt is None or marker is None or valid is None or valid != parsed or checked != reason:
             self.block("result_invalid")
             raise B2BTerminalRefusal("result_invalid")
+        attestation = None
+        native_n4 = self.policy["project"].get("native_n4")
+        if (native_n4 is not None or provenance is not None
+                or receipt_ref is not None or messages_digest is not None):
+            expected = native_recipe_normalized_messages_digest(
+                self.policy["mission_request"], receipt.rendered)
+            if messages_digest != expected:
+                self.block("result_unattested")
+                raise B2BTerminalRefusal("result_unattested")
+            attestation = validate_provider_attestation(
+                provenance, receipt_ref, expected_messages_digest=expected,
+                expected_content_digest=native_recipe_normalized_content_digest(
+                    self.policy["mission_request"], receipt.rendered))
+            if attestation is None:
+                self.block("result_unattested")
+                raise B2BTerminalRefusal("result_unattested")
         dispatch = json.loads(marker["payload"])
         payload = json_utf8({
             "format": "dubsar.b2b-provider-result/1",
             "attempt_id": self.attempt_id, "binding_digest": self.binding_digest,
             "run_id": self.run_id, "request_digest": dispatch["request_digest"],
-            "context_digest": receipt.digest, "text": text, "proposal": valid})
+            "context_digest": receipt.digest, "text": text, "proposal": valid,
+            **({"dubsar_provenance": attestation[0],
+                "dubsar_receipt_ref": attestation[1]} if attestation else {})})
         if not self._store.b2b_commit_result(
             profile=self.profile, attempt_id=self.attempt_id,
                 payload=payload):
@@ -1786,7 +1809,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             home=home, stanza=project["native_n4"],
             native_binding=native_binding, resolved=resolved,
             preparation=sink._context_preparation,
-            messages_digest=native_messages_digest,
+            messages_digest=native_recipe_normalized_messages_digest(
+                resolved["mission_request"], sink._context_preparation.rendered),
             session_id=session_id, attempt_id=attempt_id,
             binding_digest=binding_digest, profile=profile,
             configured_tenant=project["native_n2"]["tenant_id"])
