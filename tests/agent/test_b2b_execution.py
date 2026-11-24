@@ -115,6 +115,19 @@ def test_extract_allowed_refs_only_ref_fields():
     assert "not-a-ref" not in extract_allowed_refs(view)
 
 
+def test_extract_allowed_refs_native_skips_interleaved_digests():
+    mission = "mis_" + "a" * 32
+    pieces = [f"dubsar:piece:{mission}:piece_{index:032x}" for index in range(2)]
+    source_refs = ["dubsar:mission:ordinary"]
+    for piece in pieces:
+        source_refs.extend([piece, "sha256:" + "b" * 64])
+    view = {"references": ["view-ref"]}
+    refs = extract_allowed_refs(
+        view, native_request={"source_refs": source_refs})
+    assert refs == ("view-ref", pieces[0], pieces[1])
+    assert not any(ref.startswith("sha256:") for ref in refs)
+
+
 # ---------------------------------------------------------------------------
 # _public_text — strict single clean public answer
 # ---------------------------------------------------------------------------

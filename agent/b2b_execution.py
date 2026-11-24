@@ -424,7 +424,9 @@ def extract_allowed_refs(
                 None,
             )
             if first_piece is not None:
-                refs.extend(source_refs[first_piece:])
+                refs.extend(
+                    ref for ref in source_refs[first_piece:]
+                    if isinstance(ref, str) and ref.startswith("dubsar:piece:"))
     return tuple(dict.fromkeys(refs))
 
 

@@ -24,6 +24,8 @@ _NATIVE_PROJECT_ID = re.compile(r"^prj_[0-9a-f]{32}$")
 _NATIVE_TENANT_ID = re.compile(
     r"^[^\x00-\x1f\s](?:[^\x00-\x1f]{0,62}[^\x00-\x1f\s])?$")
 _SHA256_PREFIXED = re.compile(r"^sha256:[0-9a-f]{64}$")
+_NATIVE_ROUTE_KEYS = frozenset({"provider_id", "model", "model_version"})
+_NATIVE_N4_KEYS = frozenset({"dataset_id", "core_public_key", "endpoint"}) | _NATIVE_ROUTE_KEYS
 _POINTER_KEYS = frozenset({"inputs_revision", "manifest_digest", "inputs_digest"})
 _NATIVE_BINDING_KEYS = (
     "tenant_id", "project_id", "mission_id", "mission_revision", "profile",
@@ -162,6 +164,13 @@ def _validate_source_url(value: Any) -> str:
     return value
 
 
+def _validate_route_endpoint(value: Any, name: str) -> str:
+    if (not isinstance(value, str) or not value.startswith("https://")
+            or len(value) > 2048 or re.search(r"[\s\x00-\x1f\x7f-\x9f]", value)):
+        raise B2BConfigError(f"b2b config: {name} must be an https URL")
+    return value
+
+
 def _validate_model_url(value: Any) -> str:
     if not isinstance(value, str):
         raise B2BConfigError("b2b config: base_url must be a string")
@@ -259,12 +268,22 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
     if "native_n4" in entry:
         stanza = entry["native_n4"]
         if (native_n2 is None or not isinstance(stanza, Mapping)
-                or set(stanza) != {"dataset_id", "core_public_key"}
+                or set(stanza) != _NATIVE_N4_KEYS
                 or not isinstance(stanza["dataset_id"], str)
                 or not _native_auth._DATASET_ID.fullmatch(stanza["dataset_id"])
                 or not isinstance(stanza["core_public_key"], str)
                 or not _HEX64.fullmatch(stanza["core_public_key"])):
             raise B2BConfigError(f"b2b config: project {binding_id}: invalid native_n4")
+        _validate_route_endpoint(stanza["endpoint"], f"project {binding_id}: native_n4.endpoint")
+        for key in _NATIVE_ROUTE_KEYS:
+            value = stanza[key]
+            if (not isinstance(value, str) or not value or len(value) > 256
+                    or _CONTROL_CHARS.search(value)):
+                raise B2BConfigError(
+                    f"b2b config: project {binding_id}: native_n4.{key}")
+        if stanza["model"] != entry["model"]:
+            raise B2BConfigError(
+                f"b2b config: project {binding_id}: native_n4.model must equal model")
         native_n4 = dict(stanza)
     normalized = {
         "project_id": project_id,

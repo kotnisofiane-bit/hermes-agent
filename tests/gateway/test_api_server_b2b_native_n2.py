@@ -201,6 +201,13 @@ def _project_entry(native=True, run_ref=None, project_id=PROJECT, **over):
     return entry
 
 
+def _native_n4(dataset_id, **over):
+    stanza = {"dataset_id": dataset_id, "core_public_key": "ab" * 32,
+              "endpoint": native_auth.ENDPOINT, **native_auth.ROUTE}
+    stanza.update(over)
+    return stanza
+
+
 def _raw_config(source_port=21000, projects=None, profile_name="deploy"):
     if projects is None:
         projects = {PROJECT: _project_entry()}
@@ -442,6 +449,38 @@ def test_config_native_wrong_lane_refuses(mutate):
     mutate(project)
     with pytest.raises(m.B2BConfigError):
         m.B2BConfig(_raw_config(projects={PROJECT: project}))
+
+
+def test_config_native_n4_route_is_closed_frozen_and_policied():
+    project = _project_entry(native_n4=_native_n4("ds-unit"))
+    config = m.B2BConfig(_raw_config(projects={PROJECT: project}))
+    entry = config.profiles["deploy"]
+    frozen = entry["projects"][PROJECT]
+    assert frozen["native_n4"] == _native_n4("ds-unit")
+    with pytest.raises(TypeError):
+        frozen["native_n4"]["endpoint"] = "https://elsewhere.invalid"
+    for mutate in (
+            lambda stanza: stanza.pop("endpoint"),
+            lambda stanza: stanza.pop("provider_id"),
+            lambda stanza: stanza.update(endpoint="http://insecure.invalid"),
+            lambda stanza: stanza.update(endpoint="https://bad host"),
+            lambda stanza: stanza.update(model="another-model"),
+            lambda stanza: stanza.update(model_version=""),
+            lambda stanza: stanza.update(extra="unexpected")):
+        broken = _project_entry(native_n4=_native_n4("ds-unit"))
+        mutate(broken["native_n4"])
+        with pytest.raises(m.B2BConfigError):
+            m.B2BConfig(_raw_config(projects={PROJECT: broken}))
+
+    resolved, reason = _resolve(entry, m._KeyRing(entry))
+    assert reason == "ok", reason
+    policy = _policy_for(resolved)
+    policy["project"] = dict(frozen)
+    base = m._policy_digest("deploy", entry, frozen, policy)
+    changed = dict(frozen)
+    changed["native_n4"] = dict(frozen["native_n4"],
+                                endpoint="https://elsewhere.invalid")
+    assert m._policy_digest("deploy", entry, changed, policy) != base
 
 
 def test_config_native_requires_deploy_profile_name():
@@ -1047,6 +1086,12 @@ def test_recipe_reason_classified():
     pytest.param(None, "unattested-view-piece", id="unattested-view-piece"),
     pytest.param(None, "different-view-prefix", id="different-view-prefix"),
     pytest.param(None, "revoke_after_prepare", id="revoke-after-preparation"),
+    pytest.param(None, "expired", id="expired-authorization"),
+    pytest.param(None, "future", id="future-authorization"),
+    pytest.param(None, "ttl", id="overlong-authorization-ttl"),
+    pytest.param(None, "approver_same", id="approver-same-as-requester"),
+    pytest.param(None, "approver_bad", id="approver-not-an-object-id"),
+    pytest.param(None, "config_route", id="configured-route-differs-from-claim"),
 ])
 async def test_native_http_prepare_admission_replay_and_revocation(
         tmp_path, monkeypatch, revoke_at, authorization, installation=None):
@@ -1225,7 +1270,10 @@ async def test_native_http_prepare_admission_replay_and_revocation(
                 context_contract_root=prepare_tests.extract_contract_root(tmp_path),
                 project_context={"project_id": PROJECT,
                                  "allocation_root": str(alloc), "start": str(start)},
-                **({"native_n4": {"dataset_id": record["dataset_id"], "core_public_key": core_public}}
+                **({"native_n4": _native_n4(
+                    record["dataset_id"], core_public_key=core_public,
+                    **({"endpoint": "https://elsewhere.invalid"}
+                       if authorization == "config_route" else {}))}
                    if authorization != "no_stanza" else {}))
             b2b_raw = _raw_config(
                 source_port=source.port, projects={PROJECT: project})
@@ -1324,6 +1372,16 @@ async def test_native_http_prepare_admission_replay_and_revocation(
                              "result_public_key": result_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex(),
                              "issued_at": now, "expires_at": now + 900, "approver_id": "6"*24,
                              "endpoint": "https://elsewhere.invalid" if authorization == "route" else auth.ENDPOINT}
+                    if authorization == "expired":
+                        claim["issued_at"], claim["expires_at"] = now - 901, now - 1
+                    elif authorization == "future":
+                        claim["issued_at"], claim["expires_at"] = now + 60, now + 960
+                    elif authorization == "ttl":
+                        claim["expires_at"] = now + 901
+                    elif authorization == "approver_same":
+                        claim["approver_id"] = native_binding["requester_id"]
+                    elif authorization == "approver_bad":
+                        claim["approver_id"] = "not-an-object-id"
                     signer = Ed25519PrivateKey.generate() if authorization == "signature" else core_key
                     envelope = {"claim": claim, "signature": base64.b64encode(signer.sign(
                         auth.SCHEMA.encode() + b"\0" + canonical_json(claim))).decode()}
@@ -1365,6 +1423,9 @@ async def test_native_http_prepare_admission_replay_and_revocation(
                         "sha": "sha_mismatch", "route": "route", "normalized": "normalized_digest",
                         "messages_digest": "raw_digest", "binding": "binding", "request_digest": "source_digest",
                         "mission_source_digest": "source_digest", "revoke_after_prepare": "revoked",
+                        "expired": "expired", "future": "expired", "ttl": "expired",
+                        "approver_same": "approver_not_distinct", "approver_bad": "approver_invalid",
+                        "config_route": "route",
                     }[authorization]
                     assert denial == {"error": expected, "code": expected}
                     spawn.assert_not_awaited()
@@ -1461,6 +1522,14 @@ async def test_native_http_prepare_admission_replay_and_revocation(
                 replay = await replay_response.json()
                 assert replay_response.status == 409, replay
                 assert replay["code"] == "model_authorization_consumed"
+                durable = store.b2b_attempt(
+                    profile="deploy", attempt_id=ATTEMPT)
+                assert replay["object"] == "b2b.proposal_attempt"
+                assert replay["attempt_id"] == ATTEMPT
+                assert replay["binding_digest"] == BINDING
+                assert replay["session_id"] == SESSION
+                assert replay["run_id"] == admission["run_id"] == durable["run_id"]
+                assert replay["status"] == durable["status"]
                 spawn.assert_awaited_once()
                 assert adm._store_counts(store) == counts_before
                 assert adapter._session_db.get_session(SESSION)["title"] == title_before

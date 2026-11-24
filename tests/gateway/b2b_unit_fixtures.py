@@ -18,6 +18,7 @@ from agent.b2b_execution import (
     BoundExecution, bind_execution, json_utf8, reset_execution,
 )
 from gateway.platforms import api_server_b2b as b2b
+from gateway.platforms import api_server_b2b_native_authorization as native_auth
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from hermes_constants import get_hermes_home
 from tests.gateway.b2b_process_harness import (
@@ -98,7 +99,8 @@ def build_b2b_dispatch_lane(tmp_path, *,
             project_context={"project_id": project_id, "allocation_root": str(tmp_path), "start": str(tmp_path)},
             native_n2={"tenant_id": "fixture", "run_authorization": {
                 "path": str(tmp_path / "approved"), "sha256": "22"*32}},
-            native_n4={"dataset_id": native_n4, "core_public_key": "ab"*32})
+            native_n4={"dataset_id": native_n4, "core_public_key": "ab"*32,
+                       "endpoint": native_auth.ENDPOINT, **native_auth.ROUTE})
     config = b2b.B2BConfig({"enabled": True, "profiles": {profile: entry}})
     state = b2b._B2BState(config)
     adapter = SimpleNamespace(_b2b_state=state)

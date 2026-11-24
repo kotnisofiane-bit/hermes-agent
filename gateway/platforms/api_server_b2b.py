@@ -490,6 +490,24 @@ def _deny(code: int, reason: str):
     return web.json_response({"error": reason, "code": reason}, status=code)
 
 
+def _consumed_response(store: Any, *, profile: str, attempt_id: str,
+                       binding_digest: str, session_id: str):
+    """409 for a native retry: the durable attempt identity, never a relaunch."""
+    from aiohttp import web
+    attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id) or {}
+    return web.json_response({
+        "error": "model_authorization_consumed",
+        "code": "model_authorization_consumed",
+        "object": "b2b.proposal_attempt",
+        "attempt_id": attempt_id,
+        "binding_digest": binding_digest,
+        "run_id": attempt.get("run_id"),
+        "profile": profile,
+        "session_id": attempt.get("session_id") or session_id,
+        "status": attempt.get("status") or "consumed",
+    }, status=409)
+
+
 def _policy_digest(profile: str, entry: Mapping[str, Any], project: Mapping[str, Any],
                    resolved: Mapping[str, Any]) -> str:
     """Stable identity/policy fingerprint: semantic entry/settings/schema pins + trusted
@@ -927,8 +945,8 @@ class _AttemptSink:
                         self.policy.get("native_n4_result_public_key"), result_signature, proof)
                         or provenance["approval_sha256"] != project["native_n2"]["run_authorization"]["sha256"]
                         or provenance["model"] != project["model"]
-                        or provenance["provider_id"] != _native_auth.ROUTE["provider_id"]
-                        or receipt_ref["endpoint"] != _native_auth.ENDPOINT
+                        or provenance["provider_id"] != project["native_n4"]["provider_id"]
+                        or receipt_ref["endpoint"] != project["native_n4"]["endpoint"]
                         or receipt_ref["authorized_egress_messages_digest"] != expected):
                     attestation = None
             if attestation is None:
@@ -1263,7 +1281,9 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         return _deny(403, "model_authorization_missing")
     existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
     if existing_attempt is not None and project.get("native_n2") is not None:
-        return _deny(409, "model_authorization_consumed")
+        return _consumed_response(
+            store, profile=profile, attempt_id=attempt_id,
+            binding_digest=binding_digest, session_id=session_id)
     native_binding = resolved.get("_native_binding")
     native_messages_digest = None
     if project.get("native_n2") is not None:
@@ -1285,7 +1305,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     # reports). Any source/producer error is 503 execution_unavailable with
     # NO binding/attempt/run/title/provider side effects — the in-memory
     # sink/cap are simply dropped. Legacy lanes keep their idempotent replay;
-    # a native retry is a consumed authorization, never a second launch.
+    # a native retry is a consumed authorization: answer with the durable
+    # attempt identity and never launch a second worker.
     policy = {
         "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
         "attempt_id": attempt_id, "profile_home": str(home),
@@ -1397,7 +1418,9 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         (outcome.get("attempt") or {}).get("run_id") if outcome.get("status") == "replayed" else run_id)
     if outcome.get("status") == "replayed":
         if native_binding is not None:
-            return _deny(409, "model_authorization_consumed")
+            return _consumed_response(
+                store, profile=profile, attempt_id=attempt_id,
+                binding_digest=binding_digest, session_id=session_id)
         return _replayed_response(adapter, stored_run_id, attempt_id, binding_digest, profile, session_id)
     adapter._run_idempotency_ids.add(stored_run_id)
     try:

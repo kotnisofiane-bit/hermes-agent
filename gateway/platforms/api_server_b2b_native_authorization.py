@@ -7,6 +7,7 @@ import hashlib
 import os
 import re
 import stat
+import time
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
@@ -19,6 +20,7 @@ _NATIVE_SECURITY_UID = 32013
 _NATIVE_TRUSTED_ROOT = "/"
 _NATIVE_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 _NATIVE_MANIFEST_MAX = 65536
+_CLAIM_TTL_SECONDS = 900
 _NATIVE_MANIFEST_FORMAT = "dubsar.b2b-n2-recipe/1"
 _NATIVE_MANIFEST_CLASS = "public_synthetic"
 _NATIVE_MANIFEST_KEYS = frozenset({
@@ -155,7 +157,7 @@ def _validate_n2(record):
     return dict(record)
 
 
-def read_approval(project: Mapping[str, Any]) -> Dict[str, Any]:
+def read_approval(project: Mapping[str, Any], *, now: Optional[int] = None) -> Dict[str, Any]:
     stanza = project.get("native_n4")
     if not stanza:
         raise AuthorizationRefused("missing")
@@ -169,6 +171,25 @@ def read_approval(project: Mapping[str, Any]) -> Dict[str, Any]:
             SCHEMA.encode() + b"\0" + canonical_json(claim))
     except (InvalidSignature, TypeError, ValueError, RecursionError):
         raise AuthorizationRefused("signature") from None
+    if (type(claim) is not dict or set(claim) != {
+            "schema", "n2", "n4", "endpoint", "result_public_key",
+            "issued_at", "expires_at", "approver_id"} or claim.get("schema") != SCHEMA):
+        raise AuthorizationRefused("schema")
+    issued_at, expires_at = claim.get("issued_at"), claim.get("expires_at")
+    current = int(time.time()) if now is None else now
+    if (type(issued_at) is not int or type(expires_at) is not int
+            or not issued_at <= current < expires_at
+            or expires_at - issued_at > _CLAIM_TTL_SECONDS):
+        raise AuthorizationRefused("expired")
+    try:
+        requester_id = claim["n2"]["binding"]["requester_id"]
+    except (KeyError, TypeError):
+        raise AuthorizationRefused("schema") from None
+    approver_id = claim.get("approver_id")
+    if not isinstance(approver_id, str) or re.fullmatch(r"[0-9a-f]{24}", approver_id) is None:
+        raise AuthorizationRefused("approver_invalid")
+    if approver_id == requester_id:
+        raise AuthorizationRefused("approver_not_distinct")
     try:
         n4 = claim["n4"]
         dataset, ports, n2 = n4["dataset"], n4["ports"], claim["n2"]
@@ -176,8 +197,10 @@ def read_approval(project: Mapping[str, Any]) -> Dict[str, Any]:
                 or n2["classification"] != _NATIVE_MANIFEST_CLASS
                 or dataset["dataset_id"] != stanza["dataset_id"] or n2["dataset_id"] != stanza["dataset_id"]):
             raise AuthorizationRefused("classification")
-        if (claim["endpoint"] != ENDPOINT or n4["model_route"] != ROUTE
-                or project["model"] != ROUTE["model"]
+        route = {"provider_id": stanza["provider_id"], "model": stanza["model"],
+                 "model_version": stanza["model_version"]}
+        if (claim["endpoint"] != stanza["endpoint"] or n4["model_route"] != route
+                or project["model"] != route["model"]
                 or set(ports) != {"gateway", "core_llm"}
                 or any(type(p) is not int or not 20000 <= p <= 65535 for p in ports.values())
                 or ports["gateway"] == ports["core_llm"]
