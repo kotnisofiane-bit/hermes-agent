@@ -1064,6 +1064,7 @@ def test_recipe_reason_classified():
 @pytest.mark.linux_only
 @pytest.mark.parametrize(("revoke_at", "authorization"), [
     pytest.param(None, "valid", id="valid"),
+    pytest.param(None, "expire_after_admission", id="expire-after-admission"),
     pytest.param("before_provider", "valid", id="before-provider-revocation"),
     pytest.param("before_seal", "valid", id="before-seal-revocation"),
     pytest.param(None, "no_ref", id="missing-authorization-ref"),
@@ -1210,6 +1211,10 @@ async def test_native_http_prepare_admission_replay_and_revocation(
             return web.Response(status=401)
         payload = json.loads(raw)
         provider_requests.append(payload)
+        if authorization == "expire_after_admission":
+            real_time = time.time
+            monkeypatch.setattr(
+                auth, "time", SimpleNamespace(time=lambda: real_time() + 901))
         if installation is not None:
             return installation.provider_response(proposal_result)
         assert request.headers["X-Dubsar-Context-Id"] == "n4-" + approval_sha
@@ -1393,7 +1398,7 @@ async def test_native_http_prepare_admission_replay_and_revocation(
                     project["native_n2"]["run_authorization"] = {
                         "path": str(manifest_path), "sha256": "0"*64 if authorization == "sha" else approval_sha}
                     m.bind_b2b_state(adapter)
-                if authorization != "valid":
+                if authorization not in {"valid", "expire_after_admission"}:
                     if authorization == "missing_file":
                         manifest_path.unlink(missing_ok=True)
                     if authorization == "revoke_after_prepare":

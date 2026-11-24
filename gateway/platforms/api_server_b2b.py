@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -721,6 +722,11 @@ class _AttemptSink:
         self._fingerprint = _policy_digest(profile, entry, self.policy["project"], self.policy)
         self._before_provider = None
         self.context_receipt = None
+        # Frozen at durable admission: every post-admission source recheck
+        # judges the signed window at the instant the attempt was consumed,
+        # never at a later read (a run admitted inside its window must not be
+        # revoked merely because the proof expired while the provider worked).
+        self._admission_now: Optional[int] = None
         # The frozen context preparation attached by _launch_b2b_run before
         # admission; None on every sink the launch path did not prepare.
         self._context_preparation = None
@@ -789,7 +795,7 @@ class _AttemptSink:
         messages digest."""
         project = self.policy.get("project")
         try:
-            claim = _native_auth.read_approval(project)
+            claim = _native_auth.read_approval(project, now=self._admission_now)
         except _native_auth.AuthorizationRefused:
             return False
         manifest = claim["n2"]
@@ -1423,6 +1429,20 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                 binding_digest=binding_digest, session_id=session_id)
         return _replayed_response(adapter, stored_run_id, attempt_id, binding_digest, profile, session_id)
     adapter._run_idempotency_ids.add(stored_run_id)
+    if native_binding is not None:
+        # The attempt row was committed inside b2b_admit: its created_at IS the
+        # consumption instant. Freeze it for every later manifest re-read.
+        try:
+            admitted_row = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
+            created_at = admitted_row.get("created_at") if admitted_row else None
+            if (isinstance(created_at, bool)
+                    or not isinstance(created_at, (int, float))
+                    or not math.isfinite(created_at)):
+                raise ValueError("admission timestamp unavailable")
+            sink._admission_now = int(created_at)
+        except Exception:
+            sink.block("store_unavailable")
+            return _deny(503, "store_unavailable")
     try:
         await _a.to_thread(db.set_session_title, session_id, f"B2B {session_id}")
     except Exception:
