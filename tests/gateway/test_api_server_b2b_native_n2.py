@@ -1083,6 +1083,9 @@ async def test_native_http_prepare_admission_replay_and_revocation(
             document, ensure_ascii=True, sort_keys=True,
             separators=(",", ":"), allow_nan=False)
         for document in documents)
+    if installation is not None:
+        mission_request = installation.mission_request
+        rendered = installation.rendered
     assert len(rendered) <= 9000
     messages_digest = hashlib.sha256(canonical_json([
         {"role": "system", "content": NATIVE_RECIPE_SYSTEM_PROMPT},
@@ -1139,7 +1142,8 @@ async def test_native_http_prepare_admission_replay_and_revocation(
             manifest_path.unlink(missing_ok=True)
             revoked = True
         body = _resolved_body(
-            request_env, docs=documents, refs=native_references)
+            request_env, docs=documents, refs=native_references,
+            **({"mission_request": mission_request} if installation is not None else {}))
         body["authority_basis_digest"] = "sha256:" + "ab" * 32
         body["authority_digest"] = "sha256:" + "cd" * 32
         if changed_authority:
@@ -1315,8 +1319,10 @@ async def test_native_http_prepare_admission_replay_and_revocation(
                         n4["dataset"]["classification"] = "private"
                     if authorization == "schema":
                         n4["unrecognized"] = True
+                    now = int(time.time())
                     claim = {"schema": auth.SCHEMA, "n2": record, "n4": n4,
                              "result_public_key": result_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex(),
+                             "issued_at": now, "expires_at": now + 900, "approver_id": "6"*24,
                              "endpoint": "https://elsewhere.invalid" if authorization == "route" else auth.ENDPOINT}
                     signer = Ed25519PrivateKey.generate() if authorization == "signature" else core_key
                     envelope = {"claim": claim, "signature": base64.b64encode(signer.sign(

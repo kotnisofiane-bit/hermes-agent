@@ -29,7 +29,8 @@ def port():
 class Installation:
     def __init__(self, stack, temp, core_root):
         from scribe.core_mission_boundary import core_mission_boundary as missions
-        from scribe.model_authorization import PUBLIC_PIECES
+        from scribe.model_authorization import (PUBLIC_CONTEXT_HEADER, PUBLIC_PIECES,
+                                                public_documents, public_rendered)
 
         self.stack, self.temp, self.core_root = stack, temp, core_root
         self.gateway_port, self.core_port = port(), port()
@@ -53,11 +54,22 @@ class Installation:
                                   authenticated_actor={"actor_kind": "human", "actor_id": "synthetic-actor",
                                                        "attestation": missions._mission_go_attestation(
                                                            key, "synthetic-actor", lane.MISSION)})
-        self.frozen = missions.freeze_exact_revision(store_dir=str(self.store), mission_id=lane.MISSION)
         self.documents = lane._docs()
         for doc, text in zip(self.documents, PUBLIC_PIECES):
             digest = "sha256:" + hashlib.sha256(text.encode()).hexdigest()
             doc.update(text=text, native_digest=digest, content_digest=digest)
+        ordinary_refs = [f"dubsar:mission:ref-{index}" for index in range(20)]
+        self.mission_request = {
+            "criteria": ["prove the lane — α"], "objective": "o",
+            "source_refs": lane._flat(ordinary_refs, self.documents), "title": "t — α"}
+        review_docs = [{"native_ref": d["native_ref"], "revision": 1, "digest": d["native_digest"]}
+                       for d in self.documents]
+        assert public_documents(review_docs, lane.MISSION) == self.documents
+        self.rendered = public_rendered(self.documents)
+        assert self.rendered.startswith(PUBLIC_CONTEXT_HEADER)
+        self.frozen = missions.freeze_exact_revision(
+            store_dir=str(self.store), mission_id=lane.MISSION,
+            mission_request=self.mission_request)
 
     def issue_and_start(self, prepared, core_key, hermes_key, provider_url, request, rendered, manifest):
         from backend.control_plane_g1.b2b_n4_config import load_n4_config
@@ -76,11 +88,13 @@ class Installation:
                   "result_public_key": result_public_key(result_signer(integrity)),
                   "ports": {"core_llm": self.core_port, "gateway": self.gateway_port},
                   "endpoint": ENDPOINT, "model_route": ROUTE, "tenant_id": lane.TENANT,
-                  "requester_id": lane.REQUESTER, "request_id": prepared["request_id"],
+                  "requester_id": lane.REQUESTER, "approver_id": "6"*24,
+                  "request_id": prepared["request_id"],
                   "hermes_key": hermes_key.public_bytes(Encoding.Raw, PublicFormat.Raw).hex(),
                   "issuer": lane.HERMES_ISSUER, "audience": lane.PORTAL_ISSUER,
                   "documents": [{"native_ref": d["native_ref"], "revision": 1, "digest": d["native_digest"]}
                                 for d in self.documents],
+                  "mission_request": request,
                   "messages": native_recipe_messages(request, rendered.encode())}
         source = lane._resolved_body({"request_id": "synthetic-prepared", "body": {
             "attempt_id": lane.ATTEMPT, "profile": "deploy", "session_id": lane.SESSION}}, docs=self.documents)

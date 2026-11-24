@@ -183,7 +183,8 @@ def read_approval(project: Mapping[str, Any]) -> Dict[str, Any]:
                 or ports["gateway"] == ports["core_llm"]
                 or project["base_url"] != f"http://127.0.0.1:{ports['gateway']}/v1"):
             raise AuthorizationRefused("route")
-        if (set(claim) != {"schema", "n2", "n4", "endpoint", "result_public_key"} or claim["schema"] != SCHEMA
+        if (set(claim) != {"schema", "n2", "n4", "endpoint", "result_public_key",
+                            "issued_at", "expires_at", "approver_id"} or claim["schema"] != SCHEMA
                 or not re.fullmatch(r"[0-9a-f]{64}", claim["result_public_key"])
                 or claim["result_public_key"] == stanza["core_public_key"]
                 or not _validate_n2(n2) or set(n4) != {"schema", "binding", "dataset", "model_route", "ports"}
