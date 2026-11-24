@@ -1340,7 +1340,7 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     # Lost-ACK replay is allowed even while the original holds the final native worker slot.
     if existing_attempt is None:
         from gateway.platforms.api_server_b2b_context import (
-            assert_context_source_current)
+            assert_context_source_current, run_bounded_context_operation)
         from gateway.run import _profile_runtime_scope
         # The sink + cap exist ONLY in memory until b2b_admit commits the
         # attempt — a failed preparation drops them with zero durable trace.
@@ -1450,10 +1450,28 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         return _deny(500, "title_commit_failed")
     # The admitted winner's run_id is the chosen one — the sink/cap built
     # pre-admission already carry it (a replayed outcome returned above).
-    if native_binding is not None and (
-            not sink.assert_current_policy() or not sink._native_run_current(resolved)):
-        store.b2b_update_attempt(profile=profile, attempt_id=attempt_id, status="failed")
-        return _deny(403, "model_authorization_revoked")
+    # P1: the post-consumption policy/manifest recheck consults the plugin's
+    # validator, so it runs in the bounded daemon worker under the owning
+    # profile scope — never synchronously on the API event loop. A validator
+    # that parks fails THIS attempt closed without blocking the loop.
+    if native_binding is not None:
+        try:
+            with _profile_runtime_scope(Path(policy["profile_home"]),
+                                        hydrate_secrets=False):
+                current = await run_bounded_context_operation(
+                    lambda: (sink.assert_current_policy()
+                             and sink._native_run_current(resolved)),
+                    timeout=_SOURCE_DEADLINE_S)
+        except B2BTerminalRefusal as exc:
+            sink.block(str(exc))
+            return _deny(503, str(exc))
+        except Exception:
+            sink.block("context_unavailable")
+            return _deny(503, "context_unavailable")
+        if not current:
+            store.b2b_update_attempt(
+                profile=profile, attempt_id=attempt_id, status="failed")
+            return _deny(403, "model_authorization_revoked")
     launched = await _spawn_run(adapter, request, cap=cap, resolved=resolved,
                                 session_id=session_id, run_id=stored_run_id, profile=profile)
     if launched is None:
