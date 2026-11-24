@@ -26,6 +26,9 @@ from agent.b2b_execution import (
     B2BTerminalRefusal, R2_SCHEMA_PINS, is_b2b_session_id,
 )
 from gateway.platforms.api_server_b2b import _state_for
+from gateway.platforms.api_server_b2b_native_validation import (
+    load_b2b_gateway_config, resolved_route_targets_g2,
+)
 
 
 def guard_agent_construction(
@@ -260,6 +263,21 @@ def b2b_execution_status(adapter: Any) -> Dict[str, Any]:
             "b2b_execution_profiles": profiles}
 
 
+def _authorized_provider_config(cap, route, named=None):
+    """Read G2 in the resolver's profile scope, never from the admission catalogue."""
+    try:
+        config = load_b2b_gateway_config()
+        if (cap.policy_get("native_n2_binding") is not None
+                and cap.policy_get("project").get("native_n2") is not None):
+            return config
+        if not resolved_route_targets_g2(route, named or {}, config):
+            return config
+    except ValueError:  # unreadable policy or malformed provider URL
+        pass
+    cap.sink.block("model_authorization_missing")
+    raise B2BTerminalRefusal("model_authorization_missing")
+
+
 def construct_b2b_agent(adapter: Any, cap: Any, *, session_id: Optional[str],
                         stream_delta_callback: Any, tool_progress_callback: Any,
                         tool_start_callback: Any, tool_complete_callback: Any,
@@ -284,8 +302,7 @@ def construct_b2b_agent(adapter: Any, cap: Any, *, session_id: Optional[str],
     freezes the dispatch surface before the agent leaves this worker."""
     project = cap.policy_get("project")
     from run_agent import AIAgent
-    from gateway.run import (
-        _load_gateway_config, _resolve_runtime_agent_kwargs_for_provider)
+    from gateway.run import _resolve_runtime_agent_kwargs_for_provider
 
     def _refuse_provider():
         cap.sink.block("policy_provider_unavailable")
@@ -297,15 +314,17 @@ def construct_b2b_agent(adapter: Any, cap: Any, *, session_id: Optional[str],
     # resolver runs — the pin names one provider, never a search.
     raw_provider = str(project["provider"] or "").strip().lower()
     from hermes_cli.auth import resolve_provider
-    from hermes_cli.runtime_provider_custom import has_named_custom_provider
+    from hermes_cli.runtime_provider_custom import _get_named_custom_provider
     expected_provider = None
+    named = None
     if raw_provider and raw_provider != "auto":
         try:
-            expected_provider = ("custom"
-                                 if has_named_custom_provider(raw_provider)
-                                 else resolve_provider(raw_provider))
+            named = _get_named_custom_provider(raw_provider)
+            expected_provider = "custom" if named else resolve_provider(raw_provider)
         except Exception:
             expected_provider = None
+    # Refuse a known G2 pin or named endpoint before runtime discovery can probe it.
+    _authorized_provider_config(cap, project, named)
     if not expected_provider or expected_provider == "auto":
         _refuse_provider()
 
@@ -314,6 +333,7 @@ def construct_b2b_agent(adapter: Any, cap: Any, *, session_id: Optional[str],
             project["provider"], target_model=project["model"])
     except Exception:
         _refuse_provider()
+    config = _authorized_provider_config(cap, runtime_kwargs, named)
     # Only the EFFECTIVE provider proves the route — requested_provider merely
     # echoes the request and hides a ladder fallback. Endpoint match trims a
     # trailing '/' only; a missing credential is a refusal, not a 401 later.
@@ -327,7 +347,7 @@ def construct_b2b_agent(adapter: Any, cap: Any, *, session_id: Optional[str],
     runtime_api_mode = runtime_kwargs.get("api_mode")
     if runtime_api_mode and runtime_api_mode != project["api_mode"]:
         _refuse_provider()
-    model_cfg = _load_gateway_config().get("model") or {}
+    model_cfg = config.get("model") or {}
     agent = AIAgent(
         model=project["model"], provider=project["provider"],
         api_mode=project["api_mode"], base_url=project["base_url"],
@@ -367,6 +387,8 @@ async def construct_run_agent(adapter: Any, run: Any, construct_agent: Callable[
     if cap is None:
         return construct_agent()
     from agent.b2b_execution import bind_execution, reset_execution
+    from gateway.platforms.api_server import _api_request_profile
+    profile_token = _api_request_profile.set(getattr(run, "request_profile", None))
     cap_token = bind_execution(cap)  # agent construction reads it through current_execution
     try:
         # B2B: cold AIAgent.__init__ (httpx import, client build) must not
@@ -383,6 +405,7 @@ async def construct_run_agent(adapter: Any, run: Any, construct_agent: Callable[
             lambda: ctor_context.run(construct_agent), timeout=_REQUEST_TTL_S)
     finally:
         reset_execution(cap_token)
+        _api_request_profile.reset(profile_token)
 
 
 async def execute_run_agent(adapter: Any, run: Any, callback: Callable[[], Any],
@@ -494,8 +517,8 @@ async def generic_run_visible(adapter: Any, run_id: str) -> bool:
 async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[str, Any]):
     """Only worker-attested durable output can become a fully sealed proposal."""
     from agent.b2b_execution import (
-        B2BTerminalRefusal, bind_execution, reset_execution, recheck_context, validate_proposal,
-        extract_allowed_refs)
+        B2BTerminalRefusal, bind_execution, reset_execution, recheck_context,
+        validate_proposal)
 
     sink = cap.sink
 
@@ -535,7 +558,7 @@ async def _b2b_finalize(cap, result: Dict[str, Any], status: str, fields: Dict[s
             if artifact is None:
                 return blocked("result_unattested")
             public = json.loads(artifact["payload"])
-            parsed, _ = validate_proposal(public["text"], extract_allowed_refs(receipt.view))
+            parsed, _ = validate_proposal(public["text"], cap.proposal_refs(receipt.view))
             if (parsed is None or parsed != public.get("proposal") or
                     result.get("final_response", "").strip() != public["text"].strip()):
                 return blocked("result_invalid")

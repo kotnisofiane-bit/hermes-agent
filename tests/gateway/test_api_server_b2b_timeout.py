@@ -14,6 +14,7 @@ import time
 
 import pytest
 
+from gateway.platforms import api_server_b2b_native_validation as native_validation
 from tests.gateway import b2b_process_harness as H
 from tests.gateway.b2b_process_harness import extract_contract_root
 
@@ -38,16 +39,15 @@ def test_project_request_timeout_absent_keeps_key_out_of_policy():
     """Unconfigured key: absent from the canonical project — hence from policy_json
     and the fingerprint — so a pre-versioning admission still replays byte-for-byte;
     readers downstream keep their 5s effective default via .get()."""
-    from gateway.platforms import api_server_b2b as b2b
-    out = b2b._validate_project_entry(_timeout_project_entry(), "b")
+    out = native_validation._validate_project_entry(
+        _timeout_project_entry(), "b")
     assert "request_timeout_seconds" not in out
     assert out.get("request_timeout_seconds", 5) == 5
 
 
 @pytest.mark.parametrize("value", [1, 120, 300, 600, 900])
 def test_project_request_timeout_accepts_int_bounds(value):
-    from gateway.platforms import api_server_b2b as b2b
-    out = b2b._validate_project_entry(
+    out = native_validation._validate_project_entry(
         _timeout_project_entry(request_timeout_seconds=value), "b")
     assert out["request_timeout_seconds"] == value
 
@@ -55,9 +55,9 @@ def test_project_request_timeout_accepts_int_bounds(value):
 @pytest.mark.parametrize(
     "value", [True, False, 0, 901, -1, 0.5, 60.0, "60", None])
 def test_project_request_timeout_rejects_invalid(value):
-    from gateway.platforms import api_server_b2b as b2b
-    with pytest.raises(b2b.B2BConfigError, match="request_timeout_seconds"):
-        b2b._validate_project_entry(
+    with pytest.raises(native_validation.B2BConfigError,
+                       match="request_timeout_seconds"):
+        native_validation._validate_project_entry(
             _timeout_project_entry(request_timeout_seconds=value), "b")
 
 
@@ -66,8 +66,7 @@ def _digest_inputs(*, timeout=600):
     raw = _timeout_project_entry()
     if timeout is not None:
         raw["request_timeout_seconds"] = timeout
-    from gateway.platforms import api_server_b2b as b2b
-    project = b2b._validate_project_entry(raw, "b")
+    project = native_validation._validate_project_entry(raw, "b")
     entry = {"source_url": "http://127.0.0.1:1/internal/dubsar/b2b/source",
              "portal_issuer": "portal-h1", "hermes_issuer": "hermes-h1-hub"}
     resolved = {

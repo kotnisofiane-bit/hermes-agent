@@ -18,11 +18,16 @@ from agent.b2b_execution import (
     BoundExecution, bind_execution, json_utf8, reset_execution,
 )
 from gateway.platforms import api_server_b2b as b2b
+from gateway.platforms import api_server_b2b_native_authorization as native_auth
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from hermes_constants import get_hermes_home
 from tests.gateway.b2b_process_harness import (
     UNIT_RENDERED, build_context_view, extract_contract_root, make_keypair,
 )
+
+NATIVE_ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
+NATIVE_ROUTE = {"provider_id": "nvidia-nim-integrate",
+                "model": "mistralai/mistral-large-4-1t-a52b", "model_version": "1"}
 
 
 class _FakeClock:
@@ -55,7 +60,8 @@ def build_b2b_dispatch_lane(tmp_path, *,
                             mission_source_refs=(),
                             project_id="b2b-bench",
                             view_factory=build_context_view,
-                            request_timeout_seconds=None):
+                            request_timeout_seconds=None,
+                            native_n4=None, result_public_key=None):
     """One admitted B2B attempt with a published context receipt -- ready for the
     dispatch fence. NO CAS and NO result commit: ``status == "context_ready"``.
 
@@ -65,7 +71,9 @@ def build_b2b_dispatch_lane(tmp_path, *,
     ``commit_result`` through the real sink when they need them.
     """
     contract_root = extract_contract_root(tmp_path)
-    profile = "hub"
+    profile = "deploy" if native_n4 is not None else "hub"
+    if native_n4 is not None:
+        project_id = "prj_" + "a"*32
     sid = "b2b_" + "a" * 64
     binding = sid[4:]
     attempt_id = b2b._attempt_id_for(binding)
@@ -88,6 +96,15 @@ def build_b2b_dispatch_lane(tmp_path, *,
     if request_timeout_seconds is not None:
         entry["projects"][project_id]["request_timeout_seconds"] = (
             request_timeout_seconds)
+    if native_n4 is not None:
+        entry["projects"][project_id].update(
+            bot_id=profile, provider="custom:b2b-g2", model="mistralai/mistral-large-4-1t-a52b",
+            memory_mode="none", base_url="http://127.0.0.1:28001/v1",
+            project_context={"project_id": project_id, "allocation_root": str(tmp_path), "start": str(tmp_path)},
+            native_n2={"tenant_id": "fixture", "run_authorization": {
+                "path": str(tmp_path / "approved"), "sha256": "22"*32}},
+            native_n4={"dataset_id": native_n4, "core_public_key": "ab"*32,
+                       "endpoint": NATIVE_ENDPOINT, **NATIVE_ROUTE})
     config = b2b.B2BConfig({"enabled": True, "profiles": {profile: entry}})
     state = b2b._B2BState(config)
     adapter = SimpleNamespace(_b2b_state=state)
@@ -110,6 +127,8 @@ def build_b2b_dispatch_lane(tmp_path, *,
         "mission_request": {"title": "m", "objective": "o",
                              "criteria": [], "source_refs": list(mission_source_refs)},
         "project": entry["projects"][project_id]}
+    if native_n4 is not None:
+        policy["native_n4_result_public_key"] = result_public_key
     view = view_factory(policy, {"mission_source_digest": "c" * 64})
     db_path = os.path.join(str(tmp_path), "runs.db")
     store = RunIdempotencyStore(db_path)

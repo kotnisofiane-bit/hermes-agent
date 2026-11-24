@@ -1,0 +1,1617 @@
+"""Lot-1 native N2 lane: REAL boundary tests, no doubles for the verified data.
+
+Every proof here crosses the product boundary: real Ed25519 request/response
+envelopes signed and verified through ``_signed_envelope`` / ``_verify_envelope``
+on a real loopback aiohttp source, the native body shape verifier, the real
+``_AttemptSink._matches_source`` (with a real ``_B2BState``/fingerprint), the
+protected manifest reader, the canonical ``_b2b_documents`` host check through a
+real ``BoundExecution``, and the ``assert_terminal_runtime`` recipe gate through
+the real ``bind_execution`` contextvar.
+
+Protected-file tests use real Linux files and descriptors under a private
+trusted root. They inject only the trusted root, boot-id path and expected
+owner; reads, fstat/open, pins and schema validation remain real.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+sys.path.insert(0, os.path.dirname(__file__))
+
+from agent.b2b_execution import (
+    NATIVE_RECIPE_SYSTEM_PROMPT, mission_prompt,
+    B2BTerminalRefusal, BoundExecution, assert_terminal_runtime, bind_execution,
+    canonical_json, install_bounded_agent_policy, normalized_content_digest,
+    normalized_messages_digest, reset_execution,
+)
+from gateway import run as gateway_run
+from gateway.config import PlatformConfig
+from gateway.platforms.api_server import APIServerAdapter
+from gateway.platforms import api_server_b2b as m
+from gateway.platforms import api_server_b2b_native_authorization as native_auth
+from gateway.platforms import api_server_b2b_native_validation as native_validation
+from gateway.platforms.api_server_b2b_context import _b2b_documents
+from hermes_constants import get_hermes_home
+from hermes_state import SessionDB
+from tests.gateway import test_api_server_b2b_admission as adm
+from tests.gateway import test_api_server_b2b_execution_lane as execution_lane
+from tests.gateway import test_api_server_b2b_prepare as prepare_tests
+from tests.gateway.b2b_process_harness import UNIT_RENDERED
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import (
+    Encoding, NoEncryption, PrivateFormat, PublicFormat)
+
+
+def _keypair():
+    priv = Ed25519PrivateKey.generate()
+    pem_priv = priv.private_bytes(
+        Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()).decode("utf-8")
+    pem_pub = priv.public_key().public_bytes(
+        Encoding.PEM, PublicFormat.SubjectPublicKeyInfo).decode("utf-8")
+    return priv, pem_priv, pem_pub
+
+
+PORTAL_PRIV, PORTAL_PRIV_PEM, PORTAL_PUB_PEM = _keypair()
+HERMES_PRIV, HERMES_PRIV_PEM, _ = _keypair()
+
+PORTAL_ISSUER = "portal-lot1-n2"
+HERMES_ISSUER = "hermes/deploy"
+TENANT = "tenant-alpha"
+MISSION = "mis_" + "a" * 32
+PROJECT = "prj_" + "b" * 32
+LEGACY_ALIAS = "legacy-lane"
+LEGACY_PROJECT = "legacy-prj-1"
+REQUESTER = "5" * 24
+MODEL = "mistralai/mistral-large-4-1t-a52b"
+BASE_URL = "http://127.0.0.1:8921/v1"
+NATIVE_ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
+NATIVE_ROUTE = {"provider_id": "nvidia-nim-integrate", "model": MODEL,
+                "model_version": "1"}
+
+
+def _binding_for(project=PROJECT, mission=MISSION, requester=REQUESTER):
+    basis = {"format": "dubsar.b2b-agent-session-binding/1",
+             "requester_id": requester, "project_id": project,
+             "mission_id": mission, "mission_revision": 1}
+    return hashlib.sha256(canonical_json(basis)).hexdigest()
+
+
+BINDING = _binding_for()
+SESSION = "b2b_" + BINDING
+ATTEMPT = m._attempt_id_for(BINDING)
+
+
+def _docs(mission=MISSION, count=2):
+    """Two real six-key piece manifests with genuine UTF-8 text digests."""
+    out = []
+    samples = ("pièce α — première", "pièce β — seconde")
+    for index in range(count):
+        text = samples[index] if index < len(samples) else f"pièce {index + 1} — donnée"
+        piece = f"piece_{(index + 1):032x}"
+        digest = "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+        out.append({
+            "id": piece, "revision": 1, "text": text,
+            "content_digest": digest, "native_digest": digest,
+            "native_ref": f"dubsar:piece:{mission}:{piece}"})
+    return out
+
+
+def test_native_signed_refs_keep_twenty_originals_and_twenty_ordered_pairs():
+    entry, keys = _entry_and_keys()
+    for count in (10, 11, 20):
+        documents = _docs(count=count)
+        ordinary = [f"dubsar:mission:ref-{index}" for index in range(20)]
+        refs = _flat(ordinary, documents)
+        assert len(refs) == 20 + 2 * count
+        assert native_validation._valid_native_source_refs(refs, MISSION)
+        resolved, reason = _resolve(
+            entry, keys,
+            respond=lambda env: _response_envelope(
+                env, _resolved_body(env, docs=documents, refs=refs)))
+        assert reason == "ok"
+        assert resolved["mission_request"]["source_refs"] == refs
+
+    documents = _docs(count=20)
+    assert not native_validation._valid_native_source_refs(
+        _flat([f"ordinary-{index}" for index in range(21)], documents), MISSION)
+    assert not native_validation._valid_native_source_refs(
+        _flat(["ordinary"], _docs(count=21)), MISSION)
+
+
+def test_replay_only_admission_does_not_recreate_a_missing_attempt(tmp_path):
+    from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
+
+    store = RunIdempotencyStore(str(tmp_path / "replay-only.sqlite3"))
+    binding = "1" * 64
+    session_id = "b2b_" + binding
+    attempt_id = "b2bp_" + "2" * 64
+    fingerprint = "3" * 64
+    try:
+        result = store.b2b_admit(
+            profile="deploy", session_id=session_id, binding_digest=binding,
+            attempt_id=attempt_id, fingerprint=fingerprint,
+            binding_row={"profile": "deploy", "session_id": session_id,
+                         "binding_digest": binding, "policy_json": "{}"},
+            attempt_row={
+                "profile": "deploy", "session_id": session_id,
+                "binding_digest": binding, "attempt_id": attempt_id,
+                "run_id": "run_" + "4" * 32, "status": "admitted",
+                "requester_id": REQUESTER, "source_bind": "{}",
+            },
+            run_scope="b2b:deploy:unit", run_key=attempt_id,
+            run_id="run_" + "4" * 32, run_fingerprint=fingerprint,
+            run_status={"status": "queued", "session_id": session_id},
+            replay_only=True)
+        assert result == {"status": "conflict"}
+        for table in ("run_idempotency", "b2b_attempts", "b2b_bindings", "b2b_artifacts"):
+            assert store._conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] == 0
+    finally:
+        store.close()
+
+
+def _flat(refs, docs):
+    return list(refs) + [part for d in docs
+                         for part in (d["native_ref"], d["native_digest"])]
+
+
+def _observation(session_id):
+    return {
+        "id": session_id, "source": "api_server", "title": None,
+        "model": None, "parent_session_id": None, "has_system_prompt": False,
+        "has_model_config": False, "ended_at": None, "end_reason": None,
+        "message_count": 0, "tool_call_count": 0, "api_call_count": 0,
+        "profile": "deploy"}
+
+
+def _manifest_digest(docs):
+    return "sha256:" + hashlib.sha256(canonical_json(docs)).hexdigest()
+
+
+def _pointer(docs=None, **over):
+    pointer = {
+        "inputs_revision": 3,
+        "manifest_digest": _manifest_digest(_docs() if docs is None else docs),
+        "inputs_digest": "sha256:" + "33" * 32}
+    pointer.update(over)
+    return pointer
+
+
+def _project_entry(native=True, run_ref=None, project_id=PROJECT, **over):
+    entry = {
+        "project_id": project_id, "bot_id": "deploy", "profile_id": "deploy",
+        "memory_mode": "none",
+        "allowed_namespaces": ["private/bot/deploy"],
+        "context_contract_root": None,
+        "model": MODEL, "provider": "custom:b2b-g2",
+        "base_url": BASE_URL, "api_mode": "chat_completions",
+        "logical_mission": "alpha-default",
+        "project_context": {"project_id": project_id,
+                            "allocation_root": "/srv/alloc",
+                            "start": "/srv/start"}}
+    if native:
+        entry["native_n2"] = {"tenant_id": TENANT}
+        if run_ref is not None:
+            entry["native_n2"]["run_authorization"] = dict(run_ref)
+    else:
+        # A legitimate legacy project is off the native G2 route: no provider
+        # alias, no G2 loopback URL and no native catalogue model.
+        entry.update(model="legacy-model", provider="custom",
+                     base_url="http://127.0.0.1:8922/v1")
+    entry.update(over)
+    return entry
+
+
+def _native_n4(dataset_id, **over):
+    stanza = {"dataset_id": dataset_id, "core_public_key": "ab" * 32,
+              "endpoint": NATIVE_ENDPOINT, **NATIVE_ROUTE}
+    stanza.update(over)
+    return stanza
+
+
+def _raw_config(source_port=21000, projects=None, profile_name="deploy"):
+    if projects is None:
+        projects = {PROJECT: _project_entry()}
+    return {"enabled": True, "profiles": {profile_name: {
+        "source_url": f"http://127.0.0.1:{source_port}/internal/dubsar/b2b/source",
+        "portal_issuer": PORTAL_ISSUER, "hermes_issuer": HERMES_ISSUER,
+        "portal_public_key_pem": PORTAL_PUB_PEM,
+        "hermes_private_key_pem": HERMES_PRIV_PEM,
+        "projects": projects}}}
+
+
+class _SourceServer:
+    """A real loopback aiohttp source: it receives the actual signed Hermes
+    request bytes and answers with an actually-signed portal envelope."""
+
+    def __init__(self, respond):
+        self._respond = respond
+        self.requests = []
+        self.errors = []
+
+    def __enter__(self):
+        ready = threading.Event()
+        self._loop = asyncio.new_event_loop()
+
+        async def handle(request):
+            from aiohttp import web
+            raw = await request.read()
+            try:
+                envelope = json.loads(raw)
+            except Exception:
+                return web.Response(status=400)
+            self.requests.append(envelope)
+            try:
+                reply = self._respond(envelope)
+            except Exception as exc:
+                self.errors.append(exc)
+                return web.Response(status=500)
+            if reply is None:
+                return web.Response(status=403)
+            return web.Response(
+                status=200,
+                text=json.dumps(reply, ensure_ascii=False,
+                                separators=(",", ":")),
+                content_type="application/json")
+
+        def run():
+            asyncio.set_event_loop(self._loop)
+
+            async def main():
+                from aiohttp import web
+                app = web.Application()
+                app.router.add_post("/internal/dubsar/b2b/source", handle)
+                self._runner = web.AppRunner(app)
+                await self._runner.setup()
+                self._site = web.TCPSite(self._runner, "127.0.0.1", 0)
+                await self._site.start()
+                self.port = self._site._server.sockets[0].getsockname()[1]
+                ready.set()
+
+            self._loop.create_task(main())
+            self._loop.run_forever()
+
+        self._thread = threading.Thread(target=run, daemon=True)
+        self._thread.start()
+        assert ready.wait(10), "source server did not start"
+        return self
+
+    def __exit__(self, *exc):
+        async def cleanup():
+            await self._runner.cleanup()
+
+        asyncio.run_coroutine_threadsafe(cleanup(), self._loop).result(timeout=5)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(5)
+        self._loop.close()
+
+
+def _response_envelope(request_env, body):
+    now = int(time.time())
+    env = {"version": m._VERSION, "issuer": PORTAL_ISSUER,
+           "audience": HERMES_ISSUER, "operation": "resolved",
+           "request_id": request_env["request_id"], "issued_at": now,
+           "expires_at": now + 15, "body": body}
+    env["signature"] = m._b64url(
+        PORTAL_PRIV.sign(m._DOMAIN + canonical_json(env)))
+    return env
+
+
+def _native_e2e_plugin_init(documents, ordinary_refs, native_references, rendered,
+                            source_digest):
+    return f'''\
+def register(ctx):
+    from agent.b2b_execution import B2BTerminalRefusal
+    from tests.agent.test_b2b_execution import _no_memory_view
+    from tests.gateway.b2b_process_harness import (
+        reseal_unit_context_view, renew_unit_oc_read)
+    documents = {documents!r}
+    ordinary_refs = {ordinary_refs!r}
+    native_references = {native_references!r}
+    rendered = {rendered!r}
+    source_digest = {source_digest!r}
+    next_read_id = [2]
+
+    def build_view(policy):
+        view = _no_memory_view(policy)
+        view["mission_binding"]["source_digest"] = source_digest
+        view["my_work"]["mission"]["source_digest"] = source_digest
+        view["my_work"]["mission"]["references"] = ordinary_refs
+        view["bounds"]["render_chars"] = len(rendered)
+        reseal_unit_context_view(view)
+        fresh = renew_unit_oc_read(view, read_id=next_read_id[0])
+        next_read_id[0] += 1
+        return fresh
+
+    def prepare_context(*, execution):
+        stamp = ctx.get_config("preparation_stamp")
+        def validate_configuration():
+            if ctx.get_config("preparation_stamp") != stamp:
+                raise B2BTerminalRefusal("b2b_policy_changed")
+            return True
+        return {{"view": build_view(execution.policy),
+                "rendered": rendered,
+                "documents": documents,
+                "native_references": native_references,
+                "validate_configuration": validate_configuration}}
+    prepare_context.b2b_memory_modes = ("none",)
+
+    def pre_llm_call(**kwargs):
+        from agent.b2b_execution import current_execution
+        cap = current_execution(profile="deploy")
+        if cap is None or cap.context_receipt is not None:
+            return
+        view = build_view(cap.policy)
+        cap.register_context_recheck(lambda active: build_view(active.policy))
+        cap.publish_context(
+            view, rendered.encode("utf-8"), turn_id=cap.current_turn_id)
+        return rendered
+
+    ctx.register_hook("prepare_context", prepare_context)
+    ctx.register_hook("pre_llm_call", pre_llm_call)
+'''
+
+
+def _resolved_body(request_env, *, project=PROJECT, mission=MISSION,
+                   binding=None, tenant=TENANT, docs=None, refs=None,
+                   pointer=None, native=True, profile=None, **over):
+    req_body = request_env["body"]
+    binding = binding if binding is not None else _binding_for(
+        project=project, mission=mission)
+    docs = _docs(mission) if docs is None else docs
+    source_refs = (_flat(["dubsar:mission:objective"], docs)
+                   if refs is None else refs)
+    body = {
+        "attempt_id": req_body["attempt_id"],
+        "authority_basis_digest": "ab" * 32,
+        "authority_digest": "cd" * 32,
+        "binding_digest": binding,
+        "mission_id": mission, "mission_revision": 1,
+        "mission_request": {"criteria": ["prove the lane"], "objective": "o",
+                            "source_refs": source_refs, "title": "t"},
+        "mission_source_digest": "ef" * 32,
+        "observation_genesis": _observation(req_body["session_id"]),
+        "profile": profile if profile is not None else req_body["profile"],
+        "project_binding_id": project, "project_id": project,
+        "request_digest": "11" * 32, "requester_id": REQUESTER,
+        "reservation_ref": {"collection": "dubsar_b2b_agent_sessions",
+                            "id": binding},
+        "session_id": req_body["session_id"],
+        "source_request_digest": hashlib.sha256(
+            canonical_json(request_env)).hexdigest(),
+        "source_request_id": request_env["request_id"],
+        "source_state": "active", "ticket_digest": "22" * 32}
+    if native:
+        body["tenant_id"] = tenant
+        body["mission_inputs"] = _pointer(docs) if pointer is None else pointer
+    body.update(over)
+    return body
+
+
+def _resolve(entry, keys, purpose="bind", *, attempt_id=ATTEMPT,
+             session_id=SESSION, respond=None):
+    if respond is None:
+        respond = lambda env: _response_envelope(env, _resolved_body(env))
+    with _SourceServer(respond) as server:
+        entry = dict(entry)
+        entry["source_url"] = (
+            f"http://127.0.0.1:{server.port}/internal/dubsar/b2b/source")
+        resolved, reason = m.resolve_source(
+            entry, keys, purpose, attempt_id=attempt_id, profile="deploy",
+            session_id=session_id)
+    return resolved, reason
+
+
+def _entry_and_keys(config=None):
+    config = m.B2BConfig(_raw_config()) if config is None else config
+    entry = config.profiles["deploy"]
+    return entry, m._KeyRing(entry)
+
+
+# ---------------------------------------------------------------------------
+# Catalogue: the native stanza is exact and opt-in only.
+# ---------------------------------------------------------------------------
+
+def test_config_native_prepare_only_stanza():
+    config = m.B2BConfig(_raw_config(projects={PROJECT: _project_entry(
+        run_ref={"path": "/srv/n2/recipe.json", "sha256": "a" * 64})}))
+    project = config.profiles["deploy"]["projects"][PROJECT]
+    assert project["native_n2"] == {
+        "tenant_id": TENANT,
+        "run_authorization": {"path": "/srv/n2/recipe.json",
+                              "sha256": "a" * 64}}
+    with pytest.raises(TypeError):
+        project["native_n2"]["tenant_id"] = "other"
+
+
+def test_config_native_stanza_parses_and_freezes():
+    config = m.B2BConfig(_raw_config())
+    project = config.profiles["deploy"]["projects"][PROJECT]
+    assert project["native_n2"] == {"tenant_id": TENANT}
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda p: p.update({"bot_id": "hub"}),
+    lambda p: p.update({"profile_id": "hub"}),
+    lambda p: p.update({"memory_mode": "required"}),
+    lambda p: p.update({"provider": "custom:other"}),
+    lambda p: p.pop("project_context"),
+    lambda p: p.update({"native_n2": None}),
+    lambda p: p.update({"native_n2": {"tenant_id": TENANT, "extra": 1}}),
+    lambda p: p.update({"native_n2": {"run_authorization": {}}}),
+    lambda p: p.update({"native_n2": {"tenant_id": "bad tenant "}}),
+    lambda p: p.update({"native_n2": {"tenant_id": TENANT,
+        "run_authorization": {"path": "relative/x.json", "sha256": "a" * 64}}}),
+    lambda p: p.update({"native_n2": {"tenant_id": TENANT,
+        "run_authorization": {"path": "/x.json", "sha256": "zz"}}}),
+])
+def test_config_native_wrong_lane_refuses(mutate):
+    project = _project_entry()
+    mutate(project)
+    with pytest.raises(m.B2BConfigError):
+        m.B2BConfig(_raw_config(projects={PROJECT: project}))
+
+
+def test_config_native_n4_route_is_closed_frozen_and_policied():
+    project = _project_entry(native_n4=_native_n4("ds-unit"))
+    config = m.B2BConfig(_raw_config(projects={PROJECT: project}))
+    entry = config.profiles["deploy"]
+    frozen = entry["projects"][PROJECT]
+    assert frozen["native_n4"] == _native_n4("ds-unit")
+    with pytest.raises(TypeError):
+        frozen["native_n4"]["endpoint"] = "https://elsewhere.invalid"
+    for mutate in (
+            lambda stanza: stanza.pop("endpoint"),
+            lambda stanza: stanza.pop("provider_id"),
+            lambda stanza: stanza.update(endpoint="http://insecure.invalid"),
+            lambda stanza: stanza.update(endpoint="https://bad host"),
+            lambda stanza: stanza.update(model="another-model"),
+            lambda stanza: stanza.update(model_version=""),
+            lambda stanza: stanza.update(extra="unexpected")):
+        broken = _project_entry(native_n4=_native_n4("ds-unit"))
+        mutate(broken["native_n4"])
+        with pytest.raises(m.B2BConfigError):
+            m.B2BConfig(_raw_config(projects={PROJECT: broken}))
+
+    resolved, reason = _resolve(entry, m._KeyRing(entry))
+    assert reason == "ok", reason
+    policy = _policy_for(resolved)
+    policy["project"] = dict(frozen)
+    base = m._policy_digest("deploy", entry, frozen, policy)
+    changed = dict(frozen)
+    changed["native_n4"] = dict(frozen["native_n4"],
+                                endpoint="https://elsewhere.invalid")
+    assert m._policy_digest("deploy", entry, changed, policy) != base
+
+
+def test_config_native_requires_deploy_profile_name():
+    with pytest.raises(m.B2BConfigError):
+        m.B2BConfig(_raw_config(profile_name="hub"))
+
+
+def test_config_native_requires_prj_binding_and_project():
+    with pytest.raises(m.B2BConfigError):
+        m.B2BConfig(_raw_config(projects={"not-prj": _project_entry()}))
+    entry = _project_entry(project_id="not-a-prj")
+    with pytest.raises(m.B2BConfigError):
+        m.B2BConfig(_raw_config(projects={PROJECT: entry}))
+
+
+def test_config_native_alias_refused():
+    alias = _project_entry(native=False, project_id=PROJECT)
+    with pytest.raises(m.B2BConfigError):
+        m.B2BConfig(_raw_config(projects={PROJECT: _project_entry(),
+                                         LEGACY_ALIAS: alias}))
+
+
+# ---------------------------------------------------------------------------
+# Real signed exchange: extended body verifies for every real purpose.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("purpose", sorted(m._PURPOSES))
+def test_native_resolve_real_envelope_each_purpose(purpose):
+    entry, keys = _entry_and_keys()
+    resolved, reason = _resolve(entry, keys, purpose)
+    assert reason == "ok", reason
+    binding = m._native_binding(resolved)
+    assert binding == {
+        "tenant_id": TENANT, "project_id": PROJECT, "mission_id": MISSION,
+        "mission_revision": 1, "profile": "deploy", "session_id": SESSION,
+        "attempt_id": ATTEMPT, "binding_digest": BINDING,
+        "requester_id": REQUESTER,
+        "mission_inputs": _pointer()}
+
+
+def test_native_signed_source_requires_ordered_piece_pairs():
+    entry, keys = _entry_and_keys()
+    resolved, reason = _resolve(
+        entry, keys,
+        respond=lambda env: _response_envelope(
+            env, _resolved_body(env, refs=["dubsar:mission:objective"])))
+    assert resolved is None
+    assert reason == "body_native"
+
+
+@pytest.mark.parametrize(("original_count", "piece_count", "expected_reason"), [
+    (10, 10, "ok"),
+    (11, 11, "ok"),
+    (20, 20, "ok"),
+    (21, 1, "body_native"),
+    (0, 21, "body_native"),
+])
+def test_native_signed_source_combined_reference_cap(
+        original_count, piece_count, expected_reason):
+    entry, keys = _entry_and_keys()
+    refs = _flat(
+        [f"source:{index}" for index in range(original_count)],
+        _docs(count=piece_count))
+    resolved, reason = _resolve(
+        entry, keys,
+        respond=lambda env: _response_envelope(
+            env, _resolved_body(env, refs=refs)))
+    assert reason == expected_reason
+    assert (resolved is not None) is (expected_reason == "ok")
+
+
+def test_signed_non_string_project_binding_fails_closed():
+    entry, keys = _entry_and_keys()
+    resolved, reason = _resolve(
+        entry, keys,
+        respond=lambda env: _response_envelope(
+            env, _resolved_body(env, project_binding_id=["not", "a", "key"])))
+    assert resolved is None
+    assert reason == "body_native_downgrade"
+
+
+def test_native_legacy_crossing_refuses_both_ways():
+    entry, keys = _entry_and_keys()
+    # Legacy 20-key body on the NATIVE catalogue entry: the extended shape
+    # is demanded — a downgrade to historical shape refuses.
+    resolved, reason = _resolve(
+        entry, keys, respond=lambda env: _response_envelope(
+            env, _resolved_body(env, native=False)))
+    assert resolved is None and reason == "body_shape"
+    # Extended body fields on a LEGACY catalogue entry refuse just as hard.
+    config = m.B2BConfig(_raw_config(projects={
+        LEGACY_ALIAS: _project_entry(native=False, project_id=LEGACY_PROJECT)}))
+    entry, keys = config.profiles["deploy"], m._KeyRing(config.profiles["deploy"])
+    binding = _binding_for(project=LEGACY_ALIAS)
+    session = "b2b_" + binding
+    resolved, reason = _resolve(
+        entry, keys, attempt_id=m._attempt_id_for(binding),
+        session_id=session,
+        respond=lambda env: _response_envelope(env, _resolved_body(
+            env, project=LEGACY_ALIAS, binding=binding, native=True)))
+    assert resolved is None and reason == "body_shape"
+
+
+def test_native_downgrade_alias_refused():
+    # The attacker binds the LEGACY catalogue alias but claims the native
+    # project_id — the claimed id is in the native set and the selected
+    # entry is not native, so this refuses before any shape check.
+    config = m.B2BConfig(_raw_config(projects={
+        PROJECT: _project_entry(),
+        LEGACY_ALIAS: _project_entry(native=False, project_id=LEGACY_PROJECT)}))
+    entry, keys = config.profiles["deploy"], m._KeyRing(config.profiles["deploy"])
+    binding = _binding_for(project=LEGACY_ALIAS)
+    resolved, reason = _resolve(
+        entry, keys, attempt_id=m._attempt_id_for(binding),
+        session_id="b2b_" + binding,
+        respond=lambda env: _response_envelope(env, _resolved_body(
+            env, project=LEGACY_ALIAS, binding=binding, native=False,
+            project_id=PROJECT)))
+    assert resolved is None and reason == "body_native_downgrade"
+
+
+@pytest.mark.parametrize("mutation,expected", [
+    ({"tenant": "tenant-foreign"}, "body_native"),     # foreign tenant
+    ({"profile": "hub"}, "body_correlation"),          # non-deploy attempt profile
+    ({"pointer": {"inputs_revision": 0,                # bad revision
+                  "manifest_digest": _pointer()["manifest_digest"],
+                  "inputs_digest": _pointer()["inputs_digest"]}}, "body_native"),
+    ({"pointer": {"inputs_revision": 3,                # unprefixed digests
+                  "manifest_digest": "a" * 64,
+                  "inputs_digest": "sha256:" + "b" * 64}}, "body_native"),
+    ({"refs": ["dubsar:piece:" + MISSION + ":piece_" + "f" * 32]},
+     "body_native"),                                   # unpaired
+    ({"refs": ["dubsar:piece:mis_" + "9" * 32 + ":piece_" + "f" * 32,
+               "sha256:" + "a" * 64]}, "body_native"),  # foreign mission
+    ({"refs": [f"ref-{i}" for i in range(61)]}, "body_native"),  # ref bound
+])
+def test_native_body_mutations_refuse(mutation, expected):
+    entry, keys = _entry_and_keys()
+    resolved, reason = _resolve(
+        entry, keys, respond=lambda env: _response_envelope(
+            env, _resolved_body(env, **mutation)))
+    assert resolved is None and reason == expected, (reason, mutation)
+
+
+def test_native_doc_pair_order_and_adjacency_enforced():
+    entry, keys = _entry_and_keys()
+    docs = _docs()
+    flat = _flat(["dubsar:mission:objective"], docs)
+    # Reordered pairs: a different mission_request — the signed body still
+    # verifies syntactically but is NOT the attested manifest the sink
+    # compares; the ordered-suffix shape itself must hold, so swap the ref
+    # and digest of one pair (adjacency broken).
+    swapped = list(flat)
+    swapped[1], swapped[2] = swapped[2], swapped[1]
+    resolved, reason = _resolve(
+        entry, keys, respond=lambda env: _response_envelope(
+            env, _resolved_body(env, refs=swapped)))
+    assert resolved is None and reason == "body_native"
+
+
+def test_native_legacy_lane_still_verifies():
+    config = m.B2BConfig(_raw_config(projects={
+        LEGACY_ALIAS: _project_entry(native=False, project_id=LEGACY_PROJECT)}))
+    entry, keys = config.profiles["deploy"], m._KeyRing(config.profiles["deploy"])
+    binding = _binding_for(project=LEGACY_ALIAS)
+    session = "b2b_" + binding
+    resolved, reason = _resolve(
+        entry, keys, attempt_id=m._attempt_id_for(binding),
+        session_id=session,
+        respond=lambda env: _response_envelope(env, _resolved_body(
+            env, project=LEGACY_ALIAS, binding=binding, native=False,
+            refs=["dubsar:mission:objective"])))
+    assert reason == "ok", reason
+    assert m._native_binding(resolved) is None
+
+
+# ---------------------------------------------------------------------------
+# _matches_source: the admitted capability binds exactly the native body.
+# ---------------------------------------------------------------------------
+
+def _policy_for(resolved, *, messages_digest=None):
+    native = resolved.get("_native_binding")
+    return {
+        "profile": "deploy", "session_id": resolved["session_id"],
+        "binding_digest": resolved["binding_digest"],
+        "attempt_id": resolved["attempt_id"],
+        "profile_home": str(get_hermes_home().resolve()),
+        "schema_pins": m.R2_SCHEMA_PINS, "execution_policy": "h1/proposal-v1",
+        "requester_id": resolved["requester_id"],
+        "project_id": resolved["project_id"],
+        "project_binding_id": resolved["project_binding_id"],
+        "mission_id": resolved["mission_id"],
+        "mission_revision": resolved["mission_revision"],
+        "reservation_ref": resolved["reservation_ref"],
+        "request_digest": resolved["request_digest"],
+        "ticket_digest": resolved["ticket_digest"],
+        "authority_basis_digest": resolved["authority_basis_digest"],
+        "authority_digest": resolved["authority_digest"],
+        "observation_genesis": resolved["observation_genesis"],
+        "mission_request": resolved["mission_request"],
+        "project": dict(_entry_and_keys()[0]["projects"][PROJECT]),
+        **({"native_n2_binding": native} if native is not None else {}),
+        **({"native_n2_messages_digest": messages_digest}
+           if messages_digest is not None else {})}
+
+
+def _sink(entry, keys, policy):
+    config = m.B2BConfig(_raw_config())
+    adapter = SimpleNamespace(_b2b_state=m._B2BState(config))
+    return m._AttemptSink(
+        adapter, SimpleNamespace(), profile="deploy", entry=entry, keys=keys,
+        attempt_id=policy["attempt_id"], session_id=policy["session_id"],
+        binding_digest=policy["binding_digest"], run_id="run_" + uuid.uuid4().hex,
+        policy=policy)
+
+
+def test_matches_source_native_binding_exact():
+    entry, keys = _entry_and_keys()
+    resolved, reason = _resolve(entry, keys)
+    assert reason == "ok"
+    sink = _sink(entry, keys, _policy_for(resolved))
+    assert sink._matches_source(resolved) is True
+    # A mutated native binding — foreign tenant, foreign mission, foreign
+    # pointer — never matches the admitted capability.
+    for key, value in (("tenant_id", "tenant-foreign"),
+                       ("mission_id", "mis_" + "9" * 32),
+                       ("mission_inputs", {"inputs_revision": 4,
+                                           "manifest_digest": "sha256:" + "0" * 64,
+                                           "inputs_digest": "sha256:" + "0" * 64})):
+        drifted = dict(resolved)
+        drifted[key] = value
+        drifted["_native_binding"] = m._native_binding(drifted)
+        assert sink._matches_source(drifted) is False, key
+    # A legacy-verified resolved (no extended marker) never satisfies a
+    # native policy.
+    legacy = dict(resolved)
+    legacy["_native_verified"] = False
+    assert sink._matches_source(legacy) is False
+
+
+def test_current_policy_fingerprint_revokes_changed_or_removed_native_stanza():
+    entry, keys = _entry_and_keys()
+    resolved, reason = _resolve(entry, keys)
+    assert reason == "ok"
+    sink = _sink(entry, keys, _policy_for(resolved))
+    assert sink.assert_current_policy() is True
+
+    changed = _project_entry()
+    changed["native_n2"]["tenant_id"] = "tenant-bravo"
+    changed_config = m.B2BConfig(_raw_config(projects={PROJECT: changed}))
+    sink._adapter._b2b_state = m._B2BState(changed_config)
+    assert sink.assert_current_policy() is False
+
+    removed_sink = _sink(entry, keys, _policy_for(resolved))
+    removed_config = m.B2BConfig(_raw_config(projects={
+        PROJECT: _project_entry(native=False)}))
+    removed_sink._adapter._b2b_state = m._B2BState(removed_config)
+    assert removed_sink.assert_current_policy() is False
+
+
+# ---------------------------------------------------------------------------
+# Protected manifest read: every fabricable state refuses closed.
+# ---------------------------------------------------------------------------
+
+def _read_n2_record(ref):
+    try:
+        return native_auth._validate_n2(native_auth._read_protected_record(ref))
+    except native_auth.AuthorizationRefused:
+        return None
+
+def test_native_manifest_absent_and_unsafe_refuse():
+    ref = {"path": os.path.join(tempfile.gettempdir(),
+                                f"n2-missing-{os.getpid()}.json"),
+           "sha256": "a" * 64}
+    assert _read_n2_record(ref) is None
+    # A file we can create fails every proof: /tmp is world-writable and our
+    # UID is never 32013 — the refusal is the fail-closed side only.
+    directory = tempfile.mkdtemp(prefix="n2-manifest-")
+    path = os.path.join(directory, "recipe.json")
+    payload = json.dumps({
+        "format": "dubsar.b2b-n2-recipe/1", "boot_id": native_auth._boot_id(),
+        "classification": "public_synthetic", "dataset_id": "ds-1",
+        "binding": {}, "request_digest": "a" * 64,
+        "mission_source_digest": "b" * 64, "messages_digest": "c" * 64})
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(payload)
+    assert _read_n2_record(
+        {"path": path,
+         "sha256": hashlib.sha256(payload.encode()).hexdigest()}) is None
+    for ref in (None, {}, {"path": "relative/x", "sha256": "a" * 64},
+                {"path": path, "sha256": "b" * 64},
+                {"path": path}):
+        assert _read_n2_record(ref) is None, ref
+
+
+_NATIVE_IO_AVAILABLE = (
+    sys.platform.startswith("linux")
+    and hasattr(os, "O_NOFOLLOW")
+    and hasattr(os, "getuid")
+)
+_FIXTURE_BOOT_ID = "fixture-boot-id"
+
+
+def _write_native_manifest(path, record, mode=0o640):
+    payload = json.dumps(
+        record, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    with open(path, "wb") as stream:
+        stream.write(payload)
+    os.chmod(path, mode)
+    return {"path": path, "sha256": hashlib.sha256(payload).hexdigest()}
+
+
+def _native_manifest_fixture(tmp_path, monkeypatch):
+    root = os.path.join(str(tmp_path), "trusted")
+    os.mkdir(root, 0o700)
+    boot_path = os.path.join(root, "boot-id")
+    with open(boot_path, "w", encoding="ascii") as stream:
+        stream.write(_FIXTURE_BOOT_ID + "\n")
+    monkeypatch.setattr(native_auth, "_NATIVE_TRUSTED_ROOT", root)
+    monkeypatch.setattr(native_auth, "_NATIVE_BOOT_ID_PATH", Path(boot_path))
+    monkeypatch.setattr(native_auth, "_NATIVE_SECURITY_UID", getattr(os, "getuid")())
+    record = {
+        "format": "dubsar.b2b-n2-recipe/1",
+        "boot_id": _FIXTURE_BOOT_ID,
+        "classification": "public_synthetic",
+        "dataset_id": "ds-1",
+        "binding": {
+            "tenant_id": TENANT,
+            "project_id": PROJECT,
+            "mission_id": MISSION,
+            "mission_revision": 1,
+            "profile": "deploy",
+            "session_id": SESSION,
+            "attempt_id": ATTEMPT,
+            "binding_digest": BINDING,
+            "requester_id": REQUESTER,
+            "mission_inputs": {
+                "inputs_revision": 1,
+                "manifest_digest": "sha256:" + "d" * 64,
+                "inputs_digest": "sha256:" + "e" * 64,
+            },
+        },
+        "request_digest": "a" * 64,
+        "mission_source_digest": "b" * 64,
+        "messages_digest": "c" * 64,
+    }
+    path = os.path.join(root, "recipe.json")
+    ref = _write_native_manifest(path, record)
+    return root, path, record, ref
+
+
+@pytest.mark.linux_only
+def test_native_manifest_real_file_accepts_and_rejects_repinned_schema_drift(
+        tmp_path, monkeypatch):
+    _root, path, record, ref = _native_manifest_fixture(tmp_path, monkeypatch)
+    assert _read_n2_record(ref) == record
+
+    mutations = (
+        lambda value: value.update(boot_id="other-boot"),
+        lambda value: value["binding"].update(profile="main"),
+        lambda value: value.update(classification="private"),
+        lambda value: value.update(dataset_id="not a dataset"),
+        lambda value: value.update(messages_digest="not-hex"),
+        lambda value: value.update(unexpected=True),
+    )
+    for mutate in mutations:
+        changed = json.loads(json.dumps(record))
+        mutate(changed)
+        repinned = _write_native_manifest(path, changed)
+        assert _read_n2_record(repinned) is None
+
+
+@pytest.mark.linux_only
+def test_native_manifest_real_file_refuses_bad_pin_mode_link_and_symlink(
+        tmp_path, monkeypatch):
+    root, path, record, ref = _native_manifest_fixture(tmp_path, monkeypatch)
+    assert _read_n2_record(
+        {**ref, "sha256": "f" * 64}) is None
+
+    os.chmod(path, 0o600)
+    assert _read_n2_record(ref) is None
+    os.chmod(path, 0o640)
+
+    hardlink = os.path.join(root, "hardlink.json")
+    os.link(path, hardlink)
+    assert _read_n2_record(
+        {"path": hardlink, "sha256": ref["sha256"]}) is None
+
+    symlink = os.path.join(root, "symlink.json")
+    os.symlink(path, symlink)
+    assert _read_n2_record(
+        {"path": symlink, "sha256": ref["sha256"]}) is None
+
+
+@pytest.mark.linux_only
+def test_native_manifest_real_file_refuses_wrong_expected_owner(tmp_path, monkeypatch):
+    _root, _path, record, ref = _native_manifest_fixture(tmp_path, monkeypatch)
+    assert _read_n2_record(ref) == record
+    monkeypatch.setattr(native_auth, "_native_parents_safe", lambda path: path == ref["path"])
+    monkeypatch.setattr(
+        native_auth, "_NATIVE_SECURITY_UID", getattr(os, "getuid")() + 1)
+    assert _read_n2_record(ref) is None
+
+
+def test_native_parents_check_filesystem_root(monkeypatch):
+    info = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
+
+    def lstat(path):
+        assert path == os.path.sep
+        return info
+
+    monkeypatch.setattr(native_auth, "_NATIVE_TRUSTED_ROOT", os.path.sep)
+    monkeypatch.setattr(
+        native_auth, "os", SimpleNamespace(path=os.path, lstat=lstat))
+    path = os.path.join(os.path.sep, "recipe.json")
+    assert native_auth._native_parents_safe(path)
+    info.st_mode |= 0o020
+    assert not native_auth._native_parents_safe(path)
+
+
+# ---------------------------------------------------------------------------
+# _b2b_documents: canonical manifest + ordered pair enumeration.
+# ---------------------------------------------------------------------------
+
+def _cap(policy):
+    return BoundExecution(
+        profile="deploy", session_id=SESSION, binding_digest=BINDING,
+        attempt_id=ATTEMPT, run_id="run_" + uuid.uuid4().hex, policy=policy,
+        sink=SimpleNamespace(assert_current_policy=lambda: True),
+        created_at=time.time())
+
+
+def _documents_case():
+    docs = _docs()
+    flat = _flat(["dubsar:mission:objective"], docs)
+    policy = {"mission_id": MISSION,
+              "native_n2_binding": {"tenant_id": TENANT, "project_id": PROJECT,
+                                    "mission_inputs": _pointer(docs)}}
+    plain = {"my_work": {"mission": {
+        "references": flat[:1]}}}
+    resolved = {"mission_request": {
+        "source_refs": flat}}
+    return docs, _cap(policy), plain, resolved, flat
+
+
+def test_b2b_documents_native_exact_manifest():
+    docs, cap, plain, resolved, flat = _documents_case()
+    proven = _b2b_documents(
+        docs, cap=cap, plain=plain, resolved=resolved, native_references=flat)
+    assert [d["native_ref"] for d in proven] == [d["native_ref"] for d in docs]
+
+
+@pytest.mark.parametrize("mutate", [
+    "missing_documents", "empty_documents", "reordered_pairs",
+    "foreign_mission_ref", "wrong_manifest_digest", "sidecar_reorder",
+])
+def test_b2b_documents_native_mutations_refuse(mutate):
+    docs, cap, plain, resolved, flat = _documents_case()
+    native_references = flat
+    if mutate == "missing_documents":
+        raw = None
+    elif mutate == "empty_documents":
+        raw = []
+    else:
+        raw = docs
+    if mutate == "reordered_pairs":
+        resolved = {"mission_request": {
+            "source_refs": flat[:1] + flat[3:] + flat[1:3]}}
+    elif mutate == "sidecar_reorder":
+        native_references = flat[:1] + flat[3:] + flat[1:3]
+    elif mutate == "foreign_mission_ref":
+        foreign = _docs("mis_" + "9" * 32)
+        resolved = {"mission_request": {"source_refs": _flat([], foreign)}}
+        raw = foreign
+        cap = _cap({"mission_id": MISSION, "native_n2_binding": {
+            "tenant_id": TENANT, "project_id": PROJECT,
+            "mission_inputs": _pointer(docs)}})
+    elif mutate == "wrong_manifest_digest":
+        cap = _cap({"mission_id": MISSION, "native_n2_binding": {
+            "tenant_id": TENANT, "project_id": PROJECT,
+            "mission_inputs": _pointer(docs,
+                                       manifest_digest="sha256:" + "0" * 64)}})
+    with pytest.raises(B2BTerminalRefusal, match="context_documents"):
+        _b2b_documents(
+            raw, cap=cap, plain=plain, resolved=resolved,
+            native_references=native_references)
+
+
+def test_b2b_documents_native_refuses_missing_sidecar():
+    docs, cap, plain, resolved, flat = _documents_case()
+    plain["my_work"]["mission"]["references"] = flat
+    with pytest.raises(B2BTerminalRefusal, match="context_documents"):
+        _b2b_documents(docs, cap=cap, plain=plain, resolved=resolved)
+
+
+# ---------------------------------------------------------------------------
+# assert_terminal_runtime: the recipe messages gate.
+# ---------------------------------------------------------------------------
+
+class _Agent:
+    """Plain object the real install path can weakref (SimpleNamespace cannot)."""
+
+
+def _agent_for(session_id):
+    agent = _Agent()
+    agent.session_id = session_id
+    agent.model = MODEL
+    agent.provider = "custom:b2b-g2"
+    agent.api_mode = "chat_completions"
+    agent.base_url = BASE_URL
+    agent.max_iterations = 1
+    agent._disable_streaming = True
+    agent.compression_enabled = False
+    agent._api_max_retries = 1
+    agent._auto_recovery_cycles = 0
+    agent.credential_pool = None
+    agent._credential_pool = None
+    agent._fallback_chain = []
+    return agent
+
+
+def test_terminal_native_recipe_gate():
+    messages = [{"role": "system", "content": "ctx"},
+                {"role": "user", "content": "go"}]
+    digest = hashlib.sha256(canonical_json(messages)).hexdigest()
+    policy = {
+        "profile_home": str(get_hermes_home().resolve()),
+        "project": {"model": MODEL, "provider": "custom:b2b-g2",
+                    "api_mode": "chat_completions", "base_url": BASE_URL},
+        "native_n2_binding": BINDING,
+        "native_n2_messages_digest": digest}
+    cap = _cap(policy)
+    agent = _agent_for(SESSION)
+    token = bind_execution(cap)
+    try:
+        install_bounded_agent_policy(agent, cap)
+        kwargs = {"model": MODEL, "messages": messages}
+        assert_terminal_runtime(agent, kwargs, cap)  # the approved recipe passes
+        for bad in ([{"role": "user", "content": "other"}],
+                    [{"role": "user", "content": "go", "extra": 1}],
+                    [{"role": "assistant", "content": "go"}], [],
+                    [{"role": "system", "content": "ctx"},
+                     {"role": "user", "content": "go"},
+                     {"role": "user", "content": "again"}],
+                    [{"role": "system", "content": "ctx"},
+                     {"role": "user", "content": "go"},
+                     {"role": "system", "content": "history"}]):
+            with pytest.raises(B2BTerminalRefusal,
+                               match="b2b_recipe_messages_mismatch"):
+                assert_terminal_runtime(agent, {"model": MODEL, "messages": bad}, cap)
+    finally:
+        reset_execution(token)
+
+
+def test_terminal_historical_lane_untouched():
+    policy = {
+        "profile_home": str(get_hermes_home().resolve()),
+        "project": {"model": MODEL, "provider": "custom:b2b-g2",
+                    "api_mode": "chat_completions", "base_url": BASE_URL}}
+    cap = _cap(policy)
+    agent = _agent_for(SESSION)
+    token = bind_execution(cap)
+    try:
+        install_bounded_agent_policy(agent, cap)
+        assert_terminal_runtime(
+            agent,
+            {"model": MODEL, "messages": [{"role": "user", "content": "any"}]},
+            cap)
+    finally:
+        reset_execution(token)
+
+
+def test_recipe_reason_classified():
+    assert "b2b_recipe_messages_mismatch" in m._BLOCK_POLICY_CHANGED_REASONS
+    from agent.b2b_execution import BLOCK_REASONS
+    assert "b2b_recipe_messages_mismatch" in BLOCK_REASONS
+
+
+def _signed_native_claim(authorization, native_binding, prepared, record, gateway_port,
+                         core_key, result_key):
+    n4_binding = {k: v for k, v in native_binding.items()
+                  if k not in ("requester_id", "mission_inputs")}
+    n4_binding["documents"] = list(prepared["body"]["documents"])
+    n4 = {"schema": "dubsar.g2-n4-approval/1", "binding": n4_binding,
+          "dataset": {"dataset_id": record["dataset_id"], "authorized": True,
+                      "classification": "public_synthetic",
+                      "messages_digest": prepared["body"].get("normalized_messages_digest")},
+          "model_route": NATIVE_ROUTE, "ports": {"gateway": gateway_port, "core_llm": 28004}}
+    if authorization == "piece":
+        n4_binding["documents"][0] = dict(n4_binding["documents"][0], digest="sha256:" + "0"*64)
+    if authorization == "mission":
+        n4_binding["mission_id"] = "mis_" + "1"*32
+    if authorization == "attempt":
+        n4_binding["attempt_id"] = "b2bp_" + "1"*64
+    if authorization == "normalized":
+        n4["dataset"]["messages_digest"] = "2"*64
+    if authorization == "classification":
+        n4["dataset"]["classification"] = "private"
+    if authorization == "schema":
+        n4["unrecognized"] = True
+    now = int(time.time())
+    claim = {"schema": native_auth.SCHEMA, "n2": record, "n4": n4,
+             "result_public_key": result_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex(),
+             "issued_at": now, "expires_at": now + 900, "approver_id": "6"*24,
+             "endpoint": "https://elsewhere.invalid" if authorization == "route" else NATIVE_ENDPOINT}
+    if authorization == "expired":
+        claim["issued_at"], claim["expires_at"] = now - 901, now - 1
+    elif authorization == "future":
+        claim["issued_at"], claim["expires_at"] = now + 60, now + 960
+    elif authorization == "ttl":
+        claim["expires_at"] = now + 901
+    elif authorization == "approver_same":
+        claim["approver_id"] = native_binding["requester_id"]
+    elif authorization == "approver_bad":
+        claim["approver_id"] = "not-an-object-id"
+    signer = Ed25519PrivateKey.generate() if authorization == "signature" else core_key
+    envelope = {"claim": claim, "signature": base64.b64encode(signer.sign(
+        native_auth.SCHEMA.encode() + b"\0" + canonical_json(claim))).decode()}
+    return envelope
+
+
+class _NativeHttpLane:
+    """One isolated source, provider, signed recipe and HTTP session."""
+
+    def __init__(self, tmp_path, monkeypatch, authorization, revoke_at, installation):
+        self.authorization = authorization
+        self.revoke_at = revoke_at
+        self.installation = installation
+        self.monkeypatch = monkeypatch
+        self.profile_home = adm._profile_home(tmp_path, monkeypatch, "deploy")
+        self.spawn = AsyncMock(wraps=m._spawn_run)
+        monkeypatch.setattr(m, "_spawn_run", self.spawn)
+        self.documents = installation.documents if installation is not None else _docs(count=20)
+        ordinary_refs = [f"dubsar:mission:ref-{index}" for index in range(20)]
+        self.view_refs = ordinary_refs
+        self.native_references = _flat(ordinary_refs, self.documents)
+        if authorization == "unattested-view-piece":
+            self.view_refs = [*ordinary_refs[:-1], f"dubsar:piece:{MISSION}:piece_{'f' * 32}"]
+        elif authorization == "different-view-prefix":
+            self.view_refs = list(reversed(ordinary_refs))
+        self.mission_request = {
+            "criteria": ["prove the lane"], "objective": "o",
+            "source_refs": self.native_references, "title": "t"}
+        self.rendered = UNIT_RENDERED + "".join(
+            "\nb2b_document=" + json.dumps(
+                document, ensure_ascii=True, sort_keys=True,
+                separators=(",", ":"), allow_nan=False)
+            for document in self.documents)
+        if installation is not None:
+            self.mission_request = installation.mission_request
+            self.rendered = installation.rendered
+        assert len(self.rendered) <= 9000
+        self.messages_digest = hashlib.sha256(canonical_json([
+            {"role": "system", "content": NATIVE_RECIPE_SYSTEM_PROMPT},
+            {"role": "user", "content": mission_prompt(self.mission_request)
+             + "\n\n" + self.rendered},
+        ])).hexdigest()
+
+        seed_request = {
+            "request_id": str(uuid.uuid4()),
+            "body": {"attempt_id": ATTEMPT, "profile": "deploy", "session_id": SESSION},
+        }
+        resolved_body = _resolved_body(
+            seed_request, docs=self.documents, refs=self.native_references)
+        self.native_binding = {
+            key: resolved_body[key] for key in native_validation._NATIVE_BINDING_KEYS}
+        trusted_root = tmp_path / "native-trusted"
+        trusted_root.mkdir(mode=0o700)
+        boot_path = trusted_root / "boot-id"
+        boot_path.write_text(native_auth._boot_id() + "\n", encoding="ascii")
+        self.manifest_path = trusted_root / "recipe.json"
+        self.record = {
+            "format": native_auth._NATIVE_MANIFEST_FORMAT,
+            "boot_id": native_auth._boot_id(),
+            "classification": native_auth._NATIVE_MANIFEST_CLASS,
+            "dataset_id": "astra4-public-v1",
+            "binding": self.native_binding,
+            "request_digest": resolved_body["request_digest"],
+            "mission_source_digest": resolved_body["mission_source_digest"],
+            "messages_digest": self.messages_digest,
+        }
+        if authorization == "binding":
+            self.record["binding"] = dict(self.native_binding, tenant_id="tenant-bravo")
+        elif authorization == "request_digest":
+            self.record["request_digest"] = "22" * 32
+        elif authorization == "mission_source_digest":
+            self.record["mission_source_digest"] = "33" * 32
+        elif authorization == "messages_digest":
+            self.record["messages_digest"] = "44" * 32
+        monkeypatch.setattr(native_auth, "_NATIVE_TRUSTED_ROOT", str(trusted_root))
+        monkeypatch.setattr(native_auth, "_NATIVE_BOOT_ID_PATH", boot_path)
+        monkeypatch.setattr(native_auth, "_NATIVE_SECURITY_UID", getattr(os, "getuid")())
+        self.core_key = Ed25519PrivateKey.generate()
+        self.result_key = Ed25519PrivateKey.generate()
+        self.approval_sha = None
+
+        self.revoked = False
+        self.changed_authority = False
+        self.source_digest = resolved_body["mission_source_digest"]
+        self.provider_requests = []
+
+    def respond(self, request_env):
+        purpose = request_env["body"].get("purpose")
+        if self.revoke_at == purpose and not self.revoked:
+            self.manifest_path.unlink(missing_ok=True)
+            self.revoked = True
+        body = _resolved_body(
+            request_env, docs=self.documents, refs=self.native_references,
+            **({"mission_request": self.mission_request} if self.installation is not None else {}))
+        body["authority_basis_digest"] = "sha256:" + "ab" * 32
+        body["authority_digest"] = "sha256:" + "cd" * 32
+        if self.changed_authority:
+            body["authority_basis_digest"] = "sha256:" + "fa" * 32
+            body["authority_digest"] = "sha256:" + "de" * 32
+        return _response_envelope(request_env, body)
+
+    async def provider_chat(self, request):
+        proposal_result = {
+            "summary": "Prepare the bound work.",
+            "steps": ["Review the supplied piece."],
+            "source_refs": [self.documents[-1]["native_ref"]],
+            "limitations": [],
+        }
+        raw = await request.read()
+        if not request.headers.get("Authorization"):
+            return web.Response(status=401)
+        payload = json.loads(raw)
+        self.provider_requests.append(payload)
+        if self.authorization == "expire_after_admission":
+            real_time = time.time
+            self.monkeypatch.setattr(
+                native_auth, "time", SimpleNamespace(time=lambda: real_time() + 901))
+        if self.installation is not None:
+            return self.installation.provider_response(proposal_result)
+        assert request.headers["X-Dubsar-Context-Id"] == "n4-" + self.approval_sha
+        response = {
+            "id": "cmpl-native-e2e", "object": "chat.completion",
+            "choices": [{"index": 0, "message": {
+                "role": "assistant", "content": json.dumps(proposal_result)},
+                "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        }
+        if self.approval_sha:
+            call_id = "n4-native-http-call"
+            request_sha = "11" * 32
+            response["dubsar_provenance"] = {
+                "schema": "dubsar.g2-n4-provenance/1", "kind": "provider",
+                "provider_id": NATIVE_ROUTE["provider_id"], "model": MODEL,
+                "request_sha256": request_sha, "approval_sha256": self.approval_sha,
+                "call_id": call_id}
+            response["dubsar_receipt_ref"] = {
+                "call_id": call_id, "decision": "ALLOW", "reason_codes": [],
+                "content_digest": normalized_content_digest(
+                    payload.get("messages")),
+                "messages_digest": normalized_messages_digest(
+                    payload.get("messages")),
+                "authorized_egress_messages_digest": normalized_messages_digest(payload["messages"]),
+                "provider_id": NATIVE_ROUTE["provider_id"], "endpoint": NATIVE_ENDPOINT,
+                "model": MODEL, "request_sha256": request_sha}
+            proof = {"attempt_id": ATTEMPT, "text": json.dumps(proposal_result),
+                     "receipt": response["dubsar_receipt_ref"], "provenance": response["dubsar_provenance"]}
+            response["dubsar_result_signature"] = self.result_key.sign(
+                b"dubsar.n4-result/1\0" + canonical_json(proof)).hex()
+        return web.json_response(response)
+
+    def setup_adapter(self, tmp_path, source, gateway_url):
+        self.monkeypatch.setattr(gateway_run, "_hermes_home", get_hermes_home())
+        (self.profile_home / ".env").write_text(
+            "B2B_G2_API_KEY=unit-native-provider-key\n", encoding="utf-8")
+        self.monkeypatch.setenv("B2B_G2_API_KEY", "unit-native-provider-key")
+        alloc, start = tmp_path / "alloc", tmp_path / "start"
+        alloc.mkdir()
+        start.mkdir()
+        core_public = self.core_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+        self.project = _project_entry(
+            base_url=gateway_url,
+            context_contract_root=prepare_tests.extract_contract_root(tmp_path),
+            project_context={"project_id": PROJECT,
+                             "allocation_root": str(alloc), "start": str(start)},
+            **({"native_n4": _native_n4(
+                self.record["dataset_id"], core_public_key=core_public,
+                **({"endpoint": "https://elsewhere.invalid"}
+                   if self.authorization == "config_route" else {}))}
+               if self.authorization != "no_stanza" else {}))
+        b2b_raw = _raw_config(
+            source_port=source.port, projects={PROJECT: self.project})
+        extra = {"key": adm._API_KEY, "b2b": b2b_raw}
+        execution_lane._write_named_provider_config(
+            self.profile_home, named_url=gateway_url,
+            default_url="http://127.0.0.1:29999/v1")
+        plugin_name = "unitctx-native-e2e"
+        execution_lane._write_fake_plugin(
+            self.profile_home, name=plugin_name,
+            init=_native_e2e_plugin_init(
+                self.documents, self.view_refs, self.native_references, self.rendered,
+                self.source_digest))
+        execution_lane._plugin_config(self.profile_home, names=(plugin_name,))
+
+        self.adapter = APIServerAdapter(PlatformConfig(enabled=True, extra=extra))
+        self.adapter.gateway_runner = SimpleNamespace(
+            config=SimpleNamespace(multiplex_profiles=False))
+        self.adapter._session_db = SessionDB(self.profile_home / "state.db")
+        self.adapter._session_db.create_session(
+            SESSION, "api_server", profile_name="deploy")
+        prepare_tests._freeze_oc_window(self.monkeypatch)
+        self.headers = {
+            "Authorization": f"Bearer {adm._API_KEY}",
+            "Idempotency-Key": ATTEMPT,
+        }
+        self.route = f"/p/deploy/api/sessions/{SESSION}"
+        self.store = self.adapter._run_idempotency_store
+
+    async def post(self, action, **extra):
+        return await self.client.post(
+            self.route + "/b2b-" + action, headers=self.headers,
+            json={"attempt_id": ATTEMPT, "binding_digest": BINDING, **extra})
+
+    async def prepare(self):
+        # Warm process-cold plugin discovery before requesting the signed preparation.
+        warmup = await self.post("prepare", request_id=str(uuid.uuid4()))
+        await warmup.read()
+        request_id = str(uuid.uuid4())
+        response = await self.post("prepare", request_id=request_id)
+        prepared = await response.json()
+        self.spawn.assert_not_awaited()
+        return response, prepared, request_id
+
+    async def authorize(self):
+        prepared_response, prepared, prepare_request_id = await self.prepare()
+        self.prepared = prepared
+        assert prepared_response.status == 200, prepared
+        signature = base64.urlsafe_b64decode(
+            prepared["signature"] + "=" * (-len(prepared["signature"]) % 4))
+        unsigned = {key: value for key, value in prepared.items()
+                    if key != "signature"}
+        HERMES_PRIV.public_key().verify(
+            signature, m._DOMAIN + canonical_json(unsigned))
+        assert prepared["request_id"] == prepare_request_id
+        assert prepared["body"]["messages_digest"] == self.messages_digest
+        assert prepared["body"]["documents"] == [
+            {"native_ref": document["native_ref"], "revision": 1,
+             "digest": document["native_digest"]}
+            for document in self.documents]
+
+        if self.installation is not None:
+            envelope = self.installation.issue_and_start(
+                prepared, self.core_key, HERMES_PRIV.public_key(), self.provider_url,
+                self.mission_request, self.rendered, self.manifest_path)
+        else:
+            envelope = _signed_native_claim(
+                self.authorization, self.native_binding, prepared, self.record, self.gateway_port,
+                self.core_key, self.result_key)
+        data = canonical_json(self.record if self.authorization == "unsigned" else envelope)
+        self.approval_sha = hashlib.sha256(data).hexdigest()
+        self.manifest_path.write_bytes(data)
+        self.manifest_path.chmod(0o640)
+        if self.authorization != "no_ref":
+            self.project["native_n2"]["run_authorization"] = {
+                "path": str(self.manifest_path), "sha256": "0"*64 if self.authorization == "sha" else self.approval_sha}
+            m.bind_b2b_state(self.adapter)
+
+    async def admit(self):
+        if self.revoke_at is None:
+            import agent.system_prompt as system_prompt
+
+            def fail_timestamp(*args, **kwargs):
+                raise AssertionError("native prompt consulted the timestamp")
+
+            self.monkeypatch.setattr(
+                system_prompt, "_timestamp_line", fail_timestamp)
+
+        proposal_response = await self.post("proposal")
+        admission = await proposal_response.json()
+        assert proposal_response.status == 200, admission
+        assert admission["run_id"]
+        settled = False
+        for _ in range(400):
+            attempt = self.store.b2b_attempt(
+                profile="deploy", attempt_id=ATTEMPT)
+            if (self.store.b2b_artifact(attempt_id=ATTEMPT, kind="proposal")
+                    is not None or (attempt and attempt["status"] in {
+                        "context_unavailable", "context_stale",
+                        "source_denied", "policy_changed",
+                        "result_invalid", "failed", "sealed",
+                        "completed", "cancelled", "interrupted",
+                        "indeterminate"})):
+                settled = True
+                break
+            await asyncio.sleep(0.05)
+        assert settled, self.store.b2b_attempt(
+            profile="deploy", attempt_id=ATTEMPT)
+        self.artifact_kinds = {
+            row["kind"] for row in self.store._conn.execute(
+                "SELECT kind FROM b2b_artifacts WHERE attempt_id=?",
+                (ATTEMPT,)).fetchall()}
+        return admission
+
+    def assert_sealed(self):
+        assert self.store.b2b_artifact(
+            attempt_id=ATTEMPT, kind="proposal") is not None
+        assert {"context", "provider_dispatch", "provider_result",
+                "proposal"} <= self.artifact_kinds
+        assert len(self.provider_requests) == 1
+        sent = self.provider_requests[0]
+        result = json.loads(self.store.b2b_artifact(
+            attempt_id=ATTEMPT, kind="provider_result")["payload"])
+        assert result["dubsar_provenance"]["approval_sha256"] == self.approval_sha
+        assert result["dubsar_receipt_ref"]["call_id"] == result["dubsar_provenance"]["call_id"]
+        assert result["attempt_id"] == ATTEMPT and len(result["dubsar_result_signature"]) == 128
+        if self.installation is None:
+            assert [message["role"] for message in sent["messages"]] == ["system", "user"]
+            assert sent["messages"][0]["content"] == NATIVE_RECIPE_SYSTEM_PROMPT
+            assert hashlib.sha256(canonical_json(sent["messages"])).hexdigest() == self.messages_digest
+        else:
+            assert hashlib.sha256(canonical_json(sent["messages"])).hexdigest() == (
+                self.prepared["body"]["normalized_messages_digest"])
+        assert not sent.get("tools")
+
+    async def assert_consumed(self, admission):
+        counts_before = adm._store_counts(self.store)
+        title_before = self.adapter._session_db.get_session(SESSION)["title"]
+        self.manifest_path.unlink(missing_ok=True)
+        replay_response = await self.post("proposal")
+        replay = await replay_response.json()
+        assert replay_response.status == 409, replay
+        assert replay["code"] == "model_authorization_consumed"
+        durable = self.store.b2b_attempt(
+            profile="deploy", attempt_id=ATTEMPT)
+        assert replay["object"] == "b2b.proposal_attempt"
+        assert replay["attempt_id"] == ATTEMPT
+        assert replay["binding_digest"] == BINDING
+        assert replay["session_id"] == SESSION
+        assert replay["run_id"] == admission["run_id"] == durable["run_id"]
+        assert replay["status"] == durable["status"]
+        self.spawn.assert_awaited_once()
+        assert adm._store_counts(self.store) == counts_before
+        assert self.adapter._session_db.get_session(SESSION)["title"] == title_before
+        assert len(self.provider_requests) == (1 if self.revoke_at in (None, "before_seal") else 0)
+
+        if self.revoke_at is None:
+            self.changed_authority = True
+            changed_response = await self.post("proposal")
+            assert changed_response.status in {403, 409}
+            assert adm._store_counts(self.store) == counts_before
+
+
+@asynccontextmanager
+async def native_http_lane(tmp_path, monkeypatch, *, authorization="valid", revoke_at=None,
+                           installation=None):
+    lane = _NativeHttpLane(tmp_path, monkeypatch, authorization, revoke_at, installation)
+    provider_app = web.Application()
+    provider_app.router.add_post("/v1/chat/completions", lane.provider_chat)
+    async with TestServer(provider_app, host="127.0.0.1") as provider_server:
+        lane.provider_url = f"http://127.0.0.1:{provider_server.port}/v1"
+        lane.gateway_port = installation.gateway_port if installation is not None else provider_server.port
+        assert min(lane.gateway_port, provider_server.port) >= 20000
+        with _SourceServer(lane.respond) as source:
+            lane.source = source
+            lane.setup_adapter(tmp_path, source, f"http://127.0.0.1:{lane.gateway_port}/v1")
+            adapter = lane.adapter
+            try:
+                async with TestClient(TestServer(adm._app(adapter))) as lane.client:
+                    yield lane
+                assert not source.errors
+                purposes = [envelope["body"]["purpose"] for envelope in source.requests]
+                if revoke_at is not None:
+                    assert "before_provider" in purposes
+                if revoke_at == "before_seal":
+                    assert "before_seal" in purposes
+            finally:
+                tasks = list(getattr(adapter, "_active_run_tasks", {}).values())
+                for task in tasks:
+                    task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                for resource in (adapter._session_db, lane.store, adapter._response_store):
+                    resource.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+@pytest.mark.parametrize("authorization", ["unattested-view-piece", "different-view-prefix"])
+async def test_native_http_prepare_refuses_unattested_view(tmp_path, monkeypatch, authorization):
+    async with native_http_lane(tmp_path, monkeypatch, authorization=authorization) as lane:
+        prepared_response, prepared, _ = await lane.prepare()
+        assert prepared_response.status == 503, prepared
+        assert prepared == {
+            "error": "context_documents", "code": "context_documents"}
+        assert lane.provider_requests == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+@pytest.mark.parametrize("authorization", [
+    pytest.param("no_ref", id="missing-authorization-ref"),
+    pytest.param("unsigned", id="unsigned"),
+    pytest.param("mission", id="foreign-mission"),
+    pytest.param("piece", id="foreign-piece"),
+    pytest.param("attempt", id="foreign-attempt"),
+    pytest.param("route", id="foreign-route"),
+    pytest.param("normalized", id="foreign-normalized-digest"),
+    pytest.param("signature", id="invalid-core-signature"),
+    pytest.param("classification", id="classification-not-public"),
+    pytest.param("sha", id="approval-sha-mismatch"),
+    pytest.param("schema", id="unexpected-signed-field"),
+    pytest.param("no_stanza", id="no-unsigned-downgrade"),
+    pytest.param("missing_file", id="missing-authorization-file"),
+    pytest.param("binding", id="wrong-authorization-binding"),
+    pytest.param("request_digest", id="wrong-authorization-request"),
+    pytest.param("mission_source_digest", id="wrong-authorization-source"),
+    pytest.param("messages_digest", id="wrong-authorization-recipe"),
+    pytest.param("revoke_after_prepare", id="revoke-after-preparation"),
+    pytest.param("expired", id="expired-authorization"),
+    pytest.param("future", id="future-authorization"),
+    pytest.param("ttl", id="overlong-authorization-ttl"),
+    pytest.param("approver_same", id="approver-same-as-requester"),
+    pytest.param("approver_bad", id="approver-not-an-object-id"),
+    pytest.param("config_route", id="configured-route-differs-from-claim"),
+])
+async def test_native_http_admission_refuses_invalid_authorization(tmp_path, monkeypatch, authorization):
+    async with native_http_lane(tmp_path, monkeypatch, authorization=authorization) as lane:
+        await lane.authorize()
+        if authorization == "missing_file":
+            lane.manifest_path.unlink(missing_ok=True)
+        if authorization == "revoke_after_prepare":
+            original_preparation = m._b2b_run_bounded_preparation
+
+            async def prepare_then_revoke(*args, **kwargs):
+                outcome = await original_preparation(*args, **kwargs)
+                assert outcome is None, outcome
+                lane.manifest_path.unlink(missing_ok=True)
+                return outcome
+
+            monkeypatch.setattr(
+                m, "_b2b_run_bounded_preparation", prepare_then_revoke)
+        counts_before = adm._store_counts(lane.store)
+        title_before = lane.adapter._session_db.get_session(SESSION)["title"]
+        assert title_before is None
+        proposal_response = await lane.post("proposal")
+        denial = await proposal_response.json()
+        assert proposal_response.status == 403, denial
+        expected = "model_authorization_" + {
+            "no_ref": "missing", "no_stanza": "missing", "missing_file": "missing",
+            "unsigned": "schema", "mission": "mission", "piece": "pieces", "attempt": "attempt",
+            "classification": "classification", "signature": "signature", "schema": "schema",
+            "sha": "sha_mismatch", "route": "route", "normalized": "normalized_digest",
+            "messages_digest": "raw_digest", "binding": "binding", "request_digest": "source_digest",
+            "mission_source_digest": "source_digest", "revoke_after_prepare": "revoked",
+            "expired": "expired", "future": "expired", "ttl": "expired",
+            "approver_same": "approver_not_distinct", "approver_bad": "approver_invalid",
+            "config_route": "route",
+        }[authorization]
+        assert denial == {"error": expected, "code": expected}
+        lane.spawn.assert_not_awaited()
+        assert adm._store_counts(lane.store) == counts_before
+        assert lane.store.b2b_attempt(
+            profile="deploy", attempt_id=ATTEMPT) is None
+        assert lane.store.b2b_binding(
+            session_id=SESSION, profile="deploy") is None
+        assert lane.adapter._session_db.get_session(SESSION)["title"] is None
+        assert not lane.provider_requests
+        purposes = [
+            envelope["body"]["purpose"] for envelope in lane.source.requests]
+        assert "before_provider" not in purposes
+        assert "before_seal" not in purposes
+        assert not lane.source.errors
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+@pytest.mark.parametrize("authorization", ["valid", "expire_after_admission"])
+async def test_native_http_admission(tmp_path, monkeypatch, authorization):
+    async with native_http_lane(tmp_path, monkeypatch, authorization=authorization) as lane:
+        await lane.authorize()
+        await lane.admit()
+        lane.assert_sealed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+@pytest.mark.parametrize("revoke_at", ["before_provider", "before_seal"])
+async def test_native_http_revocation(tmp_path, monkeypatch, revoke_at):
+    async with native_http_lane(tmp_path, monkeypatch, revoke_at=revoke_at) as lane:
+        await lane.authorize()
+        await lane.admit()
+        if revoke_at == "before_provider":
+            assert not lane.provider_requests
+            assert "provider_dispatch" not in lane.artifact_kinds
+            assert lane.store.b2b_artifact(
+                attempt_id=ATTEMPT, kind="proposal") is None
+        else:
+            assert len(lane.provider_requests) == 1
+            assert "provider_dispatch" in lane.artifact_kinds
+            assert lane.store.b2b_artifact(
+                attempt_id=ATTEMPT, kind="provider_result") is not None
+            assert lane.store.b2b_artifact(
+                attempt_id=ATTEMPT, kind="proposal") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+@pytest.mark.parametrize(("revoke_at", "authorization"), [
+    pytest.param(None, "valid", id="valid"),
+    pytest.param(None, "expire_after_admission", id="expire-after-admission"),
+    pytest.param("before_provider", "valid", id="before-provider-revocation"),
+    pytest.param("before_seal", "valid", id="before-seal-revocation"),
+])
+async def test_native_http_replay(tmp_path, monkeypatch, revoke_at, authorization):
+    async with native_http_lane(tmp_path, monkeypatch, authorization=authorization, revoke_at=revoke_at) as lane:
+        await lane.authorize()
+        admission = await lane.admit()
+        await lane.assert_consumed(admission)

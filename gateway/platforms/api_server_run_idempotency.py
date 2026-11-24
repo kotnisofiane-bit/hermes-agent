@@ -296,6 +296,7 @@ class RunIdempotencyStore:
                   attempt_row: Dict[str, Any],
                   run_scope: str, run_key: str, run_id: str, run_fingerprint: str,
                   run_status: Dict[str, Any],
+                  replay_only: bool = False,
                   owner_pid: int = 0, owner_started: int = 0) -> Dict[str, Any]:
         """Atomic binding+attempt+run reservation in ONE BEGIN IMMEDIATE. Returns
         ``{"status": "admitted"|"replayed"|"conflict"}`` plus the stored rows; a replay
@@ -340,6 +341,11 @@ class RunIdempotencyStore:
                     return {"status": "conflict"}
                 self._conn.commit()
                 return {"status": "replayed", "attempt": dict(row), "run_id": row["run_id"]}
+            # The caller saw an existing attempt before preparation. If that
+            # row disappeared before this transaction, never create a new run.
+            if replay_only:
+                self._conn.rollback()
+                return {"status": "conflict"}
             out, rec = self._reserve_locked(
                 run_scope, run_key, run_fingerprint, run_id, run_status,
                 owner_pid=owner_pid, owner_started=owner_started, now=now)

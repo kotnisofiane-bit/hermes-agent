@@ -13,8 +13,8 @@ import httpx
 
 from agent import chat_completion_helpers as h
 from agent.b2b_execution import (
-    B2BTerminalRefusal, _public_text, before_sdk_dispatch,
-    extract_allowed_refs, validate_proposal)
+    B2BTerminalRefusal, _attestation_field, _public_text, before_sdk_dispatch,
+    normalized_messages_digest, provider_attestation, validate_proposal)
 from agent.chat_completion_nonstream import _NonStreamRequest
 
 
@@ -118,6 +118,9 @@ class _B2BNonStreamRequest(_NonStreamRequest):
             expected_digest=self._b2b_request_digest, client=client,
             dispatch_gate=self._check_dispatch_allowed)
         headers = dict(self.api_kwargs.get("extra_headers") or {})
+        if project_policy.get("native_n4") is not None:
+            headers["X-Dubsar-Profile-Id"] = "deploy"
+            headers["X-Dubsar-Context-Id"] = "n4-" + project_policy["native_n2"]["run_authorization"]["sha256"]
         headers["X-Dubsar-Attempt-Id"] = cap.attempt_id
         headers["X-Dubsar-Request-Digest"] = self._b2b_request_digest
         self.api_kwargs["extra_headers"] = headers
@@ -155,12 +158,26 @@ class _B2BNonStreamRequest(_NonStreamRequest):
             cap = self._b2b_execution
             receipt = getattr(cap.sink, "context_receipt", None) or cap.context_receipt
             text = _public_text(response)
-            allowed = extract_allowed_refs(receipt.view) if receipt is not None else ()
+            allowed = cap.proposal_refs(receipt.view) if receipt is not None else ()
             parsed, reason = validate_proposal(text, allowed)
             if parsed is None:
                 cap.sink.block("result_invalid")
                 raise B2BTerminalRefusal(f"result_invalid:{reason}")
-            cap.sink.commit_result(text=text, parsed=parsed, reason=reason)
+            provenance, receipt_ref = provider_attestation(response)
+            messages_digest = None
+            if provenance is not None or receipt_ref is not None:
+                try:
+                    messages_digest = normalized_messages_digest(
+                        self.api_kwargs.get("messages"))
+                except ValueError:
+                    cap.sink.block("result_unattested")
+                    raise B2BTerminalRefusal("result_unattested") from None
+            cap.sink.commit_result(
+                text=text, parsed=parsed, reason=reason,
+                provenance=provenance, receipt_ref=receipt_ref,
+                **({"result_signature": _attestation_field(response, "dubsar_result_signature")}
+                   if cap.policy_get("project", {}).get("native_n4") is not None else {}),
+                messages_digest=messages_digest)
             self.result["response"] = response
         except Exception as e:
             # Our own force-close caused this error: swallow it, the main
