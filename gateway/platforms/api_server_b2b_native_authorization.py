@@ -29,9 +29,6 @@ _NATIVE_MANIFEST_KEYS = frozenset({
 })
 _DATASET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 SCHEMA = "dubsar.core-model-authorization/1"
-ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
-ROUTE = {"provider_id": "nvidia-nim-integrate",
-         "model": "mistralai/mistral-large-4-1t-a52b", "model_version": "1"}
 
 
 def _boot_id() -> str:

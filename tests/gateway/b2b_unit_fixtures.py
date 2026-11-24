@@ -25,6 +25,10 @@ from tests.gateway.b2b_process_harness import (
     UNIT_RENDERED, build_context_view, extract_contract_root, make_keypair,
 )
 
+NATIVE_ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
+NATIVE_ROUTE = {"provider_id": "nvidia-nim-integrate",
+                "model": "mistralai/mistral-large-4-1t-a52b", "model_version": "1"}
+
 
 class _FakeClock:
     """Module-shaped stand-in patched onto ``agent.chat_completion_helpers.time``
@@ -100,7 +104,7 @@ def build_b2b_dispatch_lane(tmp_path, *,
             native_n2={"tenant_id": "fixture", "run_authorization": {
                 "path": str(tmp_path / "approved"), "sha256": "22"*32}},
             native_n4={"dataset_id": native_n4, "core_public_key": "ab"*32,
-                       "endpoint": native_auth.ENDPOINT, **native_auth.ROUTE})
+                       "endpoint": NATIVE_ENDPOINT, **NATIVE_ROUTE})
     config = b2b.B2BConfig({"enabled": True, "profiles": {profile: entry}})
     state = b2b._B2BState(config)
     adapter = SimpleNamespace(_b2b_state=state)

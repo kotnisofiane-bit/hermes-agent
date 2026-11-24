@@ -1283,7 +1283,14 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
-    if project["model"] == _native_auth.ROUTE["model"] and project.get("native_n2") is None:
+    state = _state_for(adapter)
+    native_models = {
+        configured["native_n4"]["model"]
+        for profile_entry in (state.config.profiles.values()
+                              if state is not None else ())
+        for configured in profile_entry["projects"].values()
+        if configured.get("native_n4") is not None}
+    if project.get("native_n2") is None and project["model"] in native_models:
         return _deny(403, "model_authorization_missing")
     existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
     if existing_attempt is not None and project.get("native_n2") is not None:

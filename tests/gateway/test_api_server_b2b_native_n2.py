@@ -72,6 +72,9 @@ LEGACY_PROJECT = "legacy-prj-1"
 REQUESTER = "5" * 24
 MODEL = "mistralai/mistral-large-4-1t-a52b"
 BASE_URL = "http://127.0.0.1:8921/v1"
+NATIVE_ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
+NATIVE_ROUTE = {"provider_id": "nvidia-nim-integrate", "model": MODEL,
+                "model_version": "1"}
 
 
 def _binding_for(project=PROJECT, mission=MISSION, requester=REQUESTER):
@@ -203,7 +206,7 @@ def _project_entry(native=True, run_ref=None, project_id=PROJECT, **over):
 
 def _native_n4(dataset_id, **over):
     stanza = {"dataset_id": dataset_id, "core_public_key": "ab" * 32,
-              "endpoint": native_auth.ENDPOINT, **native_auth.ROUTE}
+              "endpoint": NATIVE_ENDPOINT, **NATIVE_ROUTE}
     stanza.update(over)
     return stanza
 
@@ -1230,7 +1233,7 @@ async def test_native_http_prepare_admission_replay_and_revocation(
             request_sha = "11" * 32
             response["dubsar_provenance"] = {
                 "schema": "dubsar.g2-n4-provenance/1", "kind": "provider",
-                "provider_id": auth.ROUTE["provider_id"], "model": MODEL,
+                "provider_id": NATIVE_ROUTE["provider_id"], "model": MODEL,
                 "request_sha256": request_sha, "approval_sha256": approval_sha,
                 "call_id": call_id}
             response["dubsar_receipt_ref"] = {
@@ -1240,7 +1243,7 @@ async def test_native_http_prepare_admission_replay_and_revocation(
                 "messages_digest": normalized_messages_digest(
                     payload.get("messages")),
                 "authorized_egress_messages_digest": normalized_messages_digest(payload["messages"]),
-                "provider_id": auth.ROUTE["provider_id"], "endpoint": auth.ENDPOINT,
+                "provider_id": NATIVE_ROUTE["provider_id"], "endpoint": NATIVE_ENDPOINT,
                 "model": MODEL, "request_sha256": request_sha}
             proof = {"attempt_id": ATTEMPT, "text": json.dumps(proposal_result),
                      "receipt": response["dubsar_receipt_ref"], "provenance": response["dubsar_provenance"]}
@@ -1359,7 +1362,7 @@ async def test_native_http_prepare_admission_replay_and_revocation(
                           "dataset": {"dataset_id": record["dataset_id"], "authorized": True,
                                       "classification": "public_synthetic",
                                       "messages_digest": prepared["body"].get("normalized_messages_digest")},
-                          "model_route": auth.ROUTE, "ports": {"gateway": gateway_port, "core_llm": 28004}}
+                          "model_route": NATIVE_ROUTE, "ports": {"gateway": gateway_port, "core_llm": 28004}}
                     if authorization == "piece":
                         n4_binding["documents"][0] = dict(n4_binding["documents"][0], digest="sha256:" + "0"*64)
                     if authorization == "mission":
@@ -1376,7 +1379,7 @@ async def test_native_http_prepare_admission_replay_and_revocation(
                     claim = {"schema": auth.SCHEMA, "n2": record, "n4": n4,
                              "result_public_key": result_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex(),
                              "issued_at": now, "expires_at": now + 900, "approver_id": "6"*24,
-                             "endpoint": "https://elsewhere.invalid" if authorization == "route" else auth.ENDPOINT}
+                             "endpoint": "https://elsewhere.invalid" if authorization == "route" else NATIVE_ENDPOINT}
                     if authorization == "expired":
                         claim["issued_at"], claim["expires_at"] = now - 901, now - 1
                     elif authorization == "future":
