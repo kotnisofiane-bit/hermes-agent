@@ -2,12 +2,18 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import re
 import stat
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+from agent.b2b_execution import canonical_json, native_recipe_normalized_messages_digest
 
 _NATIVE_SECURITY_UID = 32013
 _NATIVE_TRUSTED_ROOT = "/"
@@ -20,6 +26,10 @@ _NATIVE_MANIFEST_KEYS = frozenset({
     "request_digest", "mission_source_digest", "messages_digest",
 })
 _DATASET_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
+SCHEMA = "dubsar.core-model-authorization/1"
+ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
+ROUTE = {"provider_id": "nvidia-nim-integrate",
+         "model": "mistralai/mistral-large-4-1t-a52b", "model_version": "1"}
 
 
 def _boot_id() -> str:
@@ -58,37 +68,22 @@ def _native_parents_safe(path: str) -> bool:
         current = parent
 
 
-def _read_native_run_authorization(ref: Any) -> Optional[Dict[str, Any]]:
-    """Protected manifest read — same discipline as the Portal installation
-    record: canonical path, safe parents, O_NOFOLLOW, security-owned 0640
-    nlink=1 regular file, byte-pinned sha256, current-boot JSON record.
-    Returns the closed eight-key manifest or ``None`` (fail closed)."""
-    from .api_server_b2b import (
-        _ATTEMPT_ID_RE,
-        _HEX64,
-        _MISSION_ID,
-        _NATIVE_BINDING_KEYS,
-        _NATIVE_PROJECT_ID,
-        _NATIVE_TENANT_ID,
-        _OBJECT_ID,
-        _POINTER_KEYS,
-        _SESSION_ID_RE,
-        _SHA256_FIELD,
-        _SHA256_PREFIXED,
-        _strict_json_loads,
-    )
+class AuthorizationRefused(ValueError):
+    def __init__(self, reason):
+        super().__init__("model_authorization_" + reason)
+
+
+def _read_protected_record(ref):
+    from .api_server_b2b import _HEX64, _strict_json_loads
 
     if not isinstance(ref, Mapping) or set(ref) != {"path", "sha256"}:
-        return None
+        raise AuthorizationRefused("missing")
     path, pinned = ref.get("path"), ref.get("sha256")
     if (not isinstance(path, str) or not path or "\x00" in path
             or os.path.abspath(path) != path
             or not isinstance(pinned, str) or _HEX64.fullmatch(pinned) is None
             or not _native_parents_safe(path)):
-        return None
-    boot_id = _boot_id()
-    if not boot_id:
-        return None
+        raise AuthorizationRefused("unprotected")
     try:
         with os.fdopen(
                 os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
@@ -97,16 +92,27 @@ def _read_native_run_authorization(ref: Any) -> Optional[Dict[str, Any]]:
                     or stat.S_IMODE(info.st_mode) != 0o640
                     or info.st_uid != _NATIVE_SECURITY_UID or info.st_nlink != 1
                     or info.st_size > _NATIVE_MANIFEST_MAX):
-                return None
+                raise AuthorizationRefused("unprotected")
             data = stream.read(_NATIVE_MANIFEST_MAX + 1)
+    except FileNotFoundError:
+        raise AuthorizationRefused("missing") from None
     except OSError:
-        return None
+        raise AuthorizationRefused("unprotected") from None
     if (len(data) > _NATIVE_MANIFEST_MAX
             or hashlib.sha256(data).hexdigest() != pinned):
-        return None
+        raise AuthorizationRefused("sha_mismatch")
     try:
-        record = _strict_json_loads(data)
+        return _strict_json_loads(data)
     except (ValueError, RecursionError):
+        raise AuthorizationRefused("schema") from None
+def _validate_n2(record):
+    from .api_server_b2b import (
+        _ATTEMPT_ID_RE, _HEX64, _MISSION_ID, _NATIVE_BINDING_KEYS, _NATIVE_PROJECT_ID,
+        _NATIVE_TENANT_ID, _OBJECT_ID, _POINTER_KEYS, _SESSION_ID_RE, _SHA256_FIELD,
+        _SHA256_PREFIXED)
+
+    boot_id = _boot_id()
+    if not boot_id:
         return None
     binding = record.get("binding") if isinstance(record, Mapping) else None
     pointer = binding.get("mission_inputs") if isinstance(binding, Mapping) else None
@@ -147,3 +153,82 @@ def _read_native_run_authorization(ref: Any) -> Optional[Dict[str, Any]]:
             or _HEX64.fullmatch(record["messages_digest"]) is None):
         return None
     return dict(record)
+
+
+def read_approval(project: Mapping[str, Any]) -> Dict[str, Any]:
+    stanza = project.get("native_n4")
+    if not stanza:
+        raise AuthorizationRefused("missing")
+    envelope = _read_protected_record(project["native_n2"].get("run_authorization"))
+    if type(envelope) is not dict or set(envelope) != {"claim", "signature"}:
+        raise AuthorizationRefused("schema")
+    claim = envelope["claim"]
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(stanza["core_public_key"])).verify(
+            base64.b64decode(envelope["signature"], validate=True),
+            SCHEMA.encode() + b"\0" + canonical_json(claim))
+    except (InvalidSignature, TypeError, ValueError, RecursionError):
+        raise AuthorizationRefused("signature") from None
+    try:
+        n4 = claim["n4"]
+        dataset, ports, n2 = n4["dataset"], n4["ports"], claim["n2"]
+        if (dataset["classification"] != _NATIVE_MANIFEST_CLASS or dataset["authorized"] is not True
+                or n2["classification"] != _NATIVE_MANIFEST_CLASS
+                or dataset["dataset_id"] != stanza["dataset_id"] or n2["dataset_id"] != stanza["dataset_id"]):
+            raise AuthorizationRefused("classification")
+        if (claim["endpoint"] != ENDPOINT or n4["model_route"] != ROUTE
+                or project["model"] != ROUTE["model"]
+                or set(ports) != {"gateway", "core_llm"}
+                or any(type(p) is not int or not 20000 <= p <= 65535 for p in ports.values())
+                or ports["gateway"] == ports["core_llm"]
+                or project["base_url"] != f"http://127.0.0.1:{ports['gateway']}/v1"):
+            raise AuthorizationRefused("route")
+        if (set(claim) != {"schema", "n2", "n4", "endpoint", "result_public_key"} or claim["schema"] != SCHEMA
+                or not re.fullmatch(r"[0-9a-f]{64}", claim["result_public_key"])
+                or claim["result_public_key"] == stanza["core_public_key"]
+                or not _validate_n2(n2) or set(n4) != {"schema", "binding", "dataset", "model_route", "ports"}
+                or n4["schema"] != "dubsar.g2-n4-approval/1"
+                or set(dataset) != {"classification", "authorized", "dataset_id", "messages_digest"}
+                or type(n4["binding"]) is not dict
+                or set(n4["binding"]) != (n2["binding"].keys() - {"mission_inputs", "requester_id"}) | {"documents"}):
+            raise AuthorizationRefused("schema")
+    except (KeyError, TypeError):
+        raise AuthorizationRefused("schema") from None
+    return claim
+
+
+def check_source(claim, resolved):
+    expected = resolved.get("_native_binding")
+    if not expected:
+        raise AuthorizationRefused("binding")
+    n2 = claim["n2"]
+    for binding in (n2["binding"], claim["n4"]["binding"]):
+        for key in binding.keys() - {"documents"}:
+            if canonical_json(binding[key]) != canonical_json(expected[key]):
+                reason = {"attempt_id": "attempt", "mission_id": "mission", "mission_revision": "revision",
+                          "mission_inputs": "pieces"}.get(key, "binding")
+                raise AuthorizationRefused(reason)
+    if (n2["request_digest"] != resolved["request_digest"]
+            or n2["mission_source_digest"] != resolved["mission_source_digest"]):
+        raise AuthorizationRefused("source_digest")
+
+
+def check_preparation(claim, resolved, preparation):
+    docs = [{"native_ref": d["native_ref"], "revision": d["revision"],
+             "digest": d["native_digest"]} for d in preparation.documents]
+    if canonical_json(claim["n4"]["binding"]["documents"]) != canonical_json(docs):
+        raise AuthorizationRefused("pieces")
+    if claim["n4"]["dataset"]["messages_digest"] != native_recipe_normalized_messages_digest(
+            resolved["mission_request"], preparation.rendered):
+        raise AuthorizationRefused("normalized_digest")
+
+
+def authentic_result(public_key, signature, proof):
+    try:
+        if not re.fullmatch(r"[0-9a-f]{128}", signature):
+            return False
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key)).verify(
+            bytes.fromhex(signature), b"dubsar.n4-result/1\0" + canonical_json(proof))
+        return True
+    except (InvalidSignature, TypeError, ValueError):
+        return False

@@ -936,7 +936,7 @@ def _remote_b2b_agent(tmp_path, monkeypatch, cap, *,
 
 def _drive_b2b_run(tmp_path, monkeypatch, cap, *, clock=None, prep_seconds=0.0,
                    dispatch_seconds=0.0, run_budget=None, budget_started=None,
-                   gated=False):
+                   gated=False, response=None):
     """Drive a REAL ``_B2BNonStreamRequest`` through ``run()``/``_call`` — real
     worker thread, real poll loop — with a fake SDK ``create`` and, optionally,
     a fake ``h.time`` clock. The fake client's ``create`` records the armed
@@ -957,7 +957,7 @@ def _drive_b2b_run(tmp_path, monkeypatch, cap, *, clock=None, prep_seconds=0.0,
     send_flag, release, aborted = (threading.Event() for _ in range(3))
     outcome = {"sends": [], "made": [], "with_options": [],
                "send_flag": send_flag, "release": release, "aborted": aborted}
-    response = _Resp(content=_good_proposal())
+    response = response or _Resp(content=_good_proposal())
     req = None
 
     def _create(**_kw):
@@ -1047,6 +1047,41 @@ def _drive_b2b_run(tmp_path, monkeypatch, cap, *, clock=None, prep_seconds=0.0,
 
     outcome["finish"] = finish
     return outcome
+
+
+def test_b2b_worker_forwards_provider_attestation(tmp_path, monkeypatch):
+    """The worker must hand the gateway's provenance and receipt reference to
+    the sink — the sink is the only place that verifies and persists them."""
+    _b2b_env(tmp_path, monkeypatch)
+    provenance = {"schema": "dubsar.g2-n4-provenance/1", "kind": "provider",
+                  "provider_id": "nvidia-nim-integrate", "model": "m",
+                  "request_sha256": "11" * 32, "approval_sha256": "22" * 32,
+                  "call_id": "c"}
+    receipt = {"call_id": "c", "decision": "ALLOW", "messages_digest": "33" * 32}
+    response = _Resp(content=_good_proposal())
+    response.dubsar_provenance = provenance
+    response.dubsar_receipt_ref = receipt
+    sink = _TSink()
+    out = _drive_b2b_run(
+        tmp_path, monkeypatch, _cap(sink=sink), response=response)
+    out["finish"]()
+    assert sink.committed is not None
+    assert sink.committed["provenance"] == provenance
+    assert sink.committed["receipt_ref"] == receipt
+    assert sink.committed["messages_digest"] == be.normalized_messages_digest(
+        out["req"].api_kwargs["messages"])
+
+
+def test_b2b_worker_omits_attestation_when_provider_sends_none(
+        tmp_path, monkeypatch):
+    _b2b_env(tmp_path, monkeypatch)
+    sink = _TSink()
+    out = _drive_b2b_run(tmp_path, monkeypatch, _cap(sink=sink))
+    out["finish"]()
+    assert sink.committed is not None
+    assert sink.committed["provenance"] is None
+    assert sink.committed["receipt_ref"] is None
+    assert sink.committed["messages_digest"] is None
 
 
 @pytest.mark.parametrize("policy_timeout,armed", [(600, 600.0), (None, 5.0)],

@@ -32,7 +32,10 @@ from agent.b2b_execution import (
     _plain_json,
     _public_text, canonical_json, is_b2b_attempt_id, is_b2b_session_id, json_utf8,
     assert_source_equivalent, context_proof, qualify_context_view, verify_context_proof,
-    mission_prompt, native_recipe_messages_digest, recheck_context, validate_proposal,
+    mission_prompt, native_recipe_messages_digest,
+    native_recipe_normalized_content_digest,
+    native_recipe_normalized_messages_digest, recheck_context, validate_proposal,
+    validate_provider_attestation,
     extract_allowed_refs)
 from gateway.platforms import api_server_b2b_native_authorization as _native_auth
 
@@ -110,9 +113,9 @@ _PROFILE_ENTRY_KEYS = frozenset({
 _PROJECT_ENTRY_KEYS = frozenset({
     "project_id", "bot_id", "profile_id", "allowed_namespaces", "context_contract_root",
     "model", "provider", "base_url", "api_mode", "logical_mission", "project_context",
-    "request_timeout_seconds", "memory_mode", "native_n2"})
+    "request_timeout_seconds", "memory_mode", "native_n2", "native_n4"})
 _PROJECT_ENTRY_REQUIRED_KEYS = _PROJECT_ENTRY_KEYS - {
-    "request_timeout_seconds", "memory_mode", "native_n2"}
+    "request_timeout_seconds", "memory_mode", "native_n2", "native_n4"}
 _PROJECT_CONTEXT_KEYS = frozenset({"allocation_root", "project_id", "start"})
 _API_MODES = frozenset({"chat_completions"})
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
@@ -369,6 +372,17 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
                 raise B2BConfigError(
                     f"b2b config: project {binding_id}: run_authorization ref")
             native_n2["run_authorization"] = {"path": path, "sha256": sha256}
+    native_n4 = None
+    if "native_n4" in entry:
+        stanza = entry["native_n4"]
+        if (native_n2 is None or not isinstance(stanza, Mapping)
+                or set(stanza) != {"dataset_id", "core_public_key"}
+                or not isinstance(stanza["dataset_id"], str)
+                or not _native_auth._DATASET_ID.fullmatch(stanza["dataset_id"])
+                or not isinstance(stanza["core_public_key"], str)
+                or not _HEX64.fullmatch(stanza["core_public_key"])):
+            raise B2BConfigError(f"b2b config: project {binding_id}: invalid native_n4")
+        native_n4 = dict(stanza)
     normalized = {
         "project_id": project_id,
         "bot_id": entry["bot_id"], "profile_id": entry["profile_id"],
@@ -388,6 +402,8 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
         normalized["memory_mode"] = memory_mode
     if native_n2 is not None:
         normalized["native_n2"] = native_n2
+    if native_n4 is not None:
+        normalized["native_n4"] = native_n4
     return normalized
 
 
@@ -910,6 +926,7 @@ def _policy_digest(profile: str, entry: Mapping[str, Any], project: Mapping[str,
         basis["native_n2"] = project["native_n2"]
         basis["native_n2_binding"] = resolved.get("native_n2_binding")
         basis["native_n2_messages_digest"] = resolved.get("native_n2_messages_digest")
+        basis["native_n4"] = project.get("native_n4")
     # Optional operator key: absent from the digest basis unless explicitly
     # configured, so a pre-versioning admission replays byte-for-byte while a
     # configured value still revokes a running cap when changed mid-run.
@@ -1156,11 +1173,11 @@ class _AttemptSink:
         run's binding, this exchange's request/source digests and the approved
         messages digest."""
         project = self.policy.get("project")
-        native = project.get("native_n2") if isinstance(project, Mapping) else None
-        ref = native.get("run_authorization") if isinstance(native, Mapping) else None
-        manifest = _native_auth._read_native_run_authorization(ref)
-        if manifest is None:
+        try:
+            claim = _native_auth.read_approval(project)
+        except _native_auth.AuthorizationRefused:
             return False
+        manifest = claim["n2"]
         try:
             return (canonical_json(manifest["binding"]) ==
                     canonical_json(self.policy.get("native_n2_binding"))
@@ -1282,7 +1299,9 @@ class _AttemptSink:
             profile=self.profile, attempt_id=self.attempt_id,
             source_record=source_record, dispatch_record=dispatch_record)
 
-    def commit_result(self, *, text: Any, parsed: Any, reason: str) -> None:
+    def commit_result(self, *, text: Any, parsed: Any, reason: str,
+                      provenance: Any = None, receipt_ref: Any = None,
+                      messages_digest: Any = None, result_signature: Any = None) -> None:
         receipt = self.context_receipt
         valid, checked = validate_proposal(
             text, self._proposal_refs(receipt.view) if receipt else ())
@@ -1290,12 +1309,43 @@ class _AttemptSink:
         if receipt is None or marker is None or valid is None or valid != parsed or checked != reason:
             self.block("result_invalid")
             raise B2BTerminalRefusal("result_invalid")
+        attestation = None
+        native_n4 = self.policy["project"].get("native_n4")
+        if (native_n4 is not None or provenance is not None
+                or receipt_ref is not None or messages_digest is not None):
+            expected = native_recipe_normalized_messages_digest(
+                self.policy["mission_request"], receipt.rendered)
+            if native_n4 is None or messages_digest != expected:
+                self.block("result_unattested")
+                raise B2BTerminalRefusal("result_unattested")
+            attestation = validate_provider_attestation(
+                provenance, receipt_ref, expected_messages_digest=expected,
+                expected_content_digest=native_recipe_normalized_content_digest(
+                    self.policy["mission_request"], receipt.rendered))
+            if attestation:
+                project = self.policy["project"]
+                proof = {"attempt_id": self.attempt_id, "text": text,
+                         "provenance": provenance, "receipt": receipt_ref}
+                if (not _native_auth.authentic_result(
+                        self.policy.get("native_n4_result_public_key"), result_signature, proof)
+                        or provenance["approval_sha256"] != project["native_n2"]["run_authorization"]["sha256"]
+                        or provenance["model"] != project["model"]
+                        or provenance["provider_id"] != _native_auth.ROUTE["provider_id"]
+                        or receipt_ref["endpoint"] != _native_auth.ENDPOINT
+                        or receipt_ref["authorized_egress_messages_digest"] != expected):
+                    attestation = None
+            if attestation is None:
+                self.block("result_unattested")
+                raise B2BTerminalRefusal("result_unattested")
         dispatch = json.loads(marker["payload"])
         payload = json_utf8({
             "format": "dubsar.b2b-provider-result/1",
             "attempt_id": self.attempt_id, "binding_digest": self.binding_digest,
             "run_id": self.run_id, "request_digest": dispatch["request_digest"],
-            "context_digest": receipt.digest, "text": text, "proposal": valid})
+            "context_digest": receipt.digest, "text": text, "proposal": valid,
+            **({"dubsar_result_signature": result_signature} if native_n4 is not None else {}),
+            **({"dubsar_provenance": attestation[0],
+                "dubsar_receipt_ref": attestation[1]} if attestation else {})})
         if not self._store.b2b_commit_result(
             profile=self.profile, attempt_id=self.attempt_id,
                 payload=payload):
@@ -1612,33 +1662,20 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
+    if project["model"] == _native_auth.ROUTE["model"] and project.get("native_n2") is None:
+        return _deny(403, "model_authorization_missing")
     existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
+    if existing_attempt is not None and project.get("native_n2") is not None:
+        return _deny(409, "model_authorization_consumed")
     native_binding = resolved.get("_native_binding")
     native_messages_digest = None
     if project.get("native_n2") is not None:
-        if existing_attempt is not None:
-            existing = existing or store.b2b_binding(session_id=session_id, profile=profile)
-            try:
-                native_messages_digest = json.loads(existing["policy_json"])[
-                    "native_n2_messages_digest"]
-            except (TypeError, KeyError, ValueError):
-                return _deny(409, "conflict")
-            if (not isinstance(native_messages_digest, str)
-                    or _HEX64.fullmatch(native_messages_digest) is None):
-                return _deny(409, "conflict")
-        else:
-            # Native run: the opted catalogue entry must carry run authorization
-            # and the protected manifest must pin THIS exact binding plus this
-            # exchange's digests. An absent stanza means prepare-only — refuse
-            # before context preparation, admission or any receipt consumption.
-            manifest = _native_auth._read_native_run_authorization(
-                project["native_n2"].get("run_authorization"))
-            if (native_binding is None or manifest is None
-                    or canonical_json(manifest["binding"]) != canonical_json(native_binding)
-                    or manifest["request_digest"] != resolved["request_digest"]
-                    or manifest["mission_source_digest"] != resolved["mission_source_digest"]):
-                return _deny(503, "execution_unavailable")
-            native_messages_digest = manifest["messages_digest"]
+        try:
+            claim = _native_auth.read_approval(project)
+            _native_auth.check_source(claim, resolved)
+        except _native_auth.AuthorizationRefused as exc:
+            return _deny(403, str(exc))
+        native_messages_digest = claim["n2"]["messages_digest"]
     # P2 admission gate: NEW work proves its mission context BEFORE the single
     # durable attempt is consumed — the sink/cap are built in memory first,
     # then the bounded bootstrap enters the owning profile scope (secret
@@ -1650,10 +1687,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     # and consult readiness (the same single classifier /health/detailed
     # reports). Any source/producer error is 503 execution_unavailable with
     # NO binding/attempt/run/title/provider side effects — the in-memory
-    # sink/cap are simply dropped. An already-durable attempt row is always
-    # served by the idempotent replay below (b2b_admit -> _replayed_response),
-    # so a lost-ACK retry never hears "execution_unavailable" for a committed
-    # lane and never pays a context read.
+    # sink/cap are simply dropped. Legacy lanes keep their idempotent replay;
+    # a native retry is a consumed authorization, never a second launch.
     policy = {
         "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
         "attempt_id": attempt_id, "profile_home": str(home),
@@ -1670,7 +1705,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         "observation_genesis": resolved["observation_genesis"],
         "mission_request": resolved["mission_request"], "project": project,
         **({"native_n2_binding": native_binding,
-            "native_n2_messages_digest": native_messages_digest}
+            "native_n2_messages_digest": native_messages_digest,
+            "native_n4_result_public_key": claim["result_public_key"]}
            if native_binding is not None else {})}
     fingerprint = _policy_digest(profile, entry, project, policy)
     scope = _run_scope(profile, resolved["requester_id"], binding_digest)
@@ -1700,7 +1736,12 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                 and native_recipe_messages_digest(
                     resolved["mission_request"], sink._context_preparation.rendered
                 ) != native_messages_digest):
-            return _deny(503, "execution_unavailable")
+            return _deny(403, "model_authorization_raw_digest")
+        if native_binding is not None:
+            try:
+                _native_auth.check_preparation(claim, resolved, sink._context_preparation)
+            except _native_auth.AuthorizationRefused as exc:
+                return _deny(403, str(exc))
     if existing_attempt is None:
         # Inherited generic API admission, kept at
         # its original place — not a B2B capacity gate.
@@ -1742,7 +1783,7 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         if (native_binding is not None
                 and not sink._native_run_current(resolved)):
             # Revocation during bounded preparation must not consume admission.
-            return _deny(503, "execution_unavailable")
+            return _deny(403, "model_authorization_revoked")
     outcome = store.b2b_admit(
         profile=profile, session_id=session_id, binding_digest=binding_digest,
         attempt_id=attempt_id, fingerprint=fingerprint,
@@ -1758,6 +1799,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     stored_run_id = outcome.get("run_id") or (
         (outcome.get("attempt") or {}).get("run_id") if outcome.get("status") == "replayed" else run_id)
     if outcome.get("status") == "replayed":
+        if native_binding is not None:
+            return _deny(409, "model_authorization_consumed")
         return _replayed_response(adapter, stored_run_id, attempt_id, binding_digest, profile, session_id)
     adapter._run_idempotency_ids.add(stored_run_id)
     try:
@@ -1767,6 +1810,10 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         return _deny(500, "title_commit_failed")
     # The admitted winner's run_id is the chosen one — the sink/cap built
     # pre-admission already carry it (a replayed outcome returned above).
+    if native_binding is not None and (
+            not sink.assert_current_policy() or not sink._native_run_current(resolved)):
+        store.b2b_update_attempt(profile=profile, attempt_id=attempt_id, status="failed")
+        return _deny(403, "model_authorization_revoked")
     launched = await _spawn_run(adapter, request, cap=cap, resolved=resolved,
                                 session_id=session_id, run_id=stored_run_id, profile=profile)
     if launched is None:
@@ -1935,6 +1982,13 @@ async def _prepare_b2b_only(adapter: Any, request: Any, *, profile: str, entry, 
     if resolved.get("_native_binding") is not None:
         body["messages_digest"] = native_recipe_messages_digest(
             resolved["mission_request"], preparation.rendered)
+        if project.get("native_n4") is not None:
+            body.update(native_binding=resolved["_native_binding"],
+                        request_digest=resolved["request_digest"],
+                        mission_source_digest=resolved["mission_source_digest"],
+                        dataset_id=project["native_n4"]["dataset_id"],
+                        normalized_messages_digest=native_recipe_normalized_messages_digest(
+                            resolved["mission_request"], preparation.rendered))
     envelope, _ = _signed_envelope(
         entry, keys, _PREPARED_OPERATION, body, request_id=request_id)
     return web.json_response(envelope)
