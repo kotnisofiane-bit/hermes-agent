@@ -200,6 +200,11 @@ def _project_entry(native=True, run_ref=None, project_id=PROJECT, **over):
         entry["native_n2"] = {"tenant_id": TENANT}
         if run_ref is not None:
             entry["native_n2"]["run_authorization"] = dict(run_ref)
+    else:
+        # A legitimate legacy project is off the native G2 route: no provider
+        # alias, no G2 loopback URL and no native catalogue model.
+        entry.update(model="legacy-model", provider="custom",
+                     base_url="http://127.0.0.1:8922/v1")
     entry.update(over)
     return entry
 

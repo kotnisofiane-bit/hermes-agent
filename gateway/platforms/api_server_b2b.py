@@ -43,7 +43,8 @@ from gateway.platforms.api_server_b2b_native_validation import (
     B2BConfig, B2BConfigError, validate_b2b_config, _MISSION_ID,
     _NATIVE_BINDING_KEYS, _NATIVE_PROJECT_ID, _NATIVE_TENANT_ID, _POINTER_KEYS,
     _OBSERVATION_KEYS, _PROFILE_NAME, _PROJECT_ID, _SHA256_PREFIXED, _exact_keys,
-    _native_binding, _plain_object, _scalar_ok, _valid_mission_request,
+    _legacy_targets_native_gateway, _native_binding, _native_catalogue,
+    _plain_object, _scalar_ok, _valid_mission_request,
     _valid_native_source_refs, _valid_observation, _validate_project_entry,
     _verify_native_body,
 )
@@ -1284,13 +1285,9 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
     state = _state_for(adapter)
-    native_models = {
-        configured["native_n4"]["model"]
-        for profile_entry in (state.config.profiles.values()
-                              if state is not None else ())
-        for configured in profile_entry["projects"].values()
-        if configured.get("native_n4") is not None}
-    if project.get("native_n2") is None and project["model"] in native_models:
+    native_models, native_urls = _native_catalogue(
+        state.config.profiles if state is not None else {})
+    if _legacy_targets_native_gateway(project, native_models, native_urls):
         return _deny(403, "model_authorization_missing")
     existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
     if existing_attempt is not None and project.get("native_n2") is not None:

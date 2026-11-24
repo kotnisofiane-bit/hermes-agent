@@ -46,6 +46,11 @@ _TITLE_MAX, _OBJECTIVE_MAX = 160, 1000
 _CRITERION_MAX, _CRITERIA_MAX = 300, 20
 _SOURCE_REF_MAX, _SOURCE_REFS_MAX = 300, 20
 _MAX_NATIVE_PIECES = 20
+# The native G2 route is bound to this baseline model even when the operator
+# configures no native project at all. A legacy project that names it (or any
+# configured native model) must never reach the gateway without signed Core
+# authorization, whatever provider/base_url alias it declares.
+_NATIVE_BASELINE_MODEL = "mistralai/mistral-large-4-1t-a52b"
 
 _B2B_CONFIG_ROOT_KEYS = frozenset({"enabled", "profiles"})
 _PROFILE_ENTRY_KEYS = frozenset({
@@ -74,6 +79,35 @@ class B2BConfigError(ValueError):
 
 def _plain_object(v: Any) -> bool:
     return isinstance(v, Mapping)
+
+
+def _normalized_model_name(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower().rsplit("/", 1)[-1]
+
+
+def _native_catalogue(profiles: Mapping[str, Any]) -> tuple:
+    """Models and loopback URLs the native G2 lane is configured to serve."""
+    models = {_normalized_model_name(_NATIVE_BASELINE_MODEL)}
+    urls = set()
+    for profile_entry in profiles.values():
+        for project in profile_entry["projects"].values():
+            if project.get("native_n2") is None:
+                continue
+            models.add(_normalized_model_name(project["model"]))
+            urls.add(project["base_url"])
+    return models, urls
+
+
+def _legacy_targets_native_gateway(
+        project: Mapping[str, Any], models, urls) -> bool:
+    """True when a non-native project aliases any native G2 route identity."""
+    if project.get("native_n2") is not None:
+        return False
+    return (str(project.get("provider") or "").strip().lower() == "custom:b2b-g2"
+            or project.get("base_url") in urls
+            or _normalized_model_name(project.get("model")) in models)
 
 
 def _scalar_ok(v: Any, _depth: int = 0) -> bool:
@@ -368,6 +402,13 @@ class B2BConfig:
                 "portal_public_key_pem": _req_pem(entry.get("portal_public_key_pem"), "portal_public_key_pem"),
                 "hermes_private_key_pem": _req_pem(entry.get("hermes_private_key_pem"), "hermes_private_key_pem"),
                 "projects": parsed_projects}
+        models, urls = _native_catalogue(parsed)
+        for profile_entry in parsed.values():
+            for binding_id, project in profile_entry["projects"].items():
+                if _legacy_targets_native_gateway(project, models, urls):
+                    raise B2BConfigError(
+                        f"b2b config: project {binding_id}: "
+                        "legacy lane may not target the native G2 catalogue")
         if enabled and not parsed:
             raise B2BConfigError("b2b config: enabled profiles must be explicit")
         object.__setattr__(self, "enabled", enabled)
