@@ -41,11 +41,10 @@ from agent.b2b_execution import (
 from gateway.platforms import api_server_b2b_native_authorization as _native_auth
 from gateway.platforms.api_server_b2b_native_validation import (
     B2BConfig, B2BConfigError, validate_b2b_config, _MISSION_ID,
-    _NATIVE_BINDING_KEYS, _NATIVE_PROJECT_ID, _NATIVE_TENANT_ID, _POINTER_KEYS,
-    _OBSERVATION_KEYS, _PROFILE_NAME, _PROJECT_ID, _SHA256_PREFIXED, _exact_keys,
+    _OBSERVATION_KEYS, _PROFILE_NAME, _PROJECT_ID, _exact_keys,
     _legacy_targets_native_gateway, _native_binding, _native_catalogue,
-    _plain_object, _scalar_ok, _valid_mission_request,
-    _valid_native_source_refs, _valid_observation, _validate_project_entry,
+    _scalar_ok, _valid_mission_request,
+    _valid_observation,
     _verify_native_body,
 )
 
@@ -460,7 +459,12 @@ def bind_b2b_state(adapter: Any) -> None:
     """Called once from ``__init__`` — parses + freezes operator config."""
     extra = getattr(adapter, "_extra", None) or getattr(
         getattr(adapter, "config", None), "extra", None) or {}
-    adapter._b2b_state = _B2BState(validate_b2b_config(extra))
+    gateway_config = None
+    if isinstance(extra, Mapping) and "b2b" in extra:
+        from gateway.run import _load_gateway_config
+        gateway_config = _load_gateway_config()
+    adapter._b2b_state = _B2BState(
+        validate_b2b_config(extra, gateway_config=gateway_config))
 
 
 async def validate_b2b_model_gateway(adapter: Any) -> None:
@@ -1285,9 +1289,15 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
     state = _state_for(adapter)
-    native_models, native_urls = _native_catalogue(
-        state.config.profiles if state is not None else {})
-    if _legacy_targets_native_gateway(project, native_models, native_urls):
+    if state is not None:
+        native_models = state.config.g2_models
+        native_urls = state.config.g2_base_urls
+        provider_aliases = state.config.g2_provider_aliases
+    else:
+        native_models, native_urls = _native_catalogue({})
+        provider_aliases = frozenset()
+    if _legacy_targets_native_gateway(
+            project, native_models, native_urls, provider_aliases):
         return _deny(403, "model_authorization_missing")
     existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
     if existing_attempt is not None and project.get("native_n2") is not None:

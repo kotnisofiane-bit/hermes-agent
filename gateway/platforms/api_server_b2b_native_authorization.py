@@ -106,9 +106,10 @@ def _read_protected_record(ref):
         raise AuthorizationRefused("schema") from None
 def _validate_n2(record):
     from .api_server_b2b import (
-        _ATTEMPT_ID_RE, _HEX64, _MISSION_ID, _NATIVE_BINDING_KEYS, _NATIVE_PROJECT_ID,
-        _NATIVE_TENANT_ID, _OBJECT_ID, _POINTER_KEYS, _SESSION_ID_RE, _SHA256_FIELD,
-        _SHA256_PREFIXED)
+        _ATTEMPT_ID_RE, _HEX64, _OBJECT_ID, _SESSION_ID_RE, _SHA256_FIELD)
+    from .api_server_b2b_native_validation import (
+        _MISSION_ID, _NATIVE_BINDING_KEYS, _NATIVE_PROJECT_ID, _NATIVE_TENANT_ID,
+        _POINTER_KEYS, _SHA256_PREFIXED)
 
     boot_id = _boot_id()
     if not boot_id:

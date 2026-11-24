@@ -15,6 +15,7 @@ from typing import Any, Dict, Mapping, Optional
 
 from agent.b2b_execution import B2B_MISSION_ID, _deep_freeze
 from gateway.platforms import api_server_b2b_native_authorization as _native_auth
+from hermes_cli.providers import custom_provider_aliases
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 # Lot-1 native N2 lane: the catalogue may opt a project in with an exact
@@ -87,6 +88,33 @@ def _normalized_model_name(value: Any) -> str:
     return value.strip().lower().rsplit("/", 1)[-1]
 
 
+def _route_url(value: Any) -> str:
+    return value.strip().rstrip("/") if isinstance(value, str) else ""
+
+
+_G2_PROVIDER_KEY = "b2b-g2"
+_G2_CANONICAL_ALIASES = custom_provider_aliases(_G2_PROVIDER_KEY, _G2_PROVIDER_KEY)
+
+
+def _g2_route_identity(gateway_config: Any) -> tuple:
+    """Aliases and URLs the served ``providers.b2b-g2`` entry exposes."""
+    aliases = set(_G2_CANONICAL_ALIASES)
+    urls = set()
+    providers = (gateway_config.get("providers")
+                 if isinstance(gateway_config, Mapping) else None)
+    entry = (providers.get(_G2_PROVIDER_KEY)
+             if isinstance(providers, Mapping) else None)
+    if isinstance(entry, Mapping):
+        aliases.update(custom_provider_aliases(
+            entry.get("name") or _G2_PROVIDER_KEY, _G2_PROVIDER_KEY))
+        for key in ("api", "url", "base_url"):
+            url = entry.get(key)
+            if isinstance(url, str) and url.strip():
+                urls.add(_route_url(url))
+                break
+    return frozenset(aliases), frozenset(urls)
+
+
 def _native_catalogue(profiles: Mapping[str, Any]) -> tuple:
     """Models and loopback URLs the native G2 lane is configured to serve."""
     models = {_normalized_model_name(_NATIVE_BASELINE_MODEL)}
@@ -96,17 +124,20 @@ def _native_catalogue(profiles: Mapping[str, Any]) -> tuple:
             if project.get("native_n2") is None:
                 continue
             models.add(_normalized_model_name(project["model"]))
-            urls.add(project["base_url"])
+            urls.add(_route_url(project["base_url"]))
     return models, urls
 
 
 def _legacy_targets_native_gateway(
-        project: Mapping[str, Any], models, urls) -> bool:
+        project: Mapping[str, Any], models, urls,
+        provider_aliases=frozenset()) -> bool:
     """True when a non-native project aliases any native G2 route identity."""
     if project.get("native_n2") is not None:
         return False
-    return (str(project.get("provider") or "").strip().lower() == "custom:b2b-g2"
-            or project.get("base_url") in urls
+    requested = str(project.get("provider") or "")
+    aliases = _G2_CANONICAL_ALIASES | provider_aliases
+    return (bool(custom_provider_aliases(requested) & aliases)
+            or _route_url(project.get("base_url")) in urls
             or _normalized_model_name(project.get("model")) in models)
 
 
@@ -347,13 +378,20 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
 class B2BConfig:
     enabled: bool
     profiles: Mapping[str, Any]
+    g2_models: frozenset
+    g2_base_urls: frozenset
+    g2_provider_aliases: frozenset
 
     """Frozen, fully-validated ``config.extra["b2b"]``."""
 
-    def __init__(self, raw: Any):
+    def __init__(self, raw: Any, gateway_config: Any = None):
         if raw is None:
             object.__setattr__(self, "enabled", False)
             object.__setattr__(self, "profiles", types.MappingProxyType({}))
+            object.__setattr__(self, "g2_models", frozenset(
+                {_normalized_model_name(_NATIVE_BASELINE_MODEL)}))
+            object.__setattr__(self, "g2_base_urls", frozenset())
+            object.__setattr__(self, "g2_provider_aliases", _G2_CANONICAL_ALIASES)
             return
         if not isinstance(raw, Mapping) or set(raw.keys()) != _B2B_CONFIG_ROOT_KEYS:
             raise B2BConfigError("b2b config: closed root keys {enabled,profiles}")
@@ -402,10 +440,13 @@ class B2BConfig:
                 "portal_public_key_pem": _req_pem(entry.get("portal_public_key_pem"), "portal_public_key_pem"),
                 "hermes_private_key_pem": _req_pem(entry.get("hermes_private_key_pem"), "hermes_private_key_pem"),
                 "projects": parsed_projects}
+        provider_aliases, g2_urls = _g2_route_identity(gateway_config)
         models, urls = _native_catalogue(parsed)
+        urls |= g2_urls
         for profile_entry in parsed.values():
             for binding_id, project in profile_entry["projects"].items():
-                if _legacy_targets_native_gateway(project, models, urls):
+                if _legacy_targets_native_gateway(
+                        project, models, urls, provider_aliases):
                     raise B2BConfigError(
                         f"b2b config: project {binding_id}: "
                         "legacy lane may not target the native G2 catalogue")
@@ -413,14 +454,19 @@ class B2BConfig:
             raise B2BConfigError("b2b config: enabled profiles must be explicit")
         object.__setattr__(self, "enabled", enabled)
         object.__setattr__(self, "profiles", _deep_freeze(parsed))
+        object.__setattr__(self, "g2_models", frozenset(models))
+        object.__setattr__(self, "g2_base_urls", frozenset(urls))
+        object.__setattr__(
+            self, "g2_provider_aliases",
+            _G2_CANONICAL_ALIASES | provider_aliases)
 
     def profile_entry(self, profile: str) -> Optional[Dict[str, Any]]:
         return self.profiles.get(profile)
 
 
-def validate_b2b_config(extra: Any) -> B2BConfig:
+def validate_b2b_config(extra: Any, gateway_config: Any = None) -> B2BConfig:
     raw = (extra or {}).get("b2b") if isinstance(extra, Mapping) else None
-    return B2BConfig(raw)
+    return B2BConfig(raw, gateway_config=gateway_config)
 
 
 # ---------------------------------------------------------------------------

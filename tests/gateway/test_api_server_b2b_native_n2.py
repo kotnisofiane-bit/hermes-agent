@@ -42,6 +42,7 @@ from agent.b2b_execution import (
 )
 from gateway.platforms import api_server_b2b as m
 from gateway.platforms import api_server_b2b_native_authorization as native_auth
+from gateway.platforms import api_server_b2b_native_validation as native_validation
 from gateway.platforms.api_server_b2b_context import _b2b_documents
 from hermes_constants import get_hermes_home
 
@@ -111,7 +112,7 @@ def test_native_signed_refs_keep_twenty_originals_and_twenty_ordered_pairs():
         ordinary = [f"dubsar:mission:ref-{index}" for index in range(20)]
         refs = _flat(ordinary, documents)
         assert len(refs) == 20 + 2 * count
-        assert m._valid_native_source_refs(refs, MISSION)
+        assert native_validation._valid_native_source_refs(refs, MISSION)
         resolved, reason = _resolve(
             entry, keys,
             respond=lambda env: _response_envelope(
@@ -120,9 +121,9 @@ def test_native_signed_refs_keep_twenty_originals_and_twenty_ordered_pairs():
         assert resolved["mission_request"]["source_refs"] == refs
 
     documents = _docs(count=20)
-    assert not m._valid_native_source_refs(
+    assert not native_validation._valid_native_source_refs(
         _flat([f"ordinary-{index}" for index in range(21)], documents), MISSION)
-    assert not m._valid_native_source_refs(
+    assert not native_validation._valid_native_source_refs(
         _flat(["ordinary"], _docs(count=21)), MISSION)
 
 
@@ -1154,7 +1155,7 @@ async def test_native_http_prepare_admission_replay_and_revocation(
     resolved_body = _resolved_body(
         seed_request, docs=documents, refs=native_references)
     native_binding = {
-        key: resolved_body[key] for key in m._NATIVE_BINDING_KEYS}
+        key: resolved_body[key] for key in native_validation._NATIVE_BINDING_KEYS}
     trusted_root = tmp_path / "native-trusted"
     trusted_root.mkdir(mode=0o700)
     boot_path = trusted_root / "boot-id"

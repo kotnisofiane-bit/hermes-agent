@@ -26,6 +26,7 @@ from agent.b2b_execution import (
 from agent.memory_manager import MemoryManager
 from gateway.platforms import api_server_b2b as b2b
 from gateway.platforms import api_server_b2b_context as b2b_ctx
+from gateway.platforms import api_server_b2b_native_validation as native_validation
 from hermes_cli.plugins import discover_plugins
 from tests.gateway import test_api_server_b2b_execution_lane as execution_lane
 from tests.gateway import test_api_server_b2b_timeout as timeout
@@ -44,14 +45,15 @@ fake_plugin_home = execution_lane.fake_plugin_home
 
 def test_memory_mode_operator_policy_and_revocation(tmp_path):
     for value in (None, True, False, "", "auto", "disabled", [], {}):
-        with pytest.raises(b2b.B2BConfigError, match="memory_mode"):
-            b2b._validate_project_entry(
+        with pytest.raises(native_validation.B2BConfigError, match="memory_mode"):
+            native_validation._validate_project_entry(
                 timeout._timeout_project_entry(memory_mode=value), "b")
     for value in ("required", "none"):
-        normalized = b2b._validate_project_entry(
+        normalized = native_validation._validate_project_entry(
             timeout._timeout_project_entry(memory_mode=value), "b")
         assert normalized["memory_mode"] == value
-    normalized = b2b._validate_project_entry(timeout._timeout_project_entry(), "b")
+    normalized = native_validation._validate_project_entry(
+        timeout._timeout_project_entry(), "b")
     assert "memory_mode" not in normalized
 
     entry, project, resolved = timeout._digest_inputs(timeout=None)
