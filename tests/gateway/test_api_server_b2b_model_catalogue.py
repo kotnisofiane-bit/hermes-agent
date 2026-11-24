@@ -10,14 +10,21 @@ work when no ``native_n4`` project is configured at all.
 from __future__ import annotations
 
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from types import SimpleNamespace
+from unittest import TestCase
+from unittest.mock import Mock
 
 import pytest
 from aiohttp import web
 
+from agent.b2b_execution import B2BTerminalRefusal, bind_execution, reset_execution
+from gateway import run as gateway_run
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms import api_server_b2b as b2b
+from gateway.run import _profile_runtime_scope
 from hermes_state import SessionDB
 from tests.gateway import test_api_server_b2b_admission as admission
 from tests.gateway import test_api_server_b2b_execution_lane as execution_lane
@@ -232,3 +239,144 @@ async def test_legacy_project_alone_on_served_g2_gets_403(
         tmp_path, monkeypatch, over):
     await _assert_legacy_route_refused(
         tmp_path, monkeypatch, over, serve_g2=True)
+
+
+@pytest.fixture
+def provider_endpoint():
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def parse_request(self):
+            ok = super().parse_request()
+            requests.append(self.command)
+            return ok
+
+    with HTTPServer(("127.0.0.1", 0), Handler) as server:
+        assert server.server_port >= 20000
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02})
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}/v1"
+        finally:
+            server.shutdown()
+            thread.join()
+            assert requests == []
+
+
+def _bind_legacy(base_url):
+    project = native._project_entry(
+        native=False, project_id=native.LEGACY_PROJECT,
+        provider="custom:legacy-lane", base_url=base_url)
+    adapter = SimpleNamespace(_extra={"b2b": native._raw_config(
+        projects={native.LEGACY_PROJECT: project})})
+    b2b.bind_b2b_state(adapter)
+    return adapter._b2b_state.config.profiles["deploy"]["projects"][native.LEGACY_PROJECT]
+
+
+@pytest.mark.parametrize("variant", ["base_url", "api", "localhost", "ipv6"])
+def test_startup_refuses_served_g2_addresses(tmp_path, provider_endpoint, variant):
+    other = "http://127.0.0.1:22001/v1"
+    entry = {
+        "base_url": {"api": other, "base_url": provider_endpoint},
+        "api": {"api": provider_endpoint, "base_url": other},
+        "localhost": {"url": provider_endpoint.replace("http://127.0.0.1", "HTTP://LOCALHOST") + "/"},
+        "ipv6": {"url": provider_endpoint.replace("127.0.0.1", "[::1]")},
+    }[variant]
+    (tmp_path / "config.yaml").write_text(json.dumps({"providers": {"b2b-g2": entry}}))
+    with _profile_runtime_scope(tmp_path, hydrate_secrets=False):
+        with TestCase().assertRaisesRegex(b2b.B2BConfigError, "native G2 catalogue"):
+            _bind_legacy(provider_endpoint)
+
+
+@pytest.mark.parametrize("error", ["broken-yaml", "missing", "unreadable"])
+def test_startup_refuses_unreadable_gateway_config(tmp_path, provider_endpoint, error):
+    path = tmp_path / "config.yaml"
+    path.write_text("model: {}\n")
+    with _profile_runtime_scope(tmp_path, hydrate_secrets=False):
+        _bind_legacy(provider_endpoint)
+        if error == "broken-yaml":
+            path.write_text("providers: [\n")
+        else:
+            path.unlink()
+            if error == "unreadable":
+                path.mkdir()
+        with TestCase().assertRaisesRegex(b2b.B2BConfigError, "gateway config"):
+            _bind_legacy(provider_endpoint)
+
+
+def test_unreadable_managed_config_never_becomes_an_empty_catalogue(tmp_path, monkeypatch, provider_endpoint):
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    (tmp_path / "config.yaml").write_text("model: {}\n")
+    with _profile_runtime_scope(tmp_path, hydrate_secrets=False):
+        (managed / "config.yaml").write_text("{}\n")
+        _bind_legacy(provider_endpoint)
+        (managed / "config.yaml").write_text("providers: [\n")
+        with TestCase().assertRaisesRegex(b2b.B2BConfigError, "gateway config"):
+            _bind_legacy(provider_endpoint)
+
+
+@pytest.mark.parametrize("change", [
+    "moved-url", "renamed", "resolved-url", "resolved-name", "during-resolution", "effective-url",
+    "effective-name", "unreadable", "off-g2"])
+def test_legacy_at_provider_resolution(tmp_path, monkeypatch, provider_endpoint, change):
+    config = {
+        "model": {"context_length": 256000}, "compression": {"enabled": False},
+        "providers": {"legacy-lane": {"name": "Legacy Lane", "base_url": provider_endpoint,
+                                      "api_key": "unit-legacy-only"},
+                      "b2b-g2": {"name": "Original G2", "base_url": "http://127.0.0.1:22001/v1",
+                                 "api_key": "unit-native-only"}},
+    }
+    pin = "http://127.0.0.1:22002/v1" if change in ("resolved-url", "effective-url") else provider_endpoint
+    config["providers"]["legacy-lane"]["base_url"] = pin
+    path = tmp_path / "config.yaml"
+    path.write_text(json.dumps(config))
+    with _profile_runtime_scope(tmp_path, hydrate_secrets=False):
+        project = _bind_legacy(pin)
+        lane = execution_lane._ready_lane(tmp_path)
+        execution_lane._rebind_project(lane, **project)
+        ctor = Mock(side_effect=execution_lane._LaneAgent)
+        monkeypatch.setattr("run_agent.AIAgent", ctor)
+        if change == "moved-url":
+            config["providers"]["b2b-g2"]["base_url"] = provider_endpoint
+            # If invoked, the generic resolver could probe this model-less default.
+            config["model"].update(default="", base_url=provider_endpoint)
+        elif change == "renamed":
+            config["providers"]["b2b-g2"]["name"] = "Legacy Lane"
+        elif change == "resolved-url":
+            for entry in config["providers"].values():
+                entry["base_url"] = provider_endpoint
+        elif change == "resolved-name":
+            for entry in config["providers"].values():
+                entry["name"] = "New G2"
+        elif change in ("during-resolution", "effective-url", "effective-name"):
+            resolve = gateway_run._resolve_runtime_agent_kwargs_for_provider
+
+            def move_while_resolving(*args, **kwargs):
+                # The real credential ladder sees a later edit than the preflight.
+                for entry in config["providers"].values():
+                    if change == "effective-name":
+                        entry["name"] = "Renamed During Resolution"
+                    else:
+                        entry["base_url"] = provider_endpoint
+                path.write_text(json.dumps(config))
+                return resolve(*args, **kwargs)
+
+            monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs_for_provider", move_while_resolving)
+        path.write_text("providers: [\n" if change == "unreadable" else json.dumps(config))
+        token = bind_execution(lane.cap)
+        try:
+            if change == "off-g2":
+                agent = execution_lane._construct(lane)
+                assert (agent.provider, agent.model, agent.base_url, agent.api_key) == (
+                    project["provider"], "legacy-model", provider_endpoint, "unit-legacy-only")
+                agent.session_db.close()
+            else:
+                with TestCase().assertRaisesRegex(B2BTerminalRefusal, "^model_authorization_missing$"):
+                    execution_lane._construct(lane)
+                ctor.assert_not_called()
+                assert lane.store.b2b_attempt(profile=lane.profile, attempt_id=lane.attempt_id)["status"] == "policy_changed"
+        finally:
+            reset_execution(token)
+            lane.store.close()

@@ -12,10 +12,15 @@ import os
 import re
 import types
 from typing import Any, Dict, Mapping, Optional
+from urllib.parse import urlsplit
 
 from agent.b2b_execution import B2B_MISSION_ID, _deep_freeze
 from gateway.platforms import api_server_b2b_native_authorization as _native_auth
-from hermes_cli.providers import custom_provider_aliases
+from hermes_cli import managed_scope
+from hermes_cli.config import require_readable_config_before_write
+from hermes_cli.config_effective import load_user_config_effective
+from hermes_cli.config_providers import _pick_provider_base_url, get_compatible_custom_providers
+from hermes_cli.providers import custom_provider_aliases, resolve_custom_provider
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 # Lot-1 native N2 lane: the catalogue may opt a project in with an exact
@@ -89,7 +94,39 @@ def _normalized_model_name(value: Any) -> str:
 
 
 def _route_url(value: Any) -> str:
-    return value.strip().rstrip("/") if isinstance(value, str) else ""
+    raw = value.strip().rstrip("/") if isinstance(value, str) else ""
+    try:
+        parts = urlsplit(raw)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return raw
+    if not host or parts.scheme not in ("http", "https"):
+        return raw
+    if host in ("localhost", "::1"):
+        host = "127.0.0.1"
+    elif ":" in host:
+        host = f"[{host}]"
+    if port is None:
+        port = 80 if parts.scheme == "http" else 443
+    return parts._replace(netloc=f"{host}:{port}").geturl()
+
+
+def load_b2b_gateway_config() -> dict:
+    """Read the served profile without the gateway's last-good/empty error fallback."""
+    from gateway.run import _gateway_config_home
+    try:
+        # The managed overlay has its own fail-open reader. Distinguish a
+        # genuinely absent/empty layer from an unreadable or ignored policy.
+        managed = managed_scope.get_managed_dir()
+        if managed is not None and not managed_scope.apply_managed_overlay({}):
+            if require_readable_config_before_write(managed / "config.yaml"):
+                raise ValueError("managed overlay unavailable")
+        config = load_user_config_effective(_gateway_config_home() / "config.yaml", fail_closed=True)
+    except Exception as exc:
+        raise B2BConfigError("b2b: cannot load gateway config") from exc
+    if not config:
+        raise B2BConfigError("b2b: missing gateway config")
+    return config
 
 
 _G2_PROVIDER_KEY = "b2b-g2"
@@ -107,12 +144,31 @@ def _g2_route_identity(gateway_config: Any) -> tuple:
     if isinstance(entry, Mapping):
         aliases.update(custom_provider_aliases(
             entry.get("name") or _G2_PROVIDER_KEY, _G2_PROVIDER_KEY))
-        for key in ("api", "url", "base_url"):
-            url = entry.get(key)
-            if isinstance(url, str) and url.strip():
-                urls.add(_route_url(url))
-                break
+        # The CLI picker and the named runtime can prefer different declared
+        # URLs. Protect the picker result without dropping the older spellings.
+        picked = _pick_provider_base_url({"base_url": entry.get("baseUrl"), **entry}, _G2_PROVIDER_KEY)
+        for value in (picked, entry.get("api"), entry.get("url")):
+            if url := _route_url(value):
+                urls.add(url)
     return frozenset(aliases), frozenset(urls)
+
+
+def resolved_route_targets_g2(runtime: Mapping, named: Mapping, config: Mapping) -> bool:
+    aliases, urls = _g2_route_identity(config)
+    provider = runtime.get("provider")
+    effective = custom_provider_aliases(named.get("name"), named.get("provider_key"))
+    if named:
+        effective |= custom_provider_aliases(runtime.get("requested_provider"))
+    if provider == "custom" and runtime.get("requested_provider") not in (None, "custom") and named:
+        # The runtime exposes a transport label. Recover the named identity
+        # against the *same* freshly loaded config as G2, not just the preflight name.
+        selected = resolve_custom_provider(runtime["requested_provider"], get_compatible_custom_providers(config))
+        if selected:
+            effective |= custom_provider_aliases(selected.name, selected.id)
+    if provider != "custom" or not named:
+        effective |= custom_provider_aliases(provider)
+    return (bool(aliases & effective) or _route_url(runtime.get("base_url")) in urls
+            or _route_url(named.get("base_url")) in urls)
 
 
 def _native_catalogue(profiles: Mapping[str, Any]) -> tuple:

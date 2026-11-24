@@ -196,8 +196,11 @@ async def test_core_preparation_to_one_fake_provider_receipt(tmp_path, monkeypat
         # including /tmp. Do not bypass its check in the composition.
         path = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix=".authz-", dir=core)))
         installation = Installation(stack, path, core)
-        await lane.test_native_http_prepare_admission_replay_and_revocation(
-            tmp_path, monkeypatch, None, "valid", installation=installation)
+        async with lane.native_http_lane(tmp_path, monkeypatch, installation=installation) as scenario:
+            await scenario.authorize()
+            admission = await scenario.admit()
+            scenario.assert_sealed()
+            await scenario.assert_consumed(admission)
         assert len(installation.relay.records) == 1
         assert (path / lane.ATTEMPT).read_text() == installation.sha
         state = installation.gateway.state

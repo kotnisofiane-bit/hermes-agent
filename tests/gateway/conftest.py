@@ -40,6 +40,20 @@ from unittest.mock import MagicMock
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _b2b_serving_config(request, monkeypatch):
+    """B2B adapter tests inject extra in memory but still need a readable serving config."""
+    if not request.path.name.startswith("test_api_server_b2b"):
+        return
+    from gateway import run
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home()
+    monkeypatch.setattr(run, "_hermes_home", home)
+    path = home / "config.yaml"
+    if not path.exists():
+        path.write_text("providers: {}\n", encoding="utf-8")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _bind_lark_sdk_globals_when_installed():
     """Bind the feishu adapter's lark SDK globals once per test session.
@@ -610,4 +624,3 @@ def _write_guard_cache_atomic(cache_file: Path, content: str) -> None:
             tmp.unlink(missing_ok=True)
         except OSError:
             pass
-

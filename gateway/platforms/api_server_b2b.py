@@ -40,7 +40,7 @@ from agent.b2b_execution import (
     extract_allowed_refs)
 from gateway.platforms import api_server_b2b_native_authorization as _native_auth
 from gateway.platforms.api_server_b2b_native_validation import (
-    B2BConfig, B2BConfigError, validate_b2b_config, _MISSION_ID,
+    B2BConfig, B2BConfigError, load_b2b_gateway_config, validate_b2b_config, _MISSION_ID,
     _OBSERVATION_KEYS, _PROFILE_NAME, _PROJECT_ID, _exact_keys,
     _legacy_targets_native_gateway, _native_binding, _native_catalogue,
     _scalar_ok, _valid_mission_request,
@@ -461,8 +461,7 @@ def bind_b2b_state(adapter: Any) -> None:
         getattr(adapter, "config", None), "extra", None) or {}
     gateway_config = None
     if isinstance(extra, Mapping) and "b2b" in extra:
-        from gateway.run import _load_gateway_config
-        gateway_config = _load_gateway_config()
+        gateway_config = load_b2b_gateway_config()
     adapter._b2b_state = _B2BState(
         validate_b2b_config(extra, gateway_config=gateway_config))
 
@@ -663,7 +662,7 @@ _BLOCK_POLICY_CHANGED_REASONS = frozenset({
     "b2b_sdk_override", "b2b_sdk_headers", "b2b_client_policy",
     "b2b_retries_not_disabled", "b2b_request_client_not_isolated",
     "b2b_timeout_policy", "terminal_guard_required", "kwargs_not_permitted",
-    "b2b_recipe_messages_mismatch",
+    "b2b_recipe_messages_mismatch", "model_authorization_missing",
 })
 _BLOCK_SOURCE_DENIED_REASONS = frozenset({
     "source_before_provider_denied", "source_before_seal_denied",

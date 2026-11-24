@@ -617,7 +617,7 @@ def test_construct_b2b_agent_pinned_openrouter_route(tmp_path, monkeypatch):
     lane.store.close()
 
 
-def _write_named_provider_config(home, *, named_url, default_url):
+def _write_named_provider_config(home, *, named_url, default_url, name="b2b-g2", key_env="B2B_G2_API_KEY"):
     """Serving config whose DEFAULT route is unrelated (openrouter) while a
     ``providers:`` entry owns the pinned endpoint the project names."""
     with open(os.path.join(str(home), "config.yaml"), "w") as fh:
@@ -626,29 +626,29 @@ def _write_named_provider_config(home, *, named_url, default_url):
             f'  base_url: "{default_url}"\n'
             "  api_mode: chat_completions\n  context_length: 256000\n"
             "compression:\n  enabled: false\n"
-            "providers:\n  b2b-g2:\n"
-            '    name: "b2b-g2"\n'
+            f"providers:\n  {name}:\n"
+            f'    name: "{name}"\n'
             f'    base_url: "{named_url}"\n'
-            '    key_env: "B2B_G2_API_KEY"\n'
+            f'    key_env: "{key_env}"\n'
             '    api_mode: "chat_completions"\n')
 
 
 def test_construct_b2b_agent_named_custom_provider(tmp_path, monkeypatch):
-    """``custom:b2b-g2`` pin: the named ``providers:`` entry supplies the ONLY
+    """A named legacy pin: the named ``providers:`` entry supplies the ONLY
     route — its key_env credential lands on the agent while the unrelated
     openrouter default route and foreign keys are never touched."""
     lane = _ready_lane(tmp_path)
-    named_url = "http://127.0.0.1:8443/v1"
-    sentinel = "sk-unit-b2bg2-" + "7" * 8
-    _rebind_project(lane, provider="custom:b2b-g2", base_url=named_url,
-                    model="b2b-g2-model")
+    named_url = "http://127.0.0.1:28443/v1"
+    sentinel = "sk-unit-legacy-" + "7" * 8
+    _rebind_project(lane, provider="custom:legacy", base_url=named_url,
+                    model="legacy-model")
     from hermes_constants import get_hermes_home
     import gateway.run as gw_run
     monkeypatch.setattr(gw_run, "_hermes_home", get_hermes_home())
     _write_named_provider_config(
         get_hermes_home(), named_url=named_url,
-        default_url="http://127.0.0.1:9/v1")
-    monkeypatch.setenv("B2B_G2_API_KEY", sentinel)
+        default_url="http://127.0.0.1:29999/v1", name="legacy", key_env="LEGACY_TEST_KEY")
+    monkeypatch.setenv("LEGACY_TEST_KEY", sentinel)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-unit-unrelated-" + "0" * 8)
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-unit-unrelated-" + "1" * 8)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
@@ -676,7 +676,7 @@ def test_construct_b2b_agent_named_custom_provider(tmp_path, monkeypatch):
         reset_execution(cap_token)
         _api_request_profile.reset(token)
     assert agent.api_key == sentinel
-    assert agent.model == "b2b-g2-model"
+    assert agent.model == "legacy-model"
     assert str(agent.base_url).rstrip("/") == named_url.rstrip("/")
     assert agent._runtime_context_length == 256000
     assert agent.context_compressor.context_length == 256000
