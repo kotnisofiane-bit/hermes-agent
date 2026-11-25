@@ -368,6 +368,16 @@ def construct_b2b_agent(adapter: Any, cap: Any, *, session_id: Optional[str],
         gateway_session_key=None, memory_manager=None,
         checkpoints_enabled=False,
         skip_memory=True, skip_context_files=True)
+    if project.get("native_n4") is not None:
+        # The isolated SDK client is built from these kwargs. Its HTTP
+        # headers are case-insensitive but its default/override DICT merge
+        # is not. Only the bound worker may supply native identity headers.
+        headers = agent._client_kwargs.get("default_headers")
+        if headers:
+            reserved = {"x-dubsar-profile-id", "x-dubsar-context-id",
+                        "x-dubsar-attempt-id", "x-dubsar-request-digest"}
+            agent._client_kwargs["default_headers"] = {
+                k: v for k, v in headers.items() if k.lower() not in reserved}
     agent._hermes_api_runtime = {
         "provider": project["provider"], "model": project["model"],
         "route_source": "b2b_policy"}

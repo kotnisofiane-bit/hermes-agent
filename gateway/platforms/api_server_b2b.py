@@ -40,7 +40,8 @@ from agent.b2b_execution import (
     extract_allowed_refs)
 from gateway.platforms import api_server_b2b_native_authorization as _native_auth
 from gateway.platforms.api_server_b2b_native_validation import (
-    B2BConfig, B2BConfigError, load_b2b_gateway_config, validate_b2b_config, _MISSION_ID,
+    B2BConfig, B2BConfigError, B2BModelGatewayUnavailable, load_b2b_gateway_config,
+    probe_model_gateways, validate_b2b_config, _MISSION_ID,
     _OBSERVATION_KEYS, _PROFILE_NAME, _PROJECT_ID, _exact_keys,
     _legacy_targets_native_gateway, _native_binding, _native_catalogue,
     _scalar_ok, _valid_mission_request,
@@ -89,10 +90,6 @@ _RESPONSE_BODY_KEYS_NATIVE = _RESPONSE_BODY_KEYS | frozenset(
 _ATTEMPT_FORMAT = "dubsar.b2b-proposal-attempt/1"
 _ATTEMPT_OPERATION = "proposal-v1"
 _PREPARED_OPERATION = "prepared"
-
-
-class B2BModelGatewayUnavailable(RuntimeError):
-    """A transient startup probe failure; the lane stays closed until retry."""
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +441,7 @@ class _B2BState:
 
     def __init__(self, config: B2BConfig):
         self.config = config
+        self.preparations = _native_auth.SlotPreparations()
         keys = {}
         if config.enabled:
             for name, entry in config.profiles.items():
@@ -467,27 +465,16 @@ def bind_b2b_state(adapter: Any) -> None:
 
 
 async def validate_b2b_model_gateway(adapter: Any) -> None:
-    """Require G2's unauthenticated refusal before exposing the B2B lane."""
+    """Probe every URL needed by an executable project, even if shared with a slot."""
     state = _state_for(adapter)
     if state is None or not state.config.enabled:
         return
-    import aiohttp
     urls = sorted({project["base_url"]
                    for entry in state.config.profiles.values()
-                   for project in entry["projects"].values()})
-    try:
-        async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=1.0), trust_env=False,
-                cookie_jar=aiohttp.DummyCookieJar()) as client:
-            for url in urls:
-                async with client.post(
-                        url + "/chat/completions", data=b"",
-                        allow_redirects=False) as response:
-                    if response.status != 401:
-                        raise B2BConfigError(
-                            "b2b config: model gateway must refuse unauthenticated POST with 401; redirects forbidden")
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        raise B2BModelGatewayUnavailable("b2b model gateway startup probe unavailable") from None
+                   for project in entry["projects"].values()
+                   if "authorization_slot" not in project.get("native_n2", {})})
+    if urls:
+        await probe_model_gateways(urls)
 
 
 def _deny(code: int, reason: str):
@@ -547,6 +534,8 @@ def _policy_digest(profile: str, entry: Mapping[str, Any], project: Mapping[str,
         basis["native_n2_binding"] = resolved.get("native_n2_binding")
         basis["native_n2_messages_digest"] = resolved.get("native_n2_messages_digest")
         basis["native_n4"] = project.get("native_n4")
+        if "authorization_slot" in project["native_n2"]:
+            basis["published_approval"] = resolved["project"]["native_n2"].get("run_authorization")
     # Optional operator key: absent from the digest basis unless explicitly
     # configured, so a pre-versioning admission replays byte-for-byte while a
     # configured value still revokes a running cap when changed mid-run.
@@ -723,7 +712,10 @@ class _AttemptSink:
         self.attempt_id, self.session_id = attempt_id, session_id
         self.binding_digest, self.run_id = binding_digest, run_id
         self.policy = _deep_freeze(policy)
-        self._fingerprint = _policy_digest(profile, entry, self.policy["project"], self.policy)
+        # Fingerprint the operator catalogue AND the publication pinned in the
+        # run policy. A slot is never rebound by materializing a run's snapshot.
+        self._catalog_project = entry["projects"][policy["project_binding_id"]]
+        self._fingerprint = _policy_digest(profile, entry, self._catalog_project, self.policy)
         self._before_provider = None
         self.context_receipt = None
         # Frozen at durable admission: every post-admission source recheck
@@ -793,13 +785,26 @@ class _AttemptSink:
                 return False
         return True
 
+    def _run_approval(self):
+        project = self.policy["project"]
+        if _native_auth.pin_run_project(self._catalog_project)["native_n2"] != project["native_n2"]:
+            raise _native_auth.AuthorizationRefused("revoked")
+        return _native_auth.read_approval(project, now=self._admission_now)
+
+    def _assert_slot_published(self, reason):
+        if "authorization_slot" in self._catalog_project.get("native_n2", {}):
+            try:
+                self._run_approval()
+            except _native_auth.AuthorizationRefused:
+                self.block(reason)
+                raise B2BTerminalRefusal(reason) from None
+
     def _native_run_current(self, resolved: Mapping[str, Any]) -> bool:
         """Protected manifest re-read: the record must still pin exactly this
         run's binding, this exchange's request/source digests and the approved
         messages digest."""
-        project = self.policy.get("project")
         try:
-            claim = _native_auth.read_approval(project, now=self._admission_now)
+            claim = self._run_approval()
         except _native_auth.AuthorizationRefused:
             return False
         manifest = claim["n2"]
@@ -907,6 +912,7 @@ class _AttemptSink:
             "rendered_digest": receipt.rendered_digest,
             "model": self.policy["project"]["model"],
             "provider": self.policy["project"]["provider"], "committed_at": now})
+        self._assert_slot_published("source_before_provider_denied")
         window_now = time.time()
         if not all(env["issued_at"] <= window_now < env["expires_at"] for env in
                    (resolved["_signed_request"], resolved["_signed_response"])):
@@ -1105,11 +1111,12 @@ class _AttemptSink:
 
         The signed source window is re-verified HERE on host data — the
         async prepare→commit seam admits scheduling delay, so the window a
-        timely preparation observed may have closed by commit. Pure
-        timestamp arithmetic: no plugin callback, no revalidation."""
+        timely preparation observed may have closed by commit. No plugin
+        callback; a slot must still publish the identical approved bytes."""
         from gateway.platforms.api_server_b2b_context import (
             assert_context_source_current)
         window = prepared["source_window"]
+        self._assert_slot_published("source_before_seal_denied")
         now = time.time()
         if not all(env["issued_at"] <= now < env["expires_at"] for env in
                    (window["request"], window["response"])):
@@ -1238,6 +1245,20 @@ async def _b2b_run_bounded_preparation(adapter: Any, *, profile: str,
     return None
 
 
+def _source_policy(resolved, home, project):
+    """The same source identity on the preparation and admission capabilities."""
+    keys = ("profile", "session_id", "binding_digest", "attempt_id", "requester_id",
+            "project_id", "project_binding_id", "mission_id", "mission_revision",
+            "reservation_ref", "request_digest", "ticket_digest", "authority_basis_digest",
+            "authority_digest", "observation_genesis", "mission_request")
+    policy = {key: resolved[key] for key in keys}
+    policy.update(profile_home=str(home), project=project, schema_pins=R2_SCHEMA_PINS,
+                  execution_policy="h1/proposal-v1")
+    if resolved.get("_native_binding") is not None:
+        policy["native_n2_binding"] = resolved["_native_binding"]
+    return policy
+
+
 async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, keys,
                           session_id: str, binding_digest: str, attempt_id: str,
                           resolved: Dict[str, Any], store: Any, db: Any):
@@ -1305,10 +1326,18 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             binding_digest=binding_digest, session_id=session_id)
     native_binding = resolved.get("_native_binding")
     native_messages_digest = None
+    slot = project.get("native_n2", {}).get("authorization_slot")
+    stamp = None
+    run_project = project
     if project.get("native_n2") is not None:
         try:
-            claim = _native_auth.read_approval(project)
+            run_project = _native_auth.pin_run_project(project)
+            claim = _native_auth.read_approval(run_project)
             _native_auth.check_source(claim, resolved)
+            if slot is not None:
+                if state is None or state.config.profile_entry(profile) is not entry:
+                    raise _native_auth.AuthorizationRefused("preparation")
+                stamp = state.preparations.for_claim(resolved, claim)
         except _native_auth.AuthorizationRefused as exc:
             return _deny(403, str(exc))
         native_messages_digest = claim["n2"]["messages_digest"]
@@ -1326,25 +1355,10 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     # sink/cap are simply dropped. Legacy lanes keep their idempotent replay;
     # a native retry is a consumed authorization: answer with the durable
     # attempt identity and never launch a second worker.
-    policy = {
-        "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
-        "attempt_id": attempt_id, "profile_home": str(home),
-        "schema_pins": R2_SCHEMA_PINS, "execution_policy": "h1/proposal-v1",
-        "requester_id": resolved["requester_id"],
-        "project_id": resolved["project_id"],
-        "project_binding_id": resolved["project_binding_id"],
-        "mission_id": resolved["mission_id"], "mission_revision": resolved["mission_revision"],
-        "reservation_ref": resolved["reservation_ref"],
-        "request_digest": resolved["request_digest"],
-        "ticket_digest": resolved["ticket_digest"],
-        "authority_basis_digest": resolved["authority_basis_digest"],
-        "authority_digest": resolved["authority_digest"],
-        "observation_genesis": resolved["observation_genesis"],
-        "mission_request": resolved["mission_request"], "project": project,
-        **({"native_n2_binding": native_binding,
-            "native_n2_messages_digest": native_messages_digest,
-            "native_n4_result_public_key": claim["result_public_key"]}
-           if native_binding is not None else {})}
+    policy = _source_policy(resolved, home, run_project)
+    if native_binding is not None:
+        policy.update(native_n2_messages_digest=native_messages_digest,
+                      native_n4_result_public_key=claim["result_public_key"])
     fingerprint = _policy_digest(profile, entry, project, policy)
     scope = _run_scope(profile, resolved["requester_id"], binding_digest)
     initial_status = {"status": "queued", "session_id": session_id, "created_at": time.time()}
@@ -1365,7 +1379,7 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             attempt_id=attempt_id, run_id=run_id, policy=dict(policy),
             sink=sink, created_at=time.time())
         denied = await _b2b_run_bounded_preparation(
-            adapter, profile=profile, project=project, cap=cap, sink=sink,
+            adapter, profile=profile, project=run_project, cap=cap, sink=sink,
             resolved=resolved)
         if denied is not None:
             return denied
@@ -1377,21 +1391,19 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
         if native_binding is not None:
             try:
                 _native_auth.check_preparation(claim, resolved, sink._context_preparation)
+                if slot is not None:
+                    state.preparations.verify(stamp, resolved, claim, sink._context_preparation)
+                    await probe_model_gateways((project["base_url"],))
             except _native_auth.AuthorizationRefused as exc:
                 return _deny(403, str(exc))
+            except (B2BConfigError, B2BModelGatewayUnavailable):
+                return _deny(503, "model_gateway_unavailable")
     if existing_attempt is None:
         # Inherited generic API admission, kept at
         # its original place — not a B2B capacity gate.
         limited = adapter._concurrency_limited_response()
         if limited is not None:
             return limited
-    # Signed proof can expire while session/DB checks were awaited: re-verify the
-    # freshness window on BOTH envelopes immediately before the durable commit —
-    # same predicate the CAS/seal paths apply to their own source reads.
-    now = int(time.time())
-    if not all(env["issued_at"] <= now < env["expires_at"] for env in
-               (resolved["_signed_request"], resolved["_signed_response"])):
-        return _deny(403, "source_denied")
     if existing_attempt is None:
         # Non-hydrating scope entry — introspection only, never plugin
         # secret-source code on the loop.
@@ -1413,14 +1425,24 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                    "run_id": run_id, "requester_id": resolved["requester_id"],
                    "source_bind": _source_record(resolved)}
     if cap is not None:
+        if slot is not None and (state is not _state_for(adapter)
+                                 or not state.preparations.current(resolved, stamp)):
+            if store.b2b_attempt(profile=profile, attempt_id=attempt_id) is not None:
+                return _consumed_response(store, profile=profile, attempt_id=attempt_id,
+                                          binding_digest=binding_digest, session_id=session_id)
+            return _deny(403, "model_authorization_preparation")
+        if native_binding is not None and not sink._native_run_current(resolved):
+            return _deny(403, "model_authorization_revoked")
         try:
             assert_context_source_current(sink._context_preparation)
         except B2BTerminalRefusal as exc:
             return _deny(503, str(exc))
-        if (native_binding is not None
-                and not sink._native_run_current(resolved)):
-            # Revocation during bounded preparation must not consume admission.
-            return _deny(403, "model_authorization_revoked")
+    # The source exchange, live publication and OC proof can expire during
+    # preflight, including the G2 probe. Never extend a window for the commit.
+    now = int(time.time())
+    if not all(env["issued_at"] <= now < env["expires_at"] for env in
+               (resolved["_signed_request"], resolved["_signed_response"])):
+        return _deny(403, "source_denied")
     outcome = store.b2b_admit(
         profile=profile, session_id=session_id, binding_digest=binding_digest,
         attempt_id=attempt_id, fingerprint=fingerprint,
@@ -1442,6 +1464,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                 binding_digest=binding_digest, session_id=session_id)
         return _replayed_response(adapter, stored_run_id, attempt_id, binding_digest, profile, session_id)
     adapter._run_idempotency_ids.add(stored_run_id)
+    if slot is not None:
+        state.preparations.forget(resolved)
     if native_binding is not None:
         # The attempt row was committed inside b2b_admit: its created_at IS the
         # consumption instant. Freeze it for every later manifest re-read.
@@ -1562,23 +1586,7 @@ async def _prepare_b2b_only(adapter: Any, request: Any, *, profile: str, entry, 
     project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
-    policy = {
-        "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
-        "attempt_id": attempt_id, "profile_home": str(home),
-        "schema_pins": R2_SCHEMA_PINS, "execution_policy": "h1/proposal-v1",
-        "requester_id": resolved["requester_id"],
-        "project_id": resolved["project_id"],
-        "project_binding_id": resolved["project_binding_id"],
-        "mission_id": resolved["mission_id"], "mission_revision": resolved["mission_revision"],
-        "reservation_ref": resolved["reservation_ref"],
-        "request_digest": resolved["request_digest"],
-        "ticket_digest": resolved["ticket_digest"],
-        "authority_basis_digest": resolved["authority_basis_digest"],
-        "authority_digest": resolved["authority_digest"],
-        "observation_genesis": resolved["observation_genesis"],
-        "mission_request": resolved["mission_request"], "project": project,
-        **({"native_n2_binding": resolved.get("_native_binding")}
-           if resolved.get("_native_binding") is not None else {})}
+    policy = _source_policy(resolved, home, project)
     # The sink + cap exist ONLY in memory — the run_id minted here is the
     # capability's identity, NEVER admitted, scheduled or returned: the
     # attestation's run_id is null. A failed preparation drops both with
@@ -1662,6 +1670,14 @@ async def _prepare_b2b_only(adapter: Any, request: Any, *, profile: str, entry, 
                             resolved["mission_request"], preparation.rendered))
     envelope, _ = _signed_envelope(
         entry, keys, _PREPARED_OPERATION, body, request_id=request_id)
+    if "authorization_slot" in project.get("native_n2", {}):
+        state = _state_for(adapter)
+        if state is None or state.config.profile_entry(profile) is not entry:
+            return _deny(403, "model_authorization_preparation")
+        try:
+            state.preparations.remember(resolved, envelope, proof["view"])
+        except _native_auth.AuthorizationRefused as exc:
+            return _deny(409, str(exc))
     return web.json_response(envelope)
 
 
