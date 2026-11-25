@@ -100,6 +100,10 @@ def _binding_for(project=PROJECT, mission=MISSION, requester=REQUESTER):
 BINDING = _binding_for()
 SESSION = "b2b_" + BINDING
 ATTEMPT = m._attempt_id_for(BINDING)
+SECOND_REQUESTER = "6" * 24
+SECOND_BINDING = _binding_for(requester=SECOND_REQUESTER)
+SECOND_SESSION = "b2b_" + SECOND_BINDING
+SECOND_ATTEMPT = m._attempt_id_for(SECOND_BINDING)
 
 
 @pytest.mark.asyncio
@@ -205,6 +209,78 @@ async def test_slot_server_boots_and_prepares_with_g2_down(tmp_path, monkeypatch
             lane.spawn.assert_not_awaited()
         finally:
             await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_identical_second_prepare_preserves_the_issued_approval(tmp_path, monkeypatch):
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        first_response, first, _ = await lane.prepare()
+        assert first_response.status == 200, first
+        _publish_test_slot(lane, first)
+        real_time = m.time
+
+        class _ShiftedClock:
+            def time(self):
+                return real_time.time() + 1
+
+            def __getattr__(self, name):
+                return getattr(real_time, name)
+
+        monkeypatch.setattr(m, "time", _ShiftedClock())
+        try:
+            second_response = await lane.post(
+                "prepare", request_id=str(uuid.uuid4()))
+            second = await second_response.json()
+        finally:
+            monkeypatch.setattr(m, "time", real_time)
+        assert second_response.status == 200, second
+        assert second["issued_at"] >= first["issued_at"] + 1
+        await lane.admit()
+        lane.assert_sealed()
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_live_slot_refuses_a_second_preparation_until_terminal(tmp_path, monkeypatch):
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        prepared_response, prepared, _ = await lane.prepare()
+        assert prepared_response.status == 200, prepared
+        _publish_test_slot(lane, prepared)
+        slot = lane.project["native_n2"]["authorization_slot"]
+        lane.provider_gate = asyncio.Event()
+        try:
+            admission = await lane.post("proposal")
+            assert admission.status == 200, await admission.json()
+            for _ in range(400):
+                attempt = lane.store.b2b_attempt(profile="deploy", attempt_id=ATTEMPT)
+                if attempt and attempt["status"] == "dispatch_committed":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("first run never reached the dispatch fence")
+            assert lane.store.b2b_slot_in_use(slot=slot)
+
+            lane.adapter._session_db.create_session(
+                SECOND_SESSION, "api_server", profile_name="deploy")
+            second = await lane.client.post(
+                f"/p/deploy/api/sessions/{SECOND_SESSION}/b2b-prepare",
+                headers={"Authorization": f"Bearer {adm._API_KEY}",
+                         "Idempotency-Key": SECOND_ATTEMPT},
+                json={"attempt_id": SECOND_ATTEMPT, "binding_digest": SECOND_BINDING,
+                      "request_id": str(uuid.uuid4())})
+            refused = await second.json()
+            assert second.status == 409, refused
+            assert refused["code"] == "slot_busy"
+        finally:
+            lane.provider_gate.set()
+        for _ in range(400):
+            if lane.store.b2b_artifact(attempt_id=ATTEMPT, kind="proposal") is not None:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("first run never sealed")
+        assert not lane.store.b2b_slot_in_use(slot=slot)
 
 
 @pytest.mark.asyncio
@@ -1453,6 +1529,7 @@ class _NativeHttpLane:
         self.core_key = Ed25519PrivateKey.generate()
         self.result_key = Ed25519PrivateKey.generate()
         self.approval_sha = None
+        self.provider_gate = None
 
         self.revoked = False
         self.changed_authority = False
@@ -1464,7 +1541,13 @@ class _NativeHttpLane:
         if self.revoke_at == purpose and not self.revoked:
             self.manifest_path.unlink(missing_ok=True)
             self.revoked = True
-        body = _resolved_body(request_env, docs=self.documents, refs=self.native_references)
+        if request_env["body"].get("attempt_id") == SECOND_ATTEMPT:
+            body = _resolved_body(
+                request_env, binding=SECOND_BINDING, requester_id=SECOND_REQUESTER,
+                docs=self.documents, refs=self.native_references)
+        else:
+            body = _resolved_body(
+                request_env, docs=self.documents, refs=self.native_references)
         body["authority_basis_digest"] = "sha256:" + "ab" * 32
         body["authority_digest"] = "sha256:" + "cd" * 32
         if self.changed_authority:
@@ -1485,6 +1568,8 @@ class _NativeHttpLane:
         raw = await request.read()
         if not request.headers.get("Authorization"):
             return web.Response(status=401)
+        if self.provider_gate is not None:
+            await self.provider_gate.wait()
         payload = json.loads(raw)
         self.provider_requests.append(payload)
         if self.authorization == "expire_after_admission":

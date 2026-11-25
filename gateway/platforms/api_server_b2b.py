@@ -1308,6 +1308,12 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
+    slot = project.get("native_n2", {}).get("authorization_slot")
+    if (slot is not None and store.b2b_slot_in_use(
+            slot=slot, exclude_profile=profile, exclude_attempt_id=attempt_id)):
+        # One physical approval slot cannot protect two live runs: a later
+        # publication would revoke the earlier one before its result is sealed.
+        return _deny(409, "slot_busy")
     state = _state_for(adapter)
     if state is not None:
         native_models = state.config.g2_models
@@ -1586,6 +1592,11 @@ async def _prepare_b2b_only(adapter: Any, request: Any, *, profile: str, entry, 
     project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
+    slot = project.get("native_n2", {}).get("authorization_slot")
+    if slot is not None and store.b2b_slot_in_use(slot=slot):
+        # Refuse to prepare beside a live run: publishing its approval into the
+        # project's single slot would revoke the run already in flight.
+        return _deny(409, "slot_busy")
     policy = _source_policy(resolved, home, project)
     # The sink + cap exist ONLY in memory — the run_id minted here is the
     # capability's identity, NEVER admitted, scheduled or returned: the

@@ -164,11 +164,15 @@ class SlotPreparations:
         return hashlib.sha256(canonical_json([body, raw_digest, basis_digest])).hexdigest()
 
     def _prune(self):
-        # Core must issue INSIDE the prepared envelope's original window.
+        # Core must issue INSIDE each prepared envelope's original window.
         # After this horizon even the latest such approval has expired.
         now = time.time()
-        for key, stamp in list(self._stamps.items()):
-            if now >= stamp.expires_at + _CLAIM_TTL_SECONDS:
+        for key, stamps in list(self._stamps.items()):
+            live = [stamp for stamp in stamps
+                    if now < stamp.expires_at + _CLAIM_TTL_SECONDS]
+            if live:
+                self._stamps[key] = live
+            else:
                 del self._stamps[key]
 
     def remember(self, resolved, envelope, plain_view):
@@ -178,23 +182,24 @@ class SlotPreparations:
         stamp = _PreparationStamp(
             self._source(resolved, body["messages_digest"], body["source_basis_digest"]),
             _native_oc_read_metadata(plain_view), envelope["issued_at"], envelope["expires_at"])
-        previous = self._stamps.get(key)
-        if previous is None and len(self._stamps) >= 256:
+        stamps = self._stamps.get(key, ())
+        if not stamps and len(self._stamps) >= 256:
             raise AuthorizationRefused("preparation_capacity")
         # An existing Core /1 claim signs semantic identities, not the
         # preparation nonce. Never issue overlapping windows for DIFFERENT
         # source fingerprints: an old claim could otherwise fit both.
-        if (previous and previous.source != stamp.source
-                and stamp.issued_at < previous.expires_at):
+        if any(previous.source != stamp.source and stamp.issued_at < previous.expires_at
+               for previous in stamps):
             raise AuthorizationRefused("preparation_conflict")
-        self._stamps[key] = stamp
+        if stamp not in stamps:
+            self._stamps[key] = [*stamps, stamp]
 
     def for_claim(self, resolved, claim):
         self._prune()
-        stamp = self._stamps.get(self._key(resolved))
-        if stamp is None or not stamp.issued_at <= claim["issued_at"] < stamp.expires_at:
-            raise AuthorizationRefused("preparation")
-        return stamp
+        for stamp in reversed(self._stamps.get(self._key(resolved), ())):
+            if stamp.issued_at <= claim["issued_at"] < stamp.expires_at:
+                return stamp
+        raise AuthorizationRefused("preparation")
 
     def verify(self, stamp, resolved, claim, fresh):
         proof = context_proof(fresh.view)
@@ -205,7 +210,7 @@ class SlotPreparations:
             raise AuthorizationRefused("preparation")
 
     def current(self, resolved, stamp):
-        return stamp is not None and self._stamps.get(self._key(resolved)) is stamp
+        return stamp is not None and stamp in self._stamps.get(self._key(resolved), ())
 
     def forget(self, resolved):
         self._stamps.pop(self._key(resolved), None)
