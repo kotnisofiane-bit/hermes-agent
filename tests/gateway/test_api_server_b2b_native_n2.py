@@ -240,6 +240,66 @@ async def test_identical_second_prepare_preserves_the_issued_approval(tmp_path, 
         lane.assert_sealed()
 
 
+async def _post_second_prepare(lane):
+    return await lane.client.post(
+        f"/p/deploy/api/sessions/{SECOND_SESSION}/b2b-prepare",
+        headers={"Authorization": f"Bearer {adm._API_KEY}",
+                 "Idempotency-Key": SECOND_ATTEMPT},
+        json={"attempt_id": SECOND_ATTEMPT, "binding_digest": SECOND_BINDING,
+              "request_id": str(uuid.uuid4())})
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_dead_slot_owner_frees_the_slot(tmp_path, monkeypatch):
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        prepared_response, prepared, _ = await lane.prepare()
+        assert prepared_response.status == 200, prepared
+        _publish_test_slot(lane, prepared)
+        slot = lane.project["native_n2"]["authorization_slot"]
+        lane.provider_gate = asyncio.Event()
+        try:
+            admission_response = await lane.post("proposal")
+            admission = await admission_response.json()
+            assert admission_response.status == 200, admission
+            for _ in range(400):
+                attempt = lane.store.b2b_attempt(profile="deploy", attempt_id=ATTEMPT)
+                if attempt and attempt["status"] == "dispatch_committed":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("first run never reached the dispatch fence")
+            assert lane.store.b2b_slot_in_use(slot=slot)
+
+            lane.adapter._session_db.create_session(
+                SECOND_SESSION, "api_server", profile_name="deploy")
+            refused_response = await _post_second_prepare(lane)
+            refused = await refused_response.json()
+            assert refused_response.status == 409, refused
+            assert refused["code"] == "slot_busy"
+
+            # The gateway that owned the admitted run is gone: its PID is dead.
+            lane.store._conn.execute(
+                "UPDATE run_idempotency SET owner_pid=?, owner_started=0 WHERE run_id=?",
+                (4194305, admission["run_id"]))
+            lane.store._conn.commit()
+            assert not lane.store.b2b_slot_in_use(slot=slot)
+            fresh_response = await _post_second_prepare(lane)
+            fresh = await fresh_response.json()
+            assert fresh_response.status == 200, fresh
+            assert fresh["body"]["status"] == "prepared"
+            assert fresh["body"]["run_id"] is None
+        finally:
+            lane.provider_gate.set()
+        for _ in range(400):
+            if lane.store.b2b_artifact(attempt_id=ATTEMPT, kind="proposal") is not None:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("first run never sealed")
+        assert not lane.store.b2b_slot_in_use(slot=slot)
+
+
 @pytest.mark.asyncio
 @pytest.mark.linux_only
 async def test_live_slot_refuses_a_second_preparation_until_terminal(tmp_path, monkeypatch):

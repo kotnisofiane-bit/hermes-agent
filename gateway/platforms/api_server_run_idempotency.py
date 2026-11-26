@@ -382,13 +382,18 @@ class RunIdempotencyStore:
                   "dispatch_committed", "result_received")
         with self._lock:
             rows = self._conn.execute(
-                "SELECT a.profile,a.attempt_id,b.policy_json FROM b2b_attempts a "
+                "SELECT a.profile,a.attempt_id,b.policy_json,"
+                "r.owner_pid,r.owner_started FROM b2b_attempts a "
                 "JOIN b2b_bindings b ON b.profile=a.profile AND b.session_id=a.session_id "
+                "JOIN run_idempotency r ON r.run_id=a.run_id "
                 "WHERE a.status IN (?,?,?,?,?)", active).fetchall()
+        from gateway.platforms.api_server_runs import _owner_alive
         for row in rows:
             if (exclude_attempt_id is not None and
                     row["attempt_id"] == exclude_attempt_id and
                     (exclude_profile is None or row["profile"] == exclude_profile)):
+                continue
+            if not _owner_alive(row["owner_pid"], row["owner_started"]):
                 continue
             try:
                 policy = json.loads(row["policy_json"])
