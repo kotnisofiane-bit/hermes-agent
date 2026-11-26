@@ -1309,6 +1309,11 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     if project is None or project["project_id"] != resolved["project_id"]:
         return _deny(404, "not_found")
     slot = project.get("native_n2", {}).get("authorization_slot")
+    existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
+    if existing_attempt is not None and project.get("native_n2") is not None:
+        return _consumed_response(
+            store, profile=profile, attempt_id=attempt_id,
+            binding_digest=binding_digest, session_id=session_id)
     if (slot is not None and store.b2b_slot_in_use(
             slot=slot, exclude_profile=profile, exclude_attempt_id=attempt_id)):
         # One physical approval slot cannot protect two live runs: a later
@@ -1325,11 +1330,6 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     if _legacy_targets_native_gateway(
             project, native_models, native_urls, provider_aliases):
         return _deny(403, "model_authorization_missing")
-    existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
-    if existing_attempt is not None and project.get("native_n2") is not None:
-        return _consumed_response(
-            store, profile=profile, attempt_id=attempt_id,
-            binding_digest=binding_digest, session_id=session_id)
     native_binding = resolved.get("_native_binding")
     native_messages_digest = None
     slot = project.get("native_n2", {}).get("authorization_slot")

@@ -360,6 +360,48 @@ async def test_prepare_past_the_early_gate_refuses_a_run_admitted_meanwhile(
 
 @pytest.mark.asyncio
 @pytest.mark.linux_only
+async def test_consumed_replay_is_recognized_before_slot_occupancy(tmp_path, monkeypatch):
+    from gateway.status import get_process_start_time
+
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        await lane.authorize()
+        admission = await lane.admit()
+        lane.assert_sealed()
+        slot = lane.project["native_n2"]["authorization_slot"]
+        # Another live attempt occupies the same slot.
+        binding = "9" * 64
+        session = "b2b_" + binding
+        attempt = m._attempt_id_for(binding)
+        run_id = "run_" + "9" * 32
+        fingerprint = "9" * 64
+        owner_started = int(get_process_start_time(os.getpid()) or 0)
+        occupied = lane.store.b2b_admit(
+            profile="deploy", session_id=session, binding_digest=binding,
+            attempt_id=attempt, fingerprint=fingerprint,
+            binding_row={
+                "profile": "deploy", "session_id": session, "binding_digest": binding,
+                "policy_json": json.dumps({"project": {"native_n2": {
+                    "run_authorization": {"path": slot}}}})},
+            attempt_row={
+                "profile": "deploy", "session_id": session,
+                "binding_digest": binding, "attempt_id": attempt,
+                "run_id": run_id, "status": "admitted",
+                "requester_id": "1" * 24, "source_bind": "{}"},
+            run_scope="b2b:deploy:synthetic-occupant", run_key=attempt,
+            run_id=run_id, run_fingerprint=fingerprint,
+            run_status={"status": "queued", "session_id": session},
+            owner_pid=os.getpid(), owner_started=owner_started)
+        assert occupied["status"] == "admitted"
+        assert lane.store.b2b_slot_in_use(slot=slot)
+        replay_response = await lane.post("proposal")
+        replay = await replay_response.json()
+        assert replay_response.status == 409, replay
+        assert replay["code"] == "model_authorization_consumed"
+        assert replay["run_id"] == admission["run_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
 async def test_live_slot_refuses_a_second_preparation_until_terminal(tmp_path, monkeypatch):
     async with native_http_lane(tmp_path, monkeypatch) as lane:
         prepared_response, prepared, _ = await lane.prepare()
