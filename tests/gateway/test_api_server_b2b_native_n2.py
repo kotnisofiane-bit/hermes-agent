@@ -100,6 +100,501 @@ def _binding_for(project=PROJECT, mission=MISSION, requester=REQUESTER):
 BINDING = _binding_for()
 SESSION = "b2b_" + BINDING
 ATTEMPT = m._attempt_id_for(BINDING)
+SECOND_REQUESTER = "6" * 24
+SECOND_BINDING = _binding_for(requester=SECOND_REQUESTER)
+SECOND_SESSION = "b2b_" + SECOND_BINDING
+SECOND_ATTEMPT = m._attempt_id_for(SECOND_BINDING)
+
+
+@pytest.mark.asyncio
+async def test_slot_startup_only_skips_nonexecutable_projects(tmp_path):
+    hits = {"probe": 0, "target": 0, "body": [], "auth": []}
+    server = await adm._probe_test_server(307, hits)
+    try:
+        url = f"http://127.0.0.1:{server.port}/v1"
+        assert server.port >= 20000
+        slot = str(tmp_path / "future.json")
+        native = {"tenant_id": TENANT, "authorization_slot": slot}
+        project = _project_entry(native_n2=native, native_n4=_native_n4("dataset"), base_url=url)
+
+        def adapter(projects):
+            return SimpleNamespace(_b2b_state=m._B2BState(m.B2BConfig(_raw_config(projects=projects))))
+
+        # Neither file exists; even a listening non-G2 must see no traffic.
+        await m.validate_b2b_model_gateway(adapter({PROJECT: project}))
+        assert hits["probe"] == 0
+        # A tenant-only legacy deployment did not opt into deferred startup.
+        with pytest.raises(m.B2BConfigError):
+            await m.validate_b2b_model_gateway(adapter({PROJECT: _project_entry(base_url=url)}))
+        pinned_id = "prj_" + "a" * 32
+        pinned = _project_entry(project_id=pinned_id, base_url=url, native_n4=project["native_n4"],
+                                run_ref={"path": slot, "sha256": "0" * 64})
+        with pytest.raises(m.B2BConfigError):
+            await m.validate_b2b_model_gateway(adapter({PROJECT: project, pinned_id: pinned}))
+        assert hits == {"probe": 2, "target": 0, "auth": [None, None], "body": [b"", b""]}
+
+        for invalid in (
+            {**project, "native_n4": None}, {k: v for k, v in project.items() if k != "native_n4"},
+            *({**project, "native_n2": {**native, "authorization_slot": path}}
+              for path in (False, "relative", slot + "/../x", "/", "//other/file")),
+            {**project, "native_n2": {**native, "run_authorization": pinned["native_n2"]["run_authorization"]}},
+        ):
+            with pytest.raises(m.B2BConfigError):
+                adapter({PROJECT: invalid})
+    finally:
+        await server.close()
+
+
+def _expected_recipe(lane):
+    return {"body": {
+        "documents": [{"native_ref": d["native_ref"], "revision": d["revision"],
+                       "digest": d["native_digest"]} for d in lane.documents],
+        "normalized_messages_digest": m.native_recipe_normalized_messages_digest(
+            lane.mission_request, lane.rendered.encode())}}
+
+
+def _publish_test_slot(lane, prepared, *, authorization="valid"):
+    envelope = _signed_native_claim(authorization, lane.native_binding, prepared, lane.record,
+                                    lane.gateway_port, lane.core_key, lane.result_key)
+    if authorization == "predates_preparation":
+        claim = envelope["claim"]
+        claim.update(issued_at=prepared["issued_at"] - 1, expires_at=prepared["issued_at"] + 899)
+        envelope["signature"] = base64.b64encode(lane.core_key.sign(
+            native_auth.SCHEMA.encode() + b"\0" + canonical_json(claim))).decode()
+    data = canonical_json(envelope)
+    lane.approval_sha = hashlib.sha256(data).hexdigest()
+    lane.manifest_path.write_bytes(data)
+    lane.manifest_path.chmod(0o640)
+    _write_native_manifest(str(lane.manifest_path) + ".pin", {"sha256": lane.approval_sha})
+
+
+def _republish_same_claim(lane):
+    # Same signed claim, binding and signature; different exact bytes and pin.
+    data = lane.manifest_path.read_bytes() + b"\n"
+    lane.manifest_path.write_bytes(data)
+    _write_native_manifest(str(lane.manifest_path) + ".pin", {"sha256": hashlib.sha256(data).hexdigest()})
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_slot_server_boots_and_prepares_with_g2_down(tmp_path, monkeypatch):
+    import socket
+    from aiohttp import ClientSession
+
+    lane = _NativeHttpLane(tmp_path, monkeypatch, "valid", None)
+    with socket.socket() as offline, _SourceServer(lane.respond) as source:
+        offline.bind(("127.0.0.1", 0))  # reserved, not listening
+        lane.gateway_port = offline.getsockname()[1]
+        assert min(source.port, lane.gateway_port) >= 20000
+        lane.setup_adapter(tmp_path, source, f"http://127.0.0.1:{lane.gateway_port}/v1")
+        adapter = lane.adapter
+        adapter._host, adapter._port = "127.0.0.1", 0
+        try:
+            assert not lane.manifest_path.exists()
+            assert await adapter.connect()
+            port = adapter._site._server.sockets[0].getsockname()[1]
+            assert port >= 20000
+            counts = adm._store_counts(lane.store)
+            async with ClientSession(base_url=f"http://127.0.0.1:{port}") as lane.client:
+                response, prepared, _ = await lane.prepare()
+                assert response.status == 200, prepared
+                assert prepared["body"]["run_id"] is None and not prepared["body"]["model_scheduled"]
+                assert (await lane.post("proposal")).status == 403
+                _publish_test_slot(lane, prepared)
+                refused = await lane.post("proposal")
+                assert refused.status == 503
+                assert (await refused.json())["code"] == "model_gateway_unavailable"
+            assert adm._store_counts(lane.store) == counts
+            assert adapter._session_db.get_session(SESSION)["title"] is None
+            lane.spawn.assert_not_awaited()
+        finally:
+            await adapter.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_identical_second_prepare_preserves_the_issued_approval(tmp_path, monkeypatch):
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        first_response, first, _ = await lane.prepare()
+        assert first_response.status == 200, first
+        _publish_test_slot(lane, first)
+        real_time = m.time
+
+        class _ShiftedClock:
+            def time(self):
+                return real_time.time() + 1
+
+            def __getattr__(self, name):
+                return getattr(real_time, name)
+
+        monkeypatch.setattr(m, "time", _ShiftedClock())
+        try:
+            second_response = await lane.post(
+                "prepare", request_id=str(uuid.uuid4()))
+            second = await second_response.json()
+        finally:
+            monkeypatch.setattr(m, "time", real_time)
+        assert second_response.status == 200, second
+        assert second["issued_at"] >= first["issued_at"] + 1
+        await lane.admit()
+        lane.assert_sealed()
+
+
+async def _post_second_prepare(lane):
+    return await lane.client.post(
+        f"/p/deploy/api/sessions/{SECOND_SESSION}/b2b-prepare",
+        headers={"Authorization": f"Bearer {adm._API_KEY}",
+                 "Idempotency-Key": SECOND_ATTEMPT},
+        json={"attempt_id": SECOND_ATTEMPT, "binding_digest": SECOND_BINDING,
+              "request_id": str(uuid.uuid4())})
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_dead_slot_owner_frees_the_slot(tmp_path, monkeypatch):
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        prepared_response, prepared, _ = await lane.prepare()
+        assert prepared_response.status == 200, prepared
+        _publish_test_slot(lane, prepared)
+        slot = lane.project["native_n2"]["authorization_slot"]
+        lane.provider_gate = asyncio.Event()
+        try:
+            admission_response = await lane.post("proposal")
+            admission = await admission_response.json()
+            assert admission_response.status == 200, admission
+            for _ in range(400):
+                attempt = lane.store.b2b_attempt(profile="deploy", attempt_id=ATTEMPT)
+                if attempt and attempt["status"] == "dispatch_committed":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("first run never reached the dispatch fence")
+            assert lane.store.b2b_slot_in_use(slot=slot)
+
+            lane.adapter._session_db.create_session(
+                SECOND_SESSION, "api_server", profile_name="deploy")
+            refused_response = await _post_second_prepare(lane)
+            refused = await refused_response.json()
+            assert refused_response.status == 409, refused
+            assert refused["code"] == "slot_busy"
+
+            # The gateway that owned the admitted run is gone: its PID is dead.
+            lane.store._conn.execute(
+                "UPDATE run_idempotency SET owner_pid=?, owner_started=0 WHERE run_id=?",
+                (4194305, admission["run_id"]))
+            lane.store._conn.commit()
+            assert not lane.store.b2b_slot_in_use(slot=slot)
+            fresh_response = await _post_second_prepare(lane)
+            fresh = await fresh_response.json()
+            assert fresh_response.status == 200, fresh
+            assert fresh["body"]["status"] == "prepared"
+            assert fresh["body"]["run_id"] is None
+        finally:
+            lane.provider_gate.set()
+        for _ in range(400):
+            if lane.store.b2b_artifact(attempt_id=ATTEMPT, kind="proposal") is not None:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("first run never sealed")
+        assert not lane.store.b2b_slot_in_use(slot=slot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_prepare_past_the_early_gate_refuses_a_run_admitted_meanwhile(
+        tmp_path, monkeypatch):
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        prepared_response, prepared, _ = await lane.prepare()
+        assert prepared_response.status == 200, prepared
+        _publish_test_slot(lane, prepared)
+        slot = lane.project["native_n2"]["authorization_slot"]
+        lane.adapter._session_db.create_session(
+            SECOND_SESSION, "api_server", profile_name="deploy")
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = m._b2b_run_bounded_preparation
+
+        async def gated_preparation(adapter, *, profile, project, cap, sink, resolved):
+            if cap.attempt_id == SECOND_ATTEMPT:
+                entered.set()
+                await release.wait()
+            return await original(adapter, profile=profile, project=project, cap=cap,
+                                  sink=sink, resolved=resolved)
+
+        monkeypatch.setattr(m, "_b2b_run_bounded_preparation", gated_preparation)
+        second_task = asyncio.create_task(_post_second_prepare(lane))
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        # The second preparation passed the early slot gate while the slot was
+        # free, then suspended. Admit the first run before it resumes.
+        lane.provider_gate = asyncio.Event()
+        try:
+            admission = await lane.post("proposal")
+            assert admission.status == 200, await admission.json()
+            for _ in range(400):
+                attempt = lane.store.b2b_attempt(profile="deploy", attempt_id=ATTEMPT)
+                if attempt and attempt["status"] == "dispatch_committed":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("first run never reached the dispatch fence")
+            release.set()
+            second = await asyncio.wait_for(second_task, timeout=10)
+            refused = await second.json()
+            assert second.status == 409, refused
+            assert refused["code"] == "slot_busy"
+            assert lane.store.b2b_attempt(
+                profile="deploy", attempt_id=SECOND_ATTEMPT) is None
+            assert lane.store.b2b_binding(
+                session_id=SECOND_SESSION, profile="deploy") is None
+        finally:
+            release.set()
+            lane.provider_gate.set()
+        for _ in range(400):
+            if lane.store.b2b_artifact(attempt_id=ATTEMPT, kind="proposal") is not None:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("first run never sealed")
+        assert not lane.store.b2b_slot_in_use(slot=slot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_consumed_replay_is_recognized_before_slot_occupancy(tmp_path, monkeypatch):
+    from gateway.status import get_process_start_time
+
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        await lane.authorize()
+        admission = await lane.admit()
+        lane.assert_sealed()
+        slot = lane.project["native_n2"]["authorization_slot"]
+        # Another live attempt occupies the same slot.
+        binding = "9" * 64
+        session = "b2b_" + binding
+        attempt = m._attempt_id_for(binding)
+        run_id = "run_" + "9" * 32
+        fingerprint = "9" * 64
+        owner_started = int(get_process_start_time(os.getpid()) or 0)
+        occupied = lane.store.b2b_admit(
+            profile="deploy", session_id=session, binding_digest=binding,
+            attempt_id=attempt, fingerprint=fingerprint,
+            binding_row={
+                "profile": "deploy", "session_id": session, "binding_digest": binding,
+                "policy_json": json.dumps({"project": {"native_n2": {
+                    "run_authorization": {"path": slot}}}})},
+            attempt_row={
+                "profile": "deploy", "session_id": session,
+                "binding_digest": binding, "attempt_id": attempt,
+                "run_id": run_id, "status": "admitted",
+                "requester_id": "1" * 24, "source_bind": "{}"},
+            run_scope="b2b:deploy:synthetic-occupant", run_key=attempt,
+            run_id=run_id, run_fingerprint=fingerprint,
+            run_status={"status": "queued", "session_id": session},
+            owner_pid=os.getpid(), owner_started=owner_started)
+        assert occupied["status"] == "admitted"
+        assert lane.store.b2b_slot_in_use(slot=slot)
+        replay_response = await lane.post("proposal")
+        replay = await replay_response.json()
+        assert replay_response.status == 409, replay
+        assert replay["code"] == "model_authorization_consumed"
+        assert replay["run_id"] == admission["run_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_live_slot_refuses_a_second_preparation_until_terminal(tmp_path, monkeypatch):
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        prepared_response, prepared, _ = await lane.prepare()
+        assert prepared_response.status == 200, prepared
+        _publish_test_slot(lane, prepared)
+        slot = lane.project["native_n2"]["authorization_slot"]
+        lane.provider_gate = asyncio.Event()
+        try:
+            admission = await lane.post("proposal")
+            assert admission.status == 200, await admission.json()
+            for _ in range(400):
+                attempt = lane.store.b2b_attempt(profile="deploy", attempt_id=ATTEMPT)
+                if attempt and attempt["status"] == "dispatch_committed":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("first run never reached the dispatch fence")
+            assert lane.store.b2b_slot_in_use(slot=slot)
+
+            lane.adapter._session_db.create_session(
+                SECOND_SESSION, "api_server", profile_name="deploy")
+            second = await lane.client.post(
+                f"/p/deploy/api/sessions/{SECOND_SESSION}/b2b-prepare",
+                headers={"Authorization": f"Bearer {adm._API_KEY}",
+                         "Idempotency-Key": SECOND_ATTEMPT},
+                json={"attempt_id": SECOND_ATTEMPT, "binding_digest": SECOND_BINDING,
+                      "request_id": str(uuid.uuid4())})
+            refused = await second.json()
+            assert second.status == 409, refused
+            assert refused["code"] == "slot_busy"
+        finally:
+            lane.provider_gate.set()
+        for _ in range(400):
+            if lane.store.b2b_artifact(attempt_id=ATTEMPT, kind="proposal") is not None:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("first run never sealed")
+        assert not lane.store.b2b_slot_in_use(slot=slot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+@pytest.mark.parametrize(("fault", "reason"), [
+    ("pin_mode", "unprotected"), ("pin_symlink", "unprotected"), ("duplicate_pin", "schema"),
+    ("not_prepared", "preparation"), ("predates_preparation", "preparation"),
+    ("changed_authority", "preparation"), ("changed_oc_basis", "preparation"),
+    ("replayed_oc_read", "preparation"), ("republished", "revoked"),
+])
+async def test_slot_run_requires_protected_publication_for_the_same_preparation(
+        tmp_path, monkeypatch, fault, reason):
+    # Host boundary only (the separate composition test uses native My Work/OC).
+    from tests.gateway import b2b_process_harness as harness
+    renew = harness.renew_unit_oc_read
+    prepared_read = None
+    phase = "prepare"
+
+    def oc_read(view, *, read_id):
+        nonlocal prepared_read
+        if phase == "prepare":
+            prepared_read = read_id
+        elif fault == "replayed_oc_read":
+            read_id = prepared_read
+        current = renew(view, read_id=read_id)
+        if phase == "bind" and fault == "changed_oc_basis":
+            current["operational_context"]["view"]["qualification"]["mapping_version"] += 1
+            return harness.reseal_unit_context_view(current)
+        return current
+    monkeypatch.setattr(harness, "renew_unit_oc_read", oc_read)
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        counts = adm._store_counts(lane.store)
+        if fault == "not_prepared":
+            prepared = _expected_recipe(lane)
+        else:
+            response, prepared, _ = await lane.prepare()
+            assert response.status == 200, prepared
+        _publish_test_slot(lane, prepared, authorization=fault)
+        pin = Path(str(lane.manifest_path) + ".pin")
+        if fault == "pin_mode":
+            pin.chmod(0o644)
+        elif fault == "pin_symlink":
+            target = pin.with_suffix(".target")
+            pin.rename(target)
+            pin.symlink_to(target)
+        elif fault == "duplicate_pin":
+            pin.write_text('{"sha256":"%s","sha256":"%s"}' % (lane.approval_sha, lane.approval_sha))
+        elif fault == "changed_authority":
+            lane.changed_authority = True
+        elif fault == "republished":
+            prepare = m._b2b_run_bounded_preparation
+
+            async def replace_after_read(*args, **kwargs):
+                result = await prepare(*args, **kwargs)
+                _republish_same_claim(lane)
+                return result
+            monkeypatch.setattr(m, "_b2b_run_bounded_preparation", replace_after_read)
+        phase = "bind"
+        response = await lane.post("proposal")
+        denial = await response.json()
+        assert response.status == 403, denial
+        assert denial["code"] == "model_authorization_" + reason
+        assert adm._store_counts(lane.store) == counts
+        assert lane.adapter._session_db.get_session(SESSION)["title"] is None
+        lane.spawn.assert_not_awaited()
+        assert not lane.provider_requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_slot_probes_before_commit_then_retries_and_consumes_once(tmp_path, monkeypatch):
+    import yaml
+    provider = _NativeHttpLane.provider_chat
+    probes = []
+    status = 307
+    write_config = execution_lane._write_named_provider_config
+
+    def with_untrusted_defaults(home, **kwargs):
+        write_config(home, **kwargs)
+        path = Path(home) / "config.yaml"
+        config = yaml.safe_load(path.read_text())
+        config["model"]["default_headers"] = {"x-dubsar-context-id": "stale", "x-dubsar-profile-id": "other"}
+        path.write_text(yaml.safe_dump(config))
+    monkeypatch.setattr(execution_lane, "_write_named_provider_config", with_untrusted_defaults)
+
+    async def chat(lane, request):
+        if "Authorization" not in request.headers:
+            probes.append(await request.read())
+            return web.Response(status=status, headers={"Location": "/forbidden-target"})
+        assert request.headers.getall("X-Dubsar-Context-Id") == ["n4-" + lane.approval_sha]
+        assert request.headers.getall("X-Dubsar-Profile-Id") == ["deploy"]
+        return await provider(lane, request)
+    monkeypatch.setattr(_NativeHttpLane, "provider_chat", chat)
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        lane.headers["x-dubsar-context-id"] = "request-override"
+        counts = adm._store_counts(lane.store)
+        response, prepared, _ = await lane.prepare()
+        assert response.status == 200 and probes == [] and lane.provider_requests == []
+        _publish_test_slot(lane, prepared)
+        response = await lane.post("proposal")
+        assert response.status == 503, await response.text()
+        assert probes == [b""] and adm._store_counts(lane.store) == counts
+        assert lane.adapter._session_db.get_session(SESSION)["title"] is None
+        lane.spawn.assert_not_awaited()
+        status = 401
+        admission = await lane.admit()
+        lane.assert_sealed()
+        await lane.assert_consumed(admission)
+        assert probes == [b"", b""]
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_republication_at_dispatch_fence_makes_no_provider_call(tmp_path, monkeypatch):
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        await lane.authorize()
+        qualify = m._AttemptSink._qualify_context
+
+        def qualify_then_replace(sink, view):
+            fresh = qualify(sink, view)
+            _republish_same_claim(lane)
+            return fresh
+        monkeypatch.setattr(m._AttemptSink, "_qualify_context", qualify_then_replace)
+        await lane.admit()
+        assert lane.store.b2b_attempt(profile="deploy", attempt_id=ATTEMPT)["status"] == "source_denied"
+        assert not lane.provider_requests
+        assert "provider_dispatch" not in lane.artifact_kinds
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_pre_pinned_run_does_not_require_a_slot_pin_or_previous_prepare(tmp_path, monkeypatch):
+    # The pre-pinned fixture provisions its approval and hash BEFORE constructing
+    # the adapter. It has no .pin, no slot and no preparation on this adapter.
+    setup = _NativeHttpLane.setup_adapter
+    raw = _raw_config
+
+    def provision(lane, *args):
+        _publish_test_slot(lane, _expected_recipe(lane))
+        Path(str(lane.manifest_path) + ".pin").unlink()
+
+        def configured(*args, **kwargs):
+            config = raw(*args, **kwargs)
+            native = config["profiles"]["deploy"]["projects"][PROJECT]["native_n2"]
+            native["run_authorization"] = {"path": native.pop("authorization_slot"), "sha256": lane.approval_sha}
+            return config
+        with monkeypatch.context() as config_patch:
+            config_patch.setattr(sys.modules[__name__], "_raw_config", configured)
+            setup(lane, *args)
+    monkeypatch.setattr(_NativeHttpLane, "setup_adapter", provision)
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        await m.validate_b2b_model_gateway(lane.adapter)
+        await lane.admit()
+        lane.assert_sealed()
 
 
 def _docs(mission=MISSION, count=2):
@@ -1125,17 +1620,16 @@ def _signed_native_claim(authorization, native_binding, prepared, record, gatewa
 
 
 class _NativeHttpLane:
-    """One isolated source, provider, signed recipe and HTTP session."""
+    """Fault-injection HTTP lane. The real-profile proof is in model_composition."""
 
-    def __init__(self, tmp_path, monkeypatch, authorization, revoke_at, installation):
+    def __init__(self, tmp_path, monkeypatch, authorization, revoke_at):
         self.authorization = authorization
         self.revoke_at = revoke_at
-        self.installation = installation
         self.monkeypatch = monkeypatch
         self.profile_home = adm._profile_home(tmp_path, monkeypatch, "deploy")
         self.spawn = AsyncMock(wraps=m._spawn_run)
         monkeypatch.setattr(m, "_spawn_run", self.spawn)
-        self.documents = installation.documents if installation is not None else _docs(count=20)
+        self.documents = _docs(count=20)
         ordinary_refs = [f"dubsar:mission:ref-{index}" for index in range(20)]
         self.view_refs = ordinary_refs
         self.native_references = _flat(ordinary_refs, self.documents)
@@ -1151,9 +1645,6 @@ class _NativeHttpLane:
                 document, ensure_ascii=True, sort_keys=True,
                 separators=(",", ":"), allow_nan=False)
             for document in self.documents)
-        if installation is not None:
-            self.mission_request = installation.mission_request
-            self.rendered = installation.rendered
         assert len(self.rendered) <= 9000
         self.messages_digest = hashlib.sha256(canonical_json([
             {"role": "system", "content": NATIVE_RECIPE_SYSTEM_PROMPT},
@@ -1198,6 +1689,7 @@ class _NativeHttpLane:
         self.core_key = Ed25519PrivateKey.generate()
         self.result_key = Ed25519PrivateKey.generate()
         self.approval_sha = None
+        self.provider_gate = None
 
         self.revoked = False
         self.changed_authority = False
@@ -1209,9 +1701,13 @@ class _NativeHttpLane:
         if self.revoke_at == purpose and not self.revoked:
             self.manifest_path.unlink(missing_ok=True)
             self.revoked = True
-        body = _resolved_body(
-            request_env, docs=self.documents, refs=self.native_references,
-            **({"mission_request": self.mission_request} if self.installation is not None else {}))
+        if request_env["body"].get("attempt_id") == SECOND_ATTEMPT:
+            body = _resolved_body(
+                request_env, binding=SECOND_BINDING, requester_id=SECOND_REQUESTER,
+                docs=self.documents, refs=self.native_references)
+        else:
+            body = _resolved_body(
+                request_env, docs=self.documents, refs=self.native_references)
         body["authority_basis_digest"] = "sha256:" + "ab" * 32
         body["authority_digest"] = "sha256:" + "cd" * 32
         if self.changed_authority:
@@ -1220,6 +1716,9 @@ class _NativeHttpLane:
         return _response_envelope(request_env, body)
 
     async def provider_chat(self, request):
+        # Isolated receipt-validator test vector. Never evidence of a provider
+        # result in the real-profile composition, which uses only a counter
+        # before authorization and the real disarmed Backend after admission.
         proposal_result = {
             "summary": "Prepare the bound work.",
             "steps": ["Review the supplied piece."],
@@ -1229,14 +1728,14 @@ class _NativeHttpLane:
         raw = await request.read()
         if not request.headers.get("Authorization"):
             return web.Response(status=401)
+        if self.provider_gate is not None:
+            await self.provider_gate.wait()
         payload = json.loads(raw)
         self.provider_requests.append(payload)
         if self.authorization == "expire_after_admission":
             real_time = time.time
             self.monkeypatch.setattr(
                 native_auth, "time", SimpleNamespace(time=lambda: real_time() + 901))
-        if self.installation is not None:
-            return self.installation.provider_response(proposal_result)
         assert request.headers["X-Dubsar-Context-Id"] == "n4-" + self.approval_sha
         response = {
             "id": "cmpl-native-e2e", "object": "chat.completion",
@@ -1287,6 +1786,8 @@ class _NativeHttpLane:
                 **({"endpoint": "https://elsewhere.invalid"}
                    if self.authorization == "config_route" else {}))}
                if self.authorization != "no_stanza" else {}))
+        if self.authorization != "no_stanza":
+            self.project["native_n2"]["authorization_slot"] = str(self.manifest_path)
         b2b_raw = _raw_config(
             source_port=source.port, projects={PROJECT: self.project})
         extra = {"key": adm._API_KEY, "b2b": b2b_raw}
@@ -1347,22 +1848,17 @@ class _NativeHttpLane:
              "digest": document["native_digest"]}
             for document in self.documents]
 
-        if self.installation is not None:
-            envelope = self.installation.issue_and_start(
-                prepared, self.core_key, HERMES_PRIV.public_key(), self.provider_url,
-                self.mission_request, self.rendered, self.manifest_path)
-        else:
-            envelope = _signed_native_claim(
-                self.authorization, self.native_binding, prepared, self.record, self.gateway_port,
-                self.core_key, self.result_key)
+        envelope = _signed_native_claim(
+            self.authorization, self.native_binding, prepared, self.record, self.gateway_port,
+            self.core_key, self.result_key)
         data = canonical_json(self.record if self.authorization == "unsigned" else envelope)
         self.approval_sha = hashlib.sha256(data).hexdigest()
         self.manifest_path.write_bytes(data)
         self.manifest_path.chmod(0o640)
         if self.authorization != "no_ref":
-            self.project["native_n2"]["run_authorization"] = {
-                "path": str(self.manifest_path), "sha256": "0"*64 if self.authorization == "sha" else self.approval_sha}
-            m.bind_b2b_state(self.adapter)
+            pin = self.manifest_path.with_suffix(".json.pin")
+            pin.write_bytes(canonical_json({"sha256": "0"*64 if self.authorization == "sha" else self.approval_sha}))
+            pin.chmod(0o640)
 
     async def admit(self):
         if self.revoke_at is None:
@@ -1412,18 +1908,17 @@ class _NativeHttpLane:
         assert result["dubsar_provenance"]["approval_sha256"] == self.approval_sha
         assert result["dubsar_receipt_ref"]["call_id"] == result["dubsar_provenance"]["call_id"]
         assert result["attempt_id"] == ATTEMPT and len(result["dubsar_result_signature"]) == 128
-        if self.installation is None:
-            assert [message["role"] for message in sent["messages"]] == ["system", "user"]
-            assert sent["messages"][0]["content"] == NATIVE_RECIPE_SYSTEM_PROMPT
-            assert hashlib.sha256(canonical_json(sent["messages"])).hexdigest() == self.messages_digest
-        else:
-            assert hashlib.sha256(canonical_json(sent["messages"])).hexdigest() == (
-                self.prepared["body"]["normalized_messages_digest"])
+        assert [message["role"] for message in sent["messages"]] == ["system", "user"]
+        assert sent["messages"][0]["content"] == NATIVE_RECIPE_SYSTEM_PROMPT
+        assert hashlib.sha256(canonical_json(sent["messages"])).hexdigest() == self.messages_digest
         assert not sent.get("tools")
 
     async def assert_consumed(self, admission):
         counts_before = adm._store_counts(self.store)
-        title_before = self.adapter._session_db.get_session(SESSION)["title"]
+        db = self.adapter._session_db
+        session_before = db.get_session(SESSION)
+        transcript_before = db.get_messages(SESSION)
+        binding_before = self.store.b2b_binding(session_id=SESSION, profile="deploy")
         self.manifest_path.unlink(missing_ok=True)
         replay_response = await self.post("proposal")
         replay = await replay_response.json()
@@ -1439,7 +1934,9 @@ class _NativeHttpLane:
         assert replay["status"] == durable["status"]
         self.spawn.assert_awaited_once()
         assert adm._store_counts(self.store) == counts_before
-        assert self.adapter._session_db.get_session(SESSION)["title"] == title_before
+        assert db.get_session(SESSION) == session_before
+        assert db.get_messages(SESSION) == transcript_before
+        assert self.store.b2b_binding(session_id=SESSION, profile="deploy") == binding_before
         assert len(self.provider_requests) == (1 if self.revoke_at in (None, "before_seal") else 0)
 
         if self.revoke_at is None:
@@ -1450,14 +1947,13 @@ class _NativeHttpLane:
 
 
 @asynccontextmanager
-async def native_http_lane(tmp_path, monkeypatch, *, authorization="valid", revoke_at=None,
-                           installation=None):
-    lane = _NativeHttpLane(tmp_path, monkeypatch, authorization, revoke_at, installation)
+async def native_http_lane(tmp_path, monkeypatch, *, authorization="valid", revoke_at=None):
+    lane = _NativeHttpLane(tmp_path, monkeypatch, authorization, revoke_at)
     provider_app = web.Application()
     provider_app.router.add_post("/v1/chat/completions", lane.provider_chat)
     async with TestServer(provider_app, host="127.0.0.1") as provider_server:
         lane.provider_url = f"http://127.0.0.1:{provider_server.port}/v1"
-        lane.gateway_port = installation.gateway_port if installation is not None else provider_server.port
+        lane.gateway_port = provider_server.port
         assert min(lane.gateway_port, provider_server.port) >= 20000
         with _SourceServer(lane.respond) as source:
             lane.source = source

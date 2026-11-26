@@ -24,7 +24,7 @@ from hermes_cli.providers import custom_provider_aliases, resolve_custom_provide
 
 _PROJECT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$")
 # Lot-1 native N2 lane: the catalogue may opt a project in with an exact
-# {tenant_id, run_authorization?} stanza; only a deploy-bound prj_32 lane may
+# native_n2 stanza; only a deploy-bound prj_32 lane may
 # carry it and its resolved body is the strictly extended shape.
 _NATIVE_PROJECT_ID = re.compile(r"^prj_[0-9a-f]{32}$")
 _NATIVE_TENANT_ID = re.compile(
@@ -77,6 +77,30 @@ _ECMA_WHITESPACE = "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005"
 
 class B2BConfigError(ValueError):
     pass
+
+
+class B2BModelGatewayUnavailable(RuntimeError):
+    """A transient model gateway probe failure; no permission to dispatch."""
+
+
+async def probe_model_gateways(urls):
+    """No bearer, model payload, environment proxy, cookies or redirects."""
+    import asyncio
+    import aiohttp
+
+    try:
+        async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=1.0), trust_env=False,
+                cookie_jar=aiohttp.DummyCookieJar()) as client:
+            for url in urls:
+                async with client.post(
+                        url + "/chat/completions", data=b"",
+                        allow_redirects=False) as response:
+                    if response.status != 401:
+                        raise B2BConfigError(
+                            "b2b config: model gateway must refuse unauthenticated POST with 401; redirects forbidden")
+    except (aiohttp.ClientError, asyncio.TimeoutError):
+        raise B2BModelGatewayUnavailable("b2b model gateway probe unavailable") from None
 
 
 # ---------------------------------------------------------------------------
@@ -363,8 +387,8 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
             raise B2BConfigError(
                 f"b2b config: project {binding_id}: native_n2 requires exact deploy lane")
         if (not isinstance(native, Mapping)
-                or not set(native.keys()).issubset({"tenant_id", "run_authorization"})
-                or "tenant_id" not in native):
+                or set(native) not in ({"tenant_id"}, {"tenant_id", "run_authorization"},
+                                       {"tenant_id", "authorization_slot"})):
             raise B2BConfigError(
                 f"b2b config: project {binding_id}: native_n2 closed keys")
         tenant_id = native["tenant_id"]
@@ -372,6 +396,15 @@ def _validate_project_entry(entry: Any, binding_id: str) -> Dict[str, Any]:
             raise B2BConfigError(
                 f"b2b config: project {binding_id}: native_n2.tenant_id")
         native_n2 = {"tenant_id": tenant_id}
+        if "authorization_slot" in native:
+            slot = native["authorization_slot"]
+            if (not isinstance(slot, str) or not slot.startswith("/")
+                    or slot == "/" or slot.startswith("//") or _CONTROL_CHARS.search(slot)
+                    or _UNPAIRED.search(slot) or os.path.abspath(slot) != slot
+                    or "native_n4" not in entry):
+                raise B2BConfigError(
+                    f"b2b config: project {binding_id}: invalid authorization_slot or missing native_n4")
+            native_n2["authorization_slot"] = slot
         if "run_authorization" in native:
             ref = native["run_authorization"]
             if not isinstance(ref, Mapping) or set(ref.keys()) != {"path", "sha256"}:

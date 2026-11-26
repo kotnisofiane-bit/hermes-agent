@@ -375,6 +375,38 @@ class RunIdempotencyStore:
                 (profile, attempt_id)).fetchone()
         return dict(row) if row else None
 
+    def b2b_slot_in_use(self, *, slot: str, exclude_profile: Optional[str] = None,
+                        exclude_attempt_id: Optional[str] = None) -> bool:
+        """True while another attempt bound to the same authorization slot is live."""
+        active = ("queued", "admitted", "context_ready",
+                  "dispatch_committed", "result_received")
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT a.profile,a.attempt_id,b.policy_json,"
+                "r.owner_pid,r.owner_started FROM b2b_attempts a "
+                "JOIN b2b_bindings b ON b.profile=a.profile AND b.session_id=a.session_id "
+                "JOIN run_idempotency r ON r.run_id=a.run_id "
+                "WHERE a.status IN (?,?,?,?,?)", active).fetchall()
+        from gateway.platforms.api_server_runs import _owner_alive
+        for row in rows:
+            if (exclude_attempt_id is not None and
+                    row["attempt_id"] == exclude_attempt_id and
+                    (exclude_profile is None or row["profile"] == exclude_profile)):
+                continue
+            if not _owner_alive(row["owner_pid"], row["owner_started"]):
+                continue
+            try:
+                policy = json.loads(row["policy_json"])
+                project = policy.get("project") if isinstance(policy, dict) else None
+                native = project.get("native_n2") if isinstance(project, dict) else None
+                run = native.get("run_authorization") if isinstance(native, dict) else None
+                path = run.get("path") if isinstance(run, dict) else None
+            except (TypeError, ValueError):
+                continue
+            if path == slot:
+                return True
+        return False
+
     def b2b_binding(self, *, session_id: str,
                     profile: Optional[str] = None) -> Optional[Dict[str, Any]]:
         with self._lock:

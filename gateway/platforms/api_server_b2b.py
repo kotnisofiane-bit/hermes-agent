@@ -40,13 +40,16 @@ from agent.b2b_execution import (
     extract_allowed_refs)
 from gateway.platforms import api_server_b2b_native_authorization as _native_auth
 from gateway.platforms.api_server_b2b_native_validation import (
-    B2BConfig, B2BConfigError, load_b2b_gateway_config, validate_b2b_config, _MISSION_ID,
+    B2BConfig, B2BConfigError, B2BModelGatewayUnavailable, load_b2b_gateway_config,
+    probe_model_gateways, validate_b2b_config, _MISSION_ID,
     _OBSERVATION_KEYS, _PROFILE_NAME, _PROJECT_ID, _exact_keys,
     _legacy_targets_native_gateway, _native_binding, _native_catalogue,
     _scalar_ok, _valid_mission_request,
     _valid_observation,
     _verify_native_body,
 )
+from gateway.platforms.api_server_b2b_slot import (
+    _launch_b2b_run, _prepare_b2b_only)
 
 logger = logging.getLogger("gateway.platforms.api_server")
 
@@ -89,10 +92,6 @@ _RESPONSE_BODY_KEYS_NATIVE = _RESPONSE_BODY_KEYS | frozenset(
 _ATTEMPT_FORMAT = "dubsar.b2b-proposal-attempt/1"
 _ATTEMPT_OPERATION = "proposal-v1"
 _PREPARED_OPERATION = "prepared"
-
-
-class B2BModelGatewayUnavailable(RuntimeError):
-    """A transient startup probe failure; the lane stays closed until retry."""
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +443,7 @@ class _B2BState:
 
     def __init__(self, config: B2BConfig):
         self.config = config
+        self.preparations = _native_auth.SlotPreparations()
         keys = {}
         if config.enabled:
             for name, entry in config.profiles.items():
@@ -467,27 +467,16 @@ def bind_b2b_state(adapter: Any) -> None:
 
 
 async def validate_b2b_model_gateway(adapter: Any) -> None:
-    """Require G2's unauthenticated refusal before exposing the B2B lane."""
+    """Probe every URL needed by an executable project, even if shared with a slot."""
     state = _state_for(adapter)
     if state is None or not state.config.enabled:
         return
-    import aiohttp
     urls = sorted({project["base_url"]
                    for entry in state.config.profiles.values()
-                   for project in entry["projects"].values()})
-    try:
-        async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=1.0), trust_env=False,
-                cookie_jar=aiohttp.DummyCookieJar()) as client:
-            for url in urls:
-                async with client.post(
-                        url + "/chat/completions", data=b"",
-                        allow_redirects=False) as response:
-                    if response.status != 401:
-                        raise B2BConfigError(
-                            "b2b config: model gateway must refuse unauthenticated POST with 401; redirects forbidden")
-    except (aiohttp.ClientError, asyncio.TimeoutError):
-        raise B2BModelGatewayUnavailable("b2b model gateway startup probe unavailable") from None
+                   for project in entry["projects"].values()
+                   if "authorization_slot" not in project.get("native_n2", {})})
+    if urls:
+        await probe_model_gateways(urls)
 
 
 def _deny(code: int, reason: str):
@@ -547,6 +536,8 @@ def _policy_digest(profile: str, entry: Mapping[str, Any], project: Mapping[str,
         basis["native_n2_binding"] = resolved.get("native_n2_binding")
         basis["native_n2_messages_digest"] = resolved.get("native_n2_messages_digest")
         basis["native_n4"] = project.get("native_n4")
+        if "authorization_slot" in project["native_n2"]:
+            basis["published_approval"] = resolved["project"]["native_n2"].get("run_authorization")
     # Optional operator key: absent from the digest basis unless explicitly
     # configured, so a pre-versioning admission replays byte-for-byte while a
     # configured value still revokes a running cap when changed mid-run.
@@ -723,7 +714,10 @@ class _AttemptSink:
         self.attempt_id, self.session_id = attempt_id, session_id
         self.binding_digest, self.run_id = binding_digest, run_id
         self.policy = _deep_freeze(policy)
-        self._fingerprint = _policy_digest(profile, entry, self.policy["project"], self.policy)
+        # Fingerprint the operator catalogue AND the publication pinned in the
+        # run policy. A slot is never rebound by materializing a run's snapshot.
+        self._catalog_project = entry["projects"][policy["project_binding_id"]]
+        self._fingerprint = _policy_digest(profile, entry, self._catalog_project, self.policy)
         self._before_provider = None
         self.context_receipt = None
         # Frozen at durable admission: every post-admission source recheck
@@ -793,13 +787,26 @@ class _AttemptSink:
                 return False
         return True
 
+    def _run_approval(self):
+        project = self.policy["project"]
+        if _native_auth.pin_run_project(self._catalog_project)["native_n2"] != project["native_n2"]:
+            raise _native_auth.AuthorizationRefused("revoked")
+        return _native_auth.read_approval(project, now=self._admission_now)
+
+    def _assert_slot_published(self, reason):
+        if "authorization_slot" in self._catalog_project.get("native_n2", {}):
+            try:
+                self._run_approval()
+            except _native_auth.AuthorizationRefused:
+                self.block(reason)
+                raise B2BTerminalRefusal(reason) from None
+
     def _native_run_current(self, resolved: Mapping[str, Any]) -> bool:
         """Protected manifest re-read: the record must still pin exactly this
         run's binding, this exchange's request/source digests and the approved
         messages digest."""
-        project = self.policy.get("project")
         try:
-            claim = _native_auth.read_approval(project, now=self._admission_now)
+            claim = self._run_approval()
         except _native_auth.AuthorizationRefused:
             return False
         manifest = claim["n2"]
@@ -907,6 +914,7 @@ class _AttemptSink:
             "rendered_digest": receipt.rendered_digest,
             "model": self.policy["project"]["model"],
             "provider": self.policy["project"]["provider"], "committed_at": now})
+        self._assert_slot_published("source_before_provider_denied")
         window_now = time.time()
         if not all(env["issued_at"] <= window_now < env["expires_at"] for env in
                    (resolved["_signed_request"], resolved["_signed_response"])):
@@ -1105,11 +1113,12 @@ class _AttemptSink:
 
         The signed source window is re-verified HERE on host data — the
         async prepare→commit seam admits scheduling delay, so the window a
-        timely preparation observed may have closed by commit. Pure
-        timestamp arithmetic: no plugin callback, no revalidation."""
+        timely preparation observed may have closed by commit. No plugin
+        callback; a slot must still publish the identical approved bytes."""
         from gateway.platforms.api_server_b2b_context import (
             assert_context_source_current)
         window = prepared["source_window"]
+        self._assert_slot_published("source_before_seal_denied")
         now = time.time()
         if not all(env["issued_at"] <= now < env["expires_at"] for env in
                    (window["request"], window["response"])):
@@ -1238,431 +1247,18 @@ async def _b2b_run_bounded_preparation(adapter: Any, *, profile: str,
     return None
 
 
-async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, keys,
-                          session_id: str, binding_digest: str, attempt_id: str,
-                          resolved: Dict[str, Any], store: Any, db: Any):
-    """Keep the immutable empty origin, but accept worked sessions through their owned binding."""
-    import asyncio as _a
-    from hermes_constants import get_hermes_home
-    home = get_hermes_home().resolve()
-    if (not getattr(db, "db_path", None) or str(db.db_path) == ":memory:" or
-            db.db_path.resolve().parent != home):
-        return _deny(503, "store_unavailable")
-    run_id = "run_" + uuid.uuid4().hex
-    session = await _a.to_thread(db.get_session, session_id)
-    if (not session or session.get("id") != session_id or session.get("source") != "api_server"
-            or any(session.get(key) is not None for key in
-                   ("parent_session_id", "ended_at", "end_reason"))):
-        return _deny(409, "session_incompatible")
-    try:
-        tip = await _a.to_thread(db.resolve_resume_session_id, session_id)
-    except Exception:
-        return _deny(409, "genesis_resume")
-    if tip != session_id:
-        return _deny(409, "genesis_resume")
-    existing = store.b2b_binding(session_id=session_id, profile=profile)
-    if existing is None:
-        if not _genesis_vs_native(session or {}, session_id, profile):
-            # A concurrent winner may already have started the exact session.
-            existing = store.b2b_binding(session_id=session_id, profile=profile)
-            if existing is None:
-                return _deny(409, "genesis_native")
-    if existing is None:
-        if not _valid_observation(resolved.get("observation_genesis"), profile, session_id):
-            return _deny(403, "genesis_proof")
-        obs = resolved["observation_genesis"]
-        native_obs = {
-            "id": session.get("id"), "source": session.get("source"),
-            "title": session.get("title"), "model": session.get("model"),
-            "parent_session_id": session.get("parent_session_id"),
-            "has_system_prompt": session.get("system_prompt") is not None,
-            "has_model_config": session.get("model_config") is not None,
-            "ended_at": session.get("ended_at"), "end_reason": session.get("end_reason"),
-            "message_count": int(session.get("message_count") or 0),
-            "tool_call_count": int(session.get("tool_call_count") or 0),
-            "api_call_count": int(session.get("api_call_count") or 0),
-            "profile": profile}
-        if native_obs != {k: obs[k] for k in _OBSERVATION_KEYS}:
-            return _deny(409, "genesis_mismatch")
-    project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
-    if project is None or project["project_id"] != resolved["project_id"]:
-        return _deny(404, "not_found")
-    state = _state_for(adapter)
-    if state is not None:
-        native_models = state.config.g2_models
-        native_urls = state.config.g2_base_urls
-        provider_aliases = state.config.g2_provider_aliases
-    else:
-        native_models, native_urls = _native_catalogue({})
-        provider_aliases = frozenset()
-    if _legacy_targets_native_gateway(
-            project, native_models, native_urls, provider_aliases):
-        return _deny(403, "model_authorization_missing")
-    existing_attempt = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
-    if existing_attempt is not None and project.get("native_n2") is not None:
-        return _consumed_response(
-            store, profile=profile, attempt_id=attempt_id,
-            binding_digest=binding_digest, session_id=session_id)
-    native_binding = resolved.get("_native_binding")
-    native_messages_digest = None
-    if project.get("native_n2") is not None:
-        try:
-            claim = _native_auth.read_approval(project)
-            _native_auth.check_source(claim, resolved)
-        except _native_auth.AuthorizationRefused as exc:
-            return _deny(403, str(exc))
-        native_messages_digest = claim["n2"]["messages_digest"]
-    # P2 admission gate: NEW work proves its mission context BEFORE the single
-    # durable attempt is consumed — the sink/cap are built in memory first,
-    # then the bounded bootstrap enters the owning profile scope (secret
-    # hydration included), loads the gateway config and discovers plugins,
-    # and only THEN does the one bounded worker run the plugin-owned
-    # preparation — the real native read (the profile's prepare_context
-    # plugin callback, bound to THIS cap) AND its configuration validators —
-    # inside the captured scope, attach the frozen preparation to the sink,
-    # and consult readiness (the same single classifier /health/detailed
-    # reports). Any source/producer error is 503 execution_unavailable with
-    # NO binding/attempt/run/title/provider side effects — the in-memory
-    # sink/cap are simply dropped. Legacy lanes keep their idempotent replay;
-    # a native retry is a consumed authorization: answer with the durable
-    # attempt identity and never launch a second worker.
-    policy = {
-        "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
-        "attempt_id": attempt_id, "profile_home": str(home),
-        "schema_pins": R2_SCHEMA_PINS, "execution_policy": "h1/proposal-v1",
-        "requester_id": resolved["requester_id"],
-        "project_id": resolved["project_id"],
-        "project_binding_id": resolved["project_binding_id"],
-        "mission_id": resolved["mission_id"], "mission_revision": resolved["mission_revision"],
-        "reservation_ref": resolved["reservation_ref"],
-        "request_digest": resolved["request_digest"],
-        "ticket_digest": resolved["ticket_digest"],
-        "authority_basis_digest": resolved["authority_basis_digest"],
-        "authority_digest": resolved["authority_digest"],
-        "observation_genesis": resolved["observation_genesis"],
-        "mission_request": resolved["mission_request"], "project": project,
-        **({"native_n2_binding": native_binding,
-            "native_n2_messages_digest": native_messages_digest,
-            "native_n4_result_public_key": claim["result_public_key"]}
-           if native_binding is not None else {})}
-    fingerprint = _policy_digest(profile, entry, project, policy)
-    scope = _run_scope(profile, resolved["requester_id"], binding_digest)
-    initial_status = {"status": "queued", "session_id": session_id, "created_at": time.time()}
-    sink = None
-    cap = None
-    # Lost-ACK replay is allowed even while the original holds the final native worker slot.
-    if existing_attempt is None:
-        from gateway.platforms.api_server_b2b_context import (
-            assert_context_source_current, run_bounded_context_operation)
-        from gateway.run import _profile_runtime_scope
-        # The sink + cap exist ONLY in memory until b2b_admit commits the
-        # attempt — a failed preparation drops them with zero durable trace.
-        sink = _AttemptSink(adapter, store, profile=profile, entry=entry, keys=keys,
-                            attempt_id=attempt_id, session_id=session_id,
-                            binding_digest=binding_digest, run_id=run_id, policy=policy)
-        cap = BoundExecution(
-            profile=profile, session_id=session_id, binding_digest=binding_digest,
-            attempt_id=attempt_id, run_id=run_id, policy=dict(policy),
-            sink=sink, created_at=time.time())
-        denied = await _b2b_run_bounded_preparation(
-            adapter, profile=profile, project=project, cap=cap, sink=sink,
-            resolved=resolved)
-        if denied is not None:
-            return denied
-        if (native_binding is not None
-                and native_recipe_messages_digest(
-                    resolved["mission_request"], sink._context_preparation.rendered
-                ) != native_messages_digest):
-            return _deny(403, "model_authorization_raw_digest")
-        if native_binding is not None:
-            try:
-                _native_auth.check_preparation(claim, resolved, sink._context_preparation)
-            except _native_auth.AuthorizationRefused as exc:
-                return _deny(403, str(exc))
-    if existing_attempt is None:
-        # Inherited generic API admission, kept at
-        # its original place — not a B2B capacity gate.
-        limited = adapter._concurrency_limited_response()
-        if limited is not None:
-            return limited
-    # Signed proof can expire while session/DB checks were awaited: re-verify the
-    # freshness window on BOTH envelopes immediately before the durable commit —
-    # same predicate the CAS/seal paths apply to their own source reads.
-    now = int(time.time())
-    if not all(env["issued_at"] <= now < env["expires_at"] for env in
-               (resolved["_signed_request"], resolved["_signed_response"])):
-        return _deny(403, "source_denied")
-    if existing_attempt is None:
-        # Non-hydrating scope entry — introspection only, never plugin
-        # secret-source code on the loop.
-        try:
-            with _profile_runtime_scope(home, hydrate_secrets=False):
-                from hermes_cli.plugins import get_plugin_manager
-
-                has_non_plugin_hooks = (
-                    get_plugin_manager().has_non_plugin_hook_subscribers())
-        except Exception:
-            return _deny(503, "execution_unavailable")
-        if has_non_plugin_hooks:
-            return _deny(503, "non_plugin_hook_subscribers")
-    binding_row = {"profile": profile, "session_id": session_id,
-                   "binding_digest": binding_digest,
-                   "policy_json": json_utf8(policy).decode("utf-8")}
-    attempt_row = {"attempt_id": attempt_id, "binding_digest": binding_digest,
-                   "profile": profile, "session_id": session_id, "status": "admitted",
-                   "run_id": run_id, "requester_id": resolved["requester_id"],
-                   "source_bind": _source_record(resolved)}
-    if cap is not None:
-        try:
-            assert_context_source_current(sink._context_preparation)
-        except B2BTerminalRefusal as exc:
-            return _deny(503, str(exc))
-        if (native_binding is not None
-                and not sink._native_run_current(resolved)):
-            # Revocation during bounded preparation must not consume admission.
-            return _deny(403, "model_authorization_revoked")
-    outcome = store.b2b_admit(
-        profile=profile, session_id=session_id, binding_digest=binding_digest,
-        attempt_id=attempt_id, fingerprint=fingerprint,
-        binding_row=binding_row,
-        attempt_row=attempt_row,
-        run_scope=scope, run_key=attempt_id, run_id=run_id,
-        run_fingerprint=fingerprint, run_status=initial_status,
-        owner_pid=getattr(adapter, "_run_owner_pid", 0),
-        owner_started=getattr(adapter, "_run_owner_started", 0),
-        replay_only=existing_attempt is not None)
-    if outcome.get("status") == "conflict":
-        return _deny(409, "conflict")
-    stored_run_id = outcome.get("run_id") or (
-        (outcome.get("attempt") or {}).get("run_id") if outcome.get("status") == "replayed" else run_id)
-    if outcome.get("status") == "replayed":
-        if native_binding is not None:
-            return _consumed_response(
-                store, profile=profile, attempt_id=attempt_id,
-                binding_digest=binding_digest, session_id=session_id)
-        return _replayed_response(adapter, stored_run_id, attempt_id, binding_digest, profile, session_id)
-    adapter._run_idempotency_ids.add(stored_run_id)
-    if native_binding is not None:
-        # The attempt row was committed inside b2b_admit: its created_at IS the
-        # consumption instant. Freeze it for every later manifest re-read.
-        try:
-            admitted_row = store.b2b_attempt(profile=profile, attempt_id=attempt_id)
-            created_at = admitted_row.get("created_at") if admitted_row else None
-            if (isinstance(created_at, bool)
-                    or not isinstance(created_at, (int, float))
-                    or not math.isfinite(created_at)):
-                raise ValueError("admission timestamp unavailable")
-            sink._admission_now = int(created_at)
-        except Exception:
-            sink.block("store_unavailable")
-            return _deny(503, "store_unavailable")
-    try:
-        await _a.to_thread(db.set_session_title, session_id, f"B2B {session_id}")
-    except Exception:
-        store.b2b_update_attempt(profile=profile, attempt_id=attempt_id, status="failed")
-        return _deny(500, "title_commit_failed")
-    # The admitted winner's run_id is the chosen one — the sink/cap built
-    # pre-admission already carry it (a replayed outcome returned above).
-    # P1: the post-consumption policy/manifest recheck consults the plugin's
-    # validator, so it runs in the bounded daemon worker under the owning
-    # profile scope — never synchronously on the API event loop. A validator
-    # that parks fails THIS attempt closed without blocking the loop.
-    if native_binding is not None:
-        try:
-            with _profile_runtime_scope(Path(policy["profile_home"]),
-                                        hydrate_secrets=False):
-                current = await run_bounded_context_operation(
-                    lambda: (sink.assert_current_policy()
-                             and sink._native_run_current(resolved)),
-                    timeout=_SOURCE_DEADLINE_S)
-        except B2BTerminalRefusal as exc:
-            sink.block(str(exc))
-            return _deny(503, str(exc))
-        except Exception:
-            sink.block("context_unavailable")
-            return _deny(503, "context_unavailable")
-        if not current:
-            store.b2b_update_attempt(
-                profile=profile, attempt_id=attempt_id, status="failed")
-            return _deny(403, "model_authorization_revoked")
-    launched = await _spawn_run(adapter, request, cap=cap, resolved=resolved,
-                                session_id=session_id, run_id=stored_run_id, profile=profile)
-    if launched is None:
-        sink.block("launch_failed")
-        return _deny(503, "launch_failed")
-    from aiohttp import web
-    return web.json_response({
-        "object": "b2b.proposal_attempt", "attempt_id": attempt_id,
-        "binding_digest": binding_digest, "run_id": stored_run_id, "profile": profile,
-        "session_id": session_id, "status": "admitted"})
-
-
-async def _prepare_b2b_only(adapter: Any, request: Any, *, profile: str, entry, keys,
-                            session_id: str, binding_digest: str, attempt_id: str,
-                            request_id: str, resolved: Dict[str, Any],
-                            store: Any, db: Any):
-    """The prepare-only attestation (N3): verify the exact
-    binding/session/attempt/source identities and run the SAME bounded
-    bootstrap + plugin-owned context preparation as admission — then STOP:
-    no b2b_admit, no title, no concurrency gate, no run, no provider, no
-    durable write of any kind. The prepare-only attestation is signed by the
-    owning Hermes profile; it binds the caller request_id and the signed
-    source exchange. It does not create a Hermes record, authorize a run, or
-    assert that a later admission has not occurred. The answer is a
-    ``b2b.preparation`` attestation correlated to THIS signed exchange: the
-    context proof digests, the source-basis contract, the rendered digest
-    and the ordered piece tuple — ``run_id: null``,
-    ``model_scheduled: false``. A replayed POST simply re-attests under a
-    fresh signed exchange; an already durable binding/attempt refuses 409."""
-    import asyncio as _a
-    from aiohttp import web
-    from datetime import datetime, timezone
-    from gateway.platforms.api_server_b2b_context import (
-        assert_context_source_current)
-    from gateway.run import _profile_runtime_scope
-    from hermes_constants import get_hermes_home
-    home = get_hermes_home().resolve()
-    if (not getattr(db, "db_path", None) or str(db.db_path) == ":memory:" or
-            db.db_path.resolve().parent != home):
-        return _deny(503, "store_unavailable")
-    session = await _a.to_thread(db.get_session, session_id)
-    if (not session or session.get("id") != session_id or session.get("source") != "api_server"
-            or any(session.get(key) is not None for key in
-                   ("parent_session_id", "ended_at", "end_reason"))):
-        return _deny(409, "session_incompatible")
-    try:
-        tip = await _a.to_thread(db.resolve_resume_session_id, session_id)
-    except Exception:
-        return _deny(409, "genesis_resume")
-    if tip != session_id:
-        return _deny(409, "genesis_resume")
-    # The single-use durable lane: a committed binding or attempt row means
-    # the tuple was already consumed — refuse rather than attest beside it.
-    if (store.b2b_binding(session_id=session_id, profile=profile) is not None
-            or store.b2b_attempt(profile=profile, attempt_id=attempt_id) is not None):
-        return _deny(409, "already_admitted")
-    if not _genesis_vs_native(session, session_id, profile):
-        return _deny(409, "genesis_native")
-    if not _valid_observation(resolved.get("observation_genesis"), profile, session_id):
-        return _deny(403, "genesis_proof")
-    obs = resolved["observation_genesis"]
-    native_obs = {
-        "id": session.get("id"), "source": session.get("source"),
-        "title": session.get("title"), "model": session.get("model"),
-        "parent_session_id": session.get("parent_session_id"),
-        "has_system_prompt": session.get("system_prompt") is not None,
-        "has_model_config": session.get("model_config") is not None,
-        "ended_at": session.get("ended_at"), "end_reason": session.get("end_reason"),
-        "message_count": int(session.get("message_count") or 0),
-        "tool_call_count": int(session.get("tool_call_count") or 0),
-        "api_call_count": int(session.get("api_call_count") or 0),
-        "profile": profile}
-    if native_obs != {k: obs[k] for k in _OBSERVATION_KEYS}:
-        return _deny(409, "genesis_mismatch")
-    project = entry["projects"].get(str(resolved.get("project_binding_id") or ""))
-    if project is None or project["project_id"] != resolved["project_id"]:
-        return _deny(404, "not_found")
-    policy = {
-        "profile": profile, "session_id": session_id, "binding_digest": binding_digest,
-        "attempt_id": attempt_id, "profile_home": str(home),
-        "schema_pins": R2_SCHEMA_PINS, "execution_policy": "h1/proposal-v1",
-        "requester_id": resolved["requester_id"],
-        "project_id": resolved["project_id"],
-        "project_binding_id": resolved["project_binding_id"],
-        "mission_id": resolved["mission_id"], "mission_revision": resolved["mission_revision"],
-        "reservation_ref": resolved["reservation_ref"],
-        "request_digest": resolved["request_digest"],
-        "ticket_digest": resolved["ticket_digest"],
-        "authority_basis_digest": resolved["authority_basis_digest"],
-        "authority_digest": resolved["authority_digest"],
-        "observation_genesis": resolved["observation_genesis"],
-        "mission_request": resolved["mission_request"], "project": project,
-        **({"native_n2_binding": resolved.get("_native_binding")}
-           if resolved.get("_native_binding") is not None else {})}
-    # The sink + cap exist ONLY in memory — the run_id minted here is the
-    # capability's identity, NEVER admitted, scheduled or returned: the
-    # attestation's run_id is null. A failed preparation drops both with
-    # zero durable trace.
-    run_id = "run_" + uuid.uuid4().hex
-    sink = _AttemptSink(adapter, store, profile=profile, entry=entry, keys=keys,
-                        attempt_id=attempt_id, session_id=session_id,
-                        binding_digest=binding_digest, run_id=run_id, policy=policy)
-    cap = BoundExecution(
-        profile=profile, session_id=session_id, binding_digest=binding_digest,
-        attempt_id=attempt_id, run_id=run_id, policy=dict(policy),
-        sink=sink, created_at=time.time())
-    denied = await _b2b_run_bounded_preparation(
-        adapter, profile=profile, project=project, cap=cap, sink=sink,
-        resolved=resolved)
-    if denied is not None:
-        return denied
-    # Non-hydrating scope entry — introspection only, never plugin
-    # secret-source code on the loop.
-    try:
-        with _profile_runtime_scope(home, hydrate_secrets=False):
-            from hermes_cli.plugins import get_plugin_manager
-            has_non_plugin_hooks = (
-                get_plugin_manager().has_non_plugin_hook_subscribers())
-    except Exception:
-        return _deny(503, "execution_unavailable")
-    if has_non_plugin_hooks:
-        return _deny(503, "non_plugin_hook_subscribers")
-    preparation = sink._context_preparation
-    proof = context_proof(preparation.view)
-    documents = [
-        {"native_ref": document["native_ref"], "revision": document["revision"],
-         "digest": document["native_digest"]}
-        for document in preparation.documents]
-    # Last-mile race gate: a proposal admitted between the early durable
-    # check above and this boundary consumed the same tuple — refuse rather
-    # than mint a stale attestation beside an owned admission.
-    if (store.b2b_binding(session_id=session_id, profile=profile) is not None
-            or store.b2b_attempt(profile=profile, attempt_id=attempt_id) is not None):
-        return _deny(409, "already_admitted")
-    # Signed proof can expire while session/DB checks were awaited: re-verify
-    # the freshness window on BOTH envelopes immediately before signing —
-    # the same predicate the commit path applies to its own source reads.
-    now = int(time.time())
-    if not all(env["issued_at"] <= now < env["expires_at"] for env in
-               (resolved["_signed_request"], resolved["_signed_response"])):
-        return _deny(403, "source_denied")
-    try:
-        assert_context_source_current(preparation)
-    except B2BTerminalRefusal as exc:
-        return _deny(503, str(exc))
-    body = {
-        "object": "b2b.preparation",
-        "attempt_id": attempt_id, "binding_digest": binding_digest,
-        "profile": profile, "session_id": session_id,
-        "requester_id": resolved["requester_id"],
-        "project_id": resolved["project_id"],
-        "project_binding_id": resolved["project_binding_id"],
-        "mission_id": resolved["mission_id"],
-        "mission_revision": resolved["mission_revision"],
-        "status": "prepared", "run_id": None, "model_scheduled": False,
-        "prepared_at": datetime.now(timezone.utc).isoformat(
-            timespec="milliseconds").replace("+00:00", "Z"),
-        "context_digest": proof["context_digest"],
-        "view_digest": proof["view_digest"],
-        "source_basis_contract": proof["source_basis_contract"],
-        "source_basis_digest": proof["source_basis_digest"],
-        "rendered_digest": hashlib.sha256(preparation.rendered).hexdigest(),
-        "source_request_id": resolved["source_request_id"],
-        "source_request_digest": resolved["source_request_digest"],
-        "documents": documents}
+def _source_policy(resolved, home, project):
+    """The same source identity on the preparation and admission capabilities."""
+    keys = ("profile", "session_id", "binding_digest", "attempt_id", "requester_id",
+            "project_id", "project_binding_id", "mission_id", "mission_revision",
+            "reservation_ref", "request_digest", "ticket_digest", "authority_basis_digest",
+            "authority_digest", "observation_genesis", "mission_request")
+    policy = {key: resolved[key] for key in keys}
+    policy.update(profile_home=str(home), project=project, schema_pins=R2_SCHEMA_PINS,
+                  execution_policy="h1/proposal-v1")
     if resolved.get("_native_binding") is not None:
-        body["messages_digest"] = native_recipe_messages_digest(
-            resolved["mission_request"], preparation.rendered)
-        if project.get("native_n4") is not None:
-            body.update(native_binding=resolved["_native_binding"],
-                        request_digest=resolved["request_digest"],
-                        mission_source_digest=resolved["mission_source_digest"],
-                        dataset_id=project["native_n4"]["dataset_id"],
-                        normalized_messages_digest=native_recipe_normalized_messages_digest(
-                            resolved["mission_request"], preparation.rendered))
-    envelope, _ = _signed_envelope(
-        entry, keys, _PREPARED_OPERATION, body, request_id=request_id)
-    return web.json_response(envelope)
+        policy["native_n2_binding"] = resolved["_native_binding"]
+    return policy
 
 
 def _replayed_response(adapter: Any, run_id: Any, attempt_id: str, binding_digest: str,

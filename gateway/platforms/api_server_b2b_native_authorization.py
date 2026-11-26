@@ -8,13 +8,15 @@ import os
 import re
 import stat
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-from agent.b2b_execution import canonical_json, native_recipe_normalized_messages_digest
+from agent.b2b_execution import (
+    _native_oc_read_metadata, canonical_json, context_proof, native_recipe_normalized_messages_digest)
 
 _NATIVE_SECURITY_UID = 32013
 _NATIVE_TRUSTED_ROOT = "/"
@@ -72,16 +74,10 @@ class AuthorizationRefused(ValueError):
         super().__init__("model_authorization_" + reason)
 
 
-def _read_protected_record(ref):
-    from .api_server_b2b import _HEX64, _strict_json_loads
-
-    if not isinstance(ref, Mapping) or set(ref) != {"path", "sha256"}:
-        raise AuthorizationRefused("missing")
-    path, pinned = ref.get("path"), ref.get("sha256")
+def _read_protected_bytes(path):
+    """Check the descriptor we read, for both the signed envelope and its publication pin."""
     if (not isinstance(path, str) or not path or "\x00" in path
-            or os.path.abspath(path) != path
-            or not isinstance(pinned, str) or _HEX64.fullmatch(pinned) is None
-            or not _native_parents_safe(path)):
+            or os.path.abspath(path) != path or not _native_parents_safe(path)):
         raise AuthorizationRefused("unprotected")
     try:
         with os.fdopen(
@@ -97,13 +93,129 @@ def _read_protected_record(ref):
         raise AuthorizationRefused("missing") from None
     except OSError:
         raise AuthorizationRefused("unprotected") from None
-    if (len(data) > _NATIVE_MANIFEST_MAX
-            or hashlib.sha256(data).hexdigest() != pinned):
-        raise AuthorizationRefused("sha_mismatch")
+    if len(data) > _NATIVE_MANIFEST_MAX:
+        raise AuthorizationRefused("unprotected")
+    return data
+
+
+def _decode(data):
+    from .api_server_b2b import _strict_json_loads
+
     try:
         return _strict_json_loads(data)
     except (ValueError, RecursionError):
         raise AuthorizationRefused("schema") from None
+
+
+def _read_protected_record(ref):
+    from .api_server_b2b import _HEX64
+
+    if not isinstance(ref, Mapping) or set(ref) != {"path", "sha256"}:
+        raise AuthorizationRefused("missing")
+    pinned = ref["sha256"]
+    if not isinstance(pinned, str) or not _HEX64.fullmatch(pinned):
+        raise AuthorizationRefused("unprotected")
+    data = _read_protected_bytes(ref["path"])
+    if hashlib.sha256(data).hexdigest() != pinned:
+        raise AuthorizationRefused("sha_mismatch")
+    return _decode(data)
+
+
+def pin_run_project(project):
+    """Project snapshot for ONE run. No rebinding: only this capability gets a ref."""
+    from .api_server_b2b import _HEX64
+
+    native = project["native_n2"]
+    slot = native.get("authorization_slot")
+    if slot is None:
+        return project
+    pin = _decode(_read_protected_bytes(slot + ".pin"))
+    if (type(pin) is not dict or set(pin) != {"sha256"}
+            or not isinstance(pin["sha256"], str) or not _HEX64.fullmatch(pin["sha256"])):
+        raise AuthorizationRefused("pin")
+    return {**project, "native_n2": {"tenant_id": native["tenant_id"],
+                                     "run_authorization": {"path": slot, "sha256": pin["sha256"]}}}
+
+
+@dataclass(frozen=True)
+class _PreparationStamp:
+    source: str
+    oc_read: tuple
+    issued_at: int
+    expires_at: int
+
+
+class SlotPreparations:
+    """API-loop owned; retain fingerprints, never plugin callbacks, documents or a stale view."""
+
+    def __init__(self):
+        self._stamps = {}
+
+    @staticmethod
+    def _key(resolved):
+        return resolved["profile"], resolved["attempt_id"]
+
+    @staticmethod
+    def _source(resolved, raw_digest, basis_digest):
+        # The two signed resolves have different correlations; compare every
+        # semantic field, including the reservation, genesis and authority.
+        body = {k: v for k, v in resolved["_signed_response"]["body"].items()
+                if k not in ("source_request_digest", "source_request_id")}
+        return hashlib.sha256(canonical_json([body, raw_digest, basis_digest])).hexdigest()
+
+    def _prune(self):
+        # Core must issue INSIDE each prepared envelope's original window.
+        # After this horizon even the latest such approval has expired.
+        now = time.time()
+        for key, stamps in list(self._stamps.items()):
+            live = [stamp for stamp in stamps
+                    if now < stamp.expires_at + _CLAIM_TTL_SECONDS]
+            if live:
+                self._stamps[key] = live
+            else:
+                del self._stamps[key]
+
+    def remember(self, resolved, envelope, plain_view):
+        self._prune()
+        key = self._key(resolved)
+        body = envelope["body"]
+        stamp = _PreparationStamp(
+            self._source(resolved, body["messages_digest"], body["source_basis_digest"]),
+            _native_oc_read_metadata(plain_view), envelope["issued_at"], envelope["expires_at"])
+        stamps = self._stamps.get(key, ())
+        if not stamps and len(self._stamps) >= 256:
+            raise AuthorizationRefused("preparation_capacity")
+        # An existing Core /1 claim signs semantic identities, not the
+        # preparation nonce. Never issue overlapping windows for DIFFERENT
+        # source fingerprints: an old claim could otherwise fit both.
+        if any(previous.source != stamp.source and stamp.issued_at < previous.expires_at
+               for previous in stamps):
+            raise AuthorizationRefused("preparation_conflict")
+        if stamp not in stamps:
+            self._stamps[key] = [*stamps, stamp]
+
+    def for_claim(self, resolved, claim):
+        self._prune()
+        for stamp in reversed(self._stamps.get(self._key(resolved), ())):
+            if stamp.issued_at <= claim["issued_at"] < stamp.expires_at:
+                return stamp
+        raise AuthorizationRefused("preparation")
+
+    def verify(self, stamp, resolved, claim, fresh):
+        proof = context_proof(fresh.view)
+        ref, instant = _native_oc_read_metadata(proof["view"])
+        if (stamp.source != self._source(resolved, claim["n2"]["messages_digest"],
+                                         proof["source_basis_digest"])
+                or ref == stamp.oc_read[0] or instant < stamp.oc_read[1]):
+            raise AuthorizationRefused("preparation")
+
+    def current(self, resolved, stamp):
+        return stamp is not None and stamp in self._stamps.get(self._key(resolved), ())
+
+    def forget(self, resolved):
+        self._stamps.pop(self._key(resolved), None)
+
+
 def _validate_n2(record):
     from .api_server_b2b import (
         _ATTEMPT_ID_RE, _HEX64, _OBJECT_ID, _SESSION_ID_RE, _SHA256_FIELD)
