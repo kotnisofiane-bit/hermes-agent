@@ -302,6 +302,64 @@ async def test_dead_slot_owner_frees_the_slot(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.linux_only
+async def test_prepare_past_the_early_gate_refuses_a_run_admitted_meanwhile(
+        tmp_path, monkeypatch):
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        prepared_response, prepared, _ = await lane.prepare()
+        assert prepared_response.status == 200, prepared
+        _publish_test_slot(lane, prepared)
+        slot = lane.project["native_n2"]["authorization_slot"]
+        lane.adapter._session_db.create_session(
+            SECOND_SESSION, "api_server", profile_name="deploy")
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = m._b2b_run_bounded_preparation
+
+        async def gated_preparation(adapter, *, profile, project, cap, sink, resolved):
+            if cap.attempt_id == SECOND_ATTEMPT:
+                entered.set()
+                await release.wait()
+            return await original(adapter, profile=profile, project=project, cap=cap,
+                                  sink=sink, resolved=resolved)
+
+        monkeypatch.setattr(m, "_b2b_run_bounded_preparation", gated_preparation)
+        second_task = asyncio.create_task(_post_second_prepare(lane))
+        await asyncio.wait_for(entered.wait(), timeout=10)
+        # The second preparation passed the early slot gate while the slot was
+        # free, then suspended. Admit the first run before it resumes.
+        lane.provider_gate = asyncio.Event()
+        try:
+            admission = await lane.post("proposal")
+            assert admission.status == 200, await admission.json()
+            for _ in range(400):
+                attempt = lane.store.b2b_attempt(profile="deploy", attempt_id=ATTEMPT)
+                if attempt and attempt["status"] == "dispatch_committed":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("first run never reached the dispatch fence")
+            release.set()
+            second = await asyncio.wait_for(second_task, timeout=10)
+            refused = await second.json()
+            assert second.status == 409, refused
+            assert refused["code"] == "slot_busy"
+            assert lane.store.b2b_attempt(
+                profile="deploy", attempt_id=SECOND_ATTEMPT) is None
+            assert lane.store.b2b_binding(
+                session_id=SECOND_SESSION, profile="deploy") is None
+        finally:
+            release.set()
+            lane.provider_gate.set()
+        for _ in range(400):
+            if lane.store.b2b_artifact(attempt_id=ATTEMPT, kind="proposal") is not None:
+                break
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("first run never sealed")
+        assert not lane.store.b2b_slot_in_use(slot=slot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
 async def test_live_slot_refuses_a_second_preparation_until_terminal(tmp_path, monkeypatch):
     async with native_http_lane(tmp_path, monkeypatch) as lane:
         prepared_response, prepared, _ = await lane.prepare()

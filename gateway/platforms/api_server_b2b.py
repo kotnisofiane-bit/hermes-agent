@@ -1449,6 +1449,11 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
     if not all(env["issued_at"] <= now < env["expires_at"] for env in
                (resolved["_signed_request"], resolved["_signed_response"])):
         return _deny(403, "source_denied")
+    # Last synchronous point before the durable admission: the preflight probe
+    # awaited, so another proposal may have taken the slot meanwhile.
+    if (slot is not None and store.b2b_slot_in_use(
+            slot=slot, exclude_profile=profile, exclude_attempt_id=attempt_id)):
+        return _deny(409, "slot_busy")
     outcome = store.b2b_admit(
         profile=profile, session_id=session_id, binding_digest=binding_digest,
         attempt_id=attempt_id, fingerprint=fingerprint,
@@ -1638,6 +1643,10 @@ async def _prepare_b2b_only(adapter: Any, request: Any, *, profile: str, entry, 
     if (store.b2b_binding(session_id=session_id, profile=profile) is not None
             or store.b2b_attempt(profile=profile, attempt_id=attempt_id) is not None):
         return _deny(409, "already_admitted")
+    # A proposal admitted while this preparation was running now owns the
+    # project's single slot: publishing beside it would revoke that live run.
+    if slot is not None and store.b2b_slot_in_use(slot=slot):
+        return _deny(409, "slot_busy")
     # Signed proof can expire while session/DB checks were awaited: re-verify
     # the freshness window on BOTH envelopes immediately before signing —
     # the same predicate the commit path applies to its own source reads.
