@@ -72,6 +72,14 @@ def _free_port():
         return value
 
 
+def _external_path(name):
+    """Resolve one operator-supplied fixture root, or skip naming it."""
+    value = os.environ.get(name)
+    if not value:
+        pytest.skip(f"missing external fixture input: {name}")
+    return Path(value).resolve(strict=True)
+
+
 def _raw_public(key):
     return key.public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
 
@@ -135,11 +143,11 @@ def _review_read(ready, tool):
 def _native_mcp_config(socket_path):
     # Relocate only the operator configuration. Hermes launches the shipped
     # native MCP bridge, with the actual private reader and peer checks.
-    profile = Path(os.environ["B2B_REAL_PROFILE_ROOT"])
+    profile = _external_path("B2B_REAL_PROFILE_ROOT")
     return {"command": sys.executable, "args": [
         "-IB", str(profile / "scripts/native-preflight-mcp.py"),
         "--reader-socket", socket_path, "--peer-uid", str(os.geteuid()),
-        "--ipc-dir", str(Path(os.environ["DUBSAR_CI_ROOT"]) / "image/j2")]}
+        "--ipc-dir", str(_external_path("DUBSAR_CI_ROOT") / "image/j2")]}
 
 
 class CoreInstall:
@@ -155,10 +163,10 @@ class CoreInstall:
         # This is a pre-existing installation authority, *not* the per-run
         # Core authorization. Do not synthesize its owner, witnesses or scope.
         value = os.environ.get("DUBSAR_TEST_NATIVE_INSTALLATION_RECORD")
-        assert value, ("B2B_AGENT_INPUTS_MODEL_GATEWAY_REQUIRED: supply the external protected "
-                       "DUBSAR_TEST_NATIVE_INSTALLATION_RECORD; bench-data is not native authorization")
+        if not value:
+            pytest.skip("missing external fixture input: DUBSAR_TEST_NATIVE_INSTALLATION_RECORD")
         installation = json.loads(value)
-        validator = Path(os.environ["DUBSAR_PORTAL_ROOT"]) / "api/server/services/dubsar/b2b-agent-native-n2.js"
+        validator = _external_path("DUBSAR_PORTAL_ROOT") / "api/server/services/dubsar/b2b-agent-native-n2.js"
         scope = _result(_run(["node", "-e", "const [mod, ref] = process.argv.slice(1);"
                               "console.log(JSON.stringify(require(mod).readNativeInstallation(JSON.parse(ref))));",
                               str(validator), value]))
@@ -237,7 +245,8 @@ class CoreInstall:
             "backendRoot": str(self.backend), "missionStore": str(self.store),
             "definitionFile": str(_write(self.temp / "definition.json", definition)),
             "observationFile": str(self.temp / "observation.json"), "keys": keys,
-            "nodePath": shutil.which("node"), "contractsRoot": os.environ["DUBSAR_TEST_CONTRACTS_ROOT"],
+            "nodePath": shutil.which("node"),
+            "contractsRoot": str(_external_path("DUBSAR_TEST_CONTRACTS_ROOT")),
             "databases": db["databases"], "provisioningRoles": [db["runner"]],
             "portalVerifyUrl": self.ready["source_url"], "context": context,
             "missionRequest": self.request, "executionInventory": {"directory": str(inventory), "context": asm}})
@@ -395,7 +404,8 @@ def _adapter(stack, inst, home, monkeypatch):
     entry["projects"][r["project_id"]] = project
     context = {k: r[k] for k in ("start", "allocation_root", "project_id")}
     project.update(project_id=r["project_id"], base_url=url, model=ROUTE["model"], project_context=context,
-                   context_contract_root=str(Path(os.environ["DUBSAR_TEST_CONTRACTS_ROOT"]) / "schemas/agent-context/v2"),
+                   context_contract_root=str(
+                       _external_path("DUBSAR_TEST_CONTRACTS_ROOT") / "schemas/agent-context/v2"),
                    native_n2={"tenant_id": r["tenant_id"], "authorization_slot": str(inst.slot)},
                    native_n4={"dataset_id": DATASET, "core_public_key": _raw_public(inst.key.public_key()),
                               "endpoint": ENDPOINT, **ROUTE})
@@ -437,16 +447,17 @@ async def test_bench_data_reads_are_not_native_installation_evidence(tmp_path, m
     """Qualify only the read path when the operator hasn't supplied an installation."""
     from agent.b2b_execution import BoundExecution, bind_execution, reset_execution
 
-    ci = Path(os.environ["DUBSAR_CI_ROOT"])
-    profile = Path(os.environ["B2B_REAL_PROFILE_ROOT"])
-    core = Path(os.environ["DUBSAR_SCRIBE_BUILDER"])
+    ci = _external_path("DUBSAR_CI_ROOT")
+    profile = _external_path("B2B_REAL_PROFILE_ROOT")
+    core = _external_path("DUBSAR_SCRIBE_BUILDER")
     for path in (ci / "image/j2", profile / "plugins/dubsar-agent-context", core):
         monkeypatch.syspath_prepend(str(path))
     from scribe import model_authorization as core_auth
 
     home = adm._profile_home(tmp_path, monkeypatch, "deploy")
     with ExitStack() as stack:
-        temp = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=os.environ["DUBSAR_TEST_SECURE_ROOT"])))
+        temp = Path(stack.enter_context(
+            tempfile.TemporaryDirectory(dir=_external_path("DUBSAR_TEST_SECURE_ROOT"))))
         ready = _services(stack, temp, {"mode": "bench-data", "root": str(temp),
             "project_id": "prj_" + uuid.uuid4().hex, "mission_id": "mis_" + uuid.uuid4().hex,
             "tenant_id": "tenant_native001", "requester_id": "a"*24, "pieces": list(core_auth.PUBLIC_PIECES)})
@@ -513,13 +524,15 @@ async def test_bench_data_reads_are_not_native_installation_evidence(tmp_path, m
 @pytest.mark.linux_only
 @pytest.mark.integration
 async def test_native_prepare_only_to_one_disarmed_admission(tmp_path, monkeypatch, record_property):
-    keys = ("DUBSAR_SCRIBE_BUILDER", "DUBSAR_SCRIBE_BACKEND", "DUBSAR_CI_ROOT", "B2B_REAL_PROFILE_ROOT")
-    core, backend, ci, profile = (Path(os.environ[k]).resolve(strict=True) for k in keys)
+    core = _external_path("DUBSAR_SCRIBE_BUILDER")
+    backend = _external_path("DUBSAR_SCRIBE_BACKEND")
+    ci = _external_path("DUBSAR_CI_ROOT")
+    profile = _external_path("B2B_REAL_PROFILE_ROOT")
     for p in (core, backend, ci / "image/j2", profile / "plugins/dubsar-agent-context"):
         monkeypatch.syspath_prepend(str(p))
     home = adm._profile_home(tmp_path, monkeypatch, "deploy")
     with ExitStack() as stack:
-        root = Path(os.environ["DUBSAR_TEST_SECURE_ROOT"])
+        root = _external_path("DUBSAR_TEST_SECURE_ROOT")
         temp = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="n4-", dir=root)))
         inst = CoreInstall(stack, temp, core, backend, profile)
         ready = inst.ready
