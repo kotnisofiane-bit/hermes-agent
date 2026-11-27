@@ -21,6 +21,10 @@ from agent.b2b_execution import (
 _NATIVE_SECURITY_UID = 32013
 _NATIVE_TRUSTED_ROOT = "/"
 _NATIVE_BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+MODEL_LAUNCH_PIN = "/etc/dubsar-b2b/model-launch-public.json"
+_NATIVE_PIN_OWNER = 0
+_NATIVE_PIN_GROUP = 0
+_NATIVE_PIN_MAX = 256
 _NATIVE_MANIFEST_MAX = 65536
 _CLAIM_TTL_SECONDS = 900
 _NATIVE_MANIFEST_FORMAT = "dubsar.b2b-n2-recipe/1"
@@ -97,6 +101,40 @@ def _read_protected_bytes(path):
     if len(data) > _NATIVE_MANIFEST_MAX:
         raise AuthorizationRefused("unprotected")
     return data
+
+
+def _launch_pin():
+    """The administrator's unique model-launch switch, or None when absent."""
+    try:
+        with os.fdopen(
+                os.open(MODEL_LAUNCH_PIN,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode)
+                    or stat.S_IMODE(info.st_mode) != 0o444
+                    or info.st_uid != _NATIVE_PIN_OWNER
+                    or info.st_gid != _NATIVE_PIN_GROUP
+                    or info.st_nlink != 1 or info.st_size > _NATIVE_PIN_MAX):
+                raise AuthorizationRefused("launch_pin")
+            data = stream.read(_NATIVE_PIN_MAX + 1)
+    except FileNotFoundError:
+        return None
+    except AuthorizationRefused:
+        raise
+    except OSError:
+        raise AuthorizationRefused("launch_pin") from None
+    if len(data) > _NATIVE_PIN_MAX:
+        raise AuthorizationRefused("launch_pin")
+    from .api_server_b2b import _strict_json_loads
+    try:
+        pin = _strict_json_loads(data)
+    except (ValueError, RecursionError):
+        raise AuthorizationRefused("launch_pin") from None
+    if (type(pin) is not dict or set(pin) != {"core_public_key"}
+            or type(pin["core_public_key"]) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", pin["core_public_key"]) is None):
+        raise AuthorizationRefused("launch_pin")
+    return pin["core_public_key"]
 
 
 def _decode(data):
@@ -301,6 +339,12 @@ def read_approval(project: Mapping[str, Any], *, now: Optional[int] = None) -> D
             "schema", "n2", "n4", "endpoint", "result_public_key",
             "issued_at", "expires_at"} or claim.get("schema") != schema):
         raise AuthorizationRefused("schema")
+    if launch:
+        pin = _launch_pin()
+        if pin is None:
+            raise AuthorizationRefused("launch_pin_missing")
+        if pin != stanza["core_public_key"]:
+            raise AuthorizationRefused("launch_pin")
     issued_at, expires_at = claim.get("issued_at"), claim.get("expires_at")
     current = int(time.time()) if now is None else now
     if (type(issued_at) is not int or type(expires_at) is not int
