@@ -104,6 +104,8 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
             run_project = b2b._native_auth.pin_run_project(project)
             claim = b2b._native_auth.read_approval(run_project)
             b2b._native_auth.check_source(claim, resolved)
+            if claim["schema"] == b2b._native_auth.LAUNCH_SCHEMA and slot is None:
+                raise b2b._native_auth.AuthorizationRefused("preparation")
             if slot is not None:
                 if state is None or state.config.profile_entry(profile) is not entry:
                     raise b2b._native_auth.AuthorizationRefused("preparation")
@@ -196,7 +198,7 @@ async def _launch_b2b_run(adapter: Any, request: Any, *, profile: str, entry, ke
                    "source_bind": b2b._source_record(resolved)}
     if cap is not None:
         if slot is not None and (state is not b2b._state_for(adapter)
-                                 or not state.preparations.current(resolved, stamp)):
+                                 or not state.preparations.current(resolved, stamp, claim)):
             if store.b2b_attempt(profile=profile, attempt_id=attempt_id) is not None:
                 return b2b._consumed_response(store, profile=profile, attempt_id=attempt_id,
                                           binding_digest=binding_digest, session_id=session_id)

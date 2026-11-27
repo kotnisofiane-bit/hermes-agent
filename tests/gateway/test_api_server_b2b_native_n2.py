@@ -450,6 +450,8 @@ async def test_live_slot_refuses_a_second_preparation_until_terminal(tmp_path, m
     ("not_prepared", "preparation"), ("predates_preparation", "preparation"),
     ("changed_authority", "preparation"), ("changed_oc_basis", "preparation"),
     ("replayed_oc_read", "preparation"), ("republished", "revoked"),
+    ("launch_wrong_digest", "preparation"), ("launch_wrong_uuid", "preparation"),
+    ("launch_other_owner", "launcher"), ("launch_write", "purpose"),
 ])
 async def test_slot_run_requires_protected_publication_for_the_same_preparation(
         tmp_path, monkeypatch, fault, reason):
@@ -511,7 +513,8 @@ async def test_slot_run_requires_protected_publication_for_the_same_preparation(
 
 @pytest.mark.asyncio
 @pytest.mark.linux_only
-async def test_slot_probes_before_commit_then_retries_and_consumes_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("authorization", ["valid", "launch"])
+async def test_slot_probes_before_commit_then_retries_and_consumes_once(tmp_path, monkeypatch, authorization):
     import yaml
     provider = _NativeHttpLane.provider_chat
     probes = []
@@ -539,7 +542,7 @@ async def test_slot_probes_before_commit_then_retries_and_consumes_once(tmp_path
         counts = adm._store_counts(lane.store)
         response, prepared, _ = await lane.prepare()
         assert response.status == 200 and probes == [] and lane.provider_requests == []
-        _publish_test_slot(lane, prepared)
+        _publish_test_slot(lane, prepared, authorization=authorization)
         response = await lane.post("proposal")
         assert response.status == 503, await response.text()
         assert probes == [b""] and adm._store_counts(lane.store) == counts
@@ -1613,9 +1616,17 @@ def _signed_native_claim(authorization, native_binding, prepared, record, gatewa
         claim["approver_id"] = native_binding["requester_id"]
     elif authorization == "approver_bad":
         claim["approver_id"] = "not-an-object-id"
+    if authorization.startswith("launch"):
+        del claim["approver_id"]
+        claim.update(schema="dubsar.core-model-authorization/2",
+                     purpose="write" if authorization == "launch_write" else "model_launch",
+                     launcher_id=SECOND_REQUESTER if authorization == "launch_other_owner" else REQUESTER,
+                     prepare_uuid=str(uuid.uuid4()) if authorization == "launch_wrong_uuid" else prepared["request_id"],
+                     prepare_digest="0" * 64 if authorization == "launch_wrong_digest" else
+                     hashlib.sha256(canonical_json(prepared)).hexdigest())
     signer = Ed25519PrivateKey.generate() if authorization == "signature" else core_key
     envelope = {"claim": claim, "signature": base64.b64encode(signer.sign(
-        native_auth.SCHEMA.encode() + b"\0" + canonical_json(claim))).decode()}
+        claim["schema"].encode() + b"\0" + canonical_json(claim))).decode()}
     return envelope
 
 
