@@ -450,6 +450,9 @@ async def test_live_slot_refuses_a_second_preparation_until_terminal(tmp_path, m
     ("not_prepared", "preparation"), ("predates_preparation", "preparation"),
     ("changed_authority", "preparation"), ("changed_oc_basis", "preparation"),
     ("replayed_oc_read", "preparation"), ("republished", "revoked"),
+    ("launch_wrong_digest", "preparation"), ("launch_wrong_uuid", "preparation"),
+    ("launch_other_owner", "launcher"), ("launch_write", "purpose"),
+    ("launch_no_pin", "launch_pin_missing"), ("launch_pin_mismatch", "launch_pin"),
 ])
 async def test_slot_run_requires_protected_publication_for_the_same_preparation(
         tmp_path, monkeypatch, fault, reason):
@@ -480,7 +483,13 @@ async def test_slot_run_requires_protected_publication_for_the_same_preparation(
             assert response.status == 200, prepared
         _publish_test_slot(lane, prepared, authorization=fault)
         pin = Path(str(lane.manifest_path) + ".pin")
-        if fault == "pin_mode":
+        if fault == "launch_no_pin":
+            lane.pin_path.unlink()
+        elif fault == "launch_pin_mismatch":
+            lane.pin_path.chmod(0o644)
+            lane.pin_path.write_text(json.dumps({"core_public_key": "0" * 64}))
+            lane.pin_path.chmod(0o444)
+        elif fault == "pin_mode":
             pin.chmod(0o644)
         elif fault == "pin_symlink":
             target = pin.with_suffix(".target")
@@ -511,7 +520,8 @@ async def test_slot_run_requires_protected_publication_for_the_same_preparation(
 
 @pytest.mark.asyncio
 @pytest.mark.linux_only
-async def test_slot_probes_before_commit_then_retries_and_consumes_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("authorization", ["valid", "launch"])
+async def test_slot_probes_before_commit_then_retries_and_consumes_once(tmp_path, monkeypatch, authorization):
     import yaml
     provider = _NativeHttpLane.provider_chat
     probes = []
@@ -539,7 +549,7 @@ async def test_slot_probes_before_commit_then_retries_and_consumes_once(tmp_path
         counts = adm._store_counts(lane.store)
         response, prepared, _ = await lane.prepare()
         assert response.status == 200 and probes == [] and lane.provider_requests == []
-        _publish_test_slot(lane, prepared)
+        _publish_test_slot(lane, prepared, authorization=authorization)
         response = await lane.post("proposal")
         assert response.status == 503, await response.text()
         assert probes == [b""] and adm._store_counts(lane.store) == counts
@@ -1613,9 +1623,17 @@ def _signed_native_claim(authorization, native_binding, prepared, record, gatewa
         claim["approver_id"] = native_binding["requester_id"]
     elif authorization == "approver_bad":
         claim["approver_id"] = "not-an-object-id"
+    if authorization.startswith("launch"):
+        del claim["approver_id"]
+        claim.update(schema="dubsar.core-model-authorization/2",
+                     purpose="write" if authorization == "launch_write" else "model_launch",
+                     launcher_id=SECOND_REQUESTER if authorization == "launch_other_owner" else REQUESTER,
+                     prepare_uuid=str(uuid.uuid4()) if authorization == "launch_wrong_uuid" else prepared["request_id"],
+                     prepare_digest="0" * 64 if authorization == "launch_wrong_digest" else
+                     hashlib.sha256(canonical_json(prepared)).hexdigest())
     signer = Ed25519PrivateKey.generate() if authorization == "signature" else core_key
     envelope = {"claim": claim, "signature": base64.b64encode(signer.sign(
-        native_auth.SCHEMA.encode() + b"\0" + canonical_json(claim))).decode()}
+        claim["schema"].encode() + b"\0" + canonical_json(claim))).decode()}
     return envelope
 
 
@@ -1776,6 +1794,12 @@ class _NativeHttpLane:
         alloc.mkdir()
         start.mkdir()
         core_public = self.core_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw).hex()
+        self.pin_path = tmp_path / "model-launch-public.json"
+        self.monkeypatch.setattr(native_auth, "MODEL_LAUNCH_PIN", str(self.pin_path))
+        self.monkeypatch.setattr(native_auth, "_NATIVE_PIN_OWNER", os.getuid())
+        self.monkeypatch.setattr(native_auth, "_NATIVE_PIN_GROUP", os.getgid())
+        self.pin_path.write_text(json.dumps({"core_public_key": core_public}))
+        self.pin_path.chmod(0o444)
         self.project = _project_entry(
             base_url=gateway_url,
             context_contract_root=prepare_tests.extract_contract_root(tmp_path),
@@ -2065,6 +2089,16 @@ async def test_native_http_admission_refuses_invalid_authorization(tmp_path, mon
         assert "before_provider" not in purposes
         assert "before_seal" not in purposes
         assert not lane.source.errors
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_valid_authorization_does_not_require_the_launch_pin(tmp_path, monkeypatch):
+    async with native_http_lane(tmp_path, monkeypatch) as lane:
+        lane.pin_path.unlink()
+        await lane.authorize()
+        await lane.admit()
+        lane.assert_sealed()
 
 
 @pytest.mark.asyncio
