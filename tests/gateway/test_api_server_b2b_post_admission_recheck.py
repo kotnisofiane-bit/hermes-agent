@@ -89,6 +89,7 @@ async def test_post_admission_recheck_is_bounded_and_off_loop(
 
         messages_digest = "ab" * 32
         claim = {
+            "schema": b2b._native_auth.SCHEMA,
             "n2": {
                 "binding": native_binding,
                 "request_digest": resolved["request_digest"],
